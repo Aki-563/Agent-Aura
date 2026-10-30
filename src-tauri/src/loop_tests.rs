@@ -123,6 +123,27 @@ async fn a_done_claim_the_screen_does_not_support_is_rejected_then_accepted() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_done_claim_without_the_asked_text_on_screen_is_rejected_by_the_harness() {
+    // Nothing is typed (the scripted model only claims done), so the exact text cannot be on screen.
+    let outcome = run(
+        "type the sentence zebra quokka narwhal in the box",
+        6,
+        vec![
+            ("aura_proposal", replies::proposal(done("typed it"), "claim done")),
+            ("aura_done_check", replies::done_check(true, "")),
+        ],
+        None,
+    )
+    .await;
+    assert!(!outcome.response.completed, "a done claim without the text must not complete: {}", outcome.response.message);
+    let proposals = outcome.server.requests_of("aura_proposal");
+    assert!(proposals.len() >= 2);
+    assert!(proposals[1].contains("zebra quokka narwhal") && proposals[1].contains("REJECTED"), "the model is told exactly what is missing");
+    assert!(outcome.server.requests_of("aura_done_check").is_empty(), "the harness decided from the screen; the model's own check was never needed");
+    assert!(outcome.response.message.contains("zebra quokka narwhal"), "{}", outcome.response.message);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn endless_unsupported_done_claims_end_the_run_honestly() {
     let outcome = run(
         "finish when it is visible",

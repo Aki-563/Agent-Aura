@@ -82,3 +82,14 @@ Provider settings are saved in `%LOCALAPPDATA%\AgentAura\provider.json`; the API
 **Checks and diagnostics:** `aura-cli doctor` asks the saved model one tiny question (Save & test connection does the same). `AURA_SELFTEST_TASK="open notepad" agent-aura.exe` runs a task through the real app and logs every event to `%LOCALAPPDATA%\AgentAura\selftest.log`. `node tools/ui-smoke.mjs "<task>"` drives the running app's page (start the app with `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222`). `aura-cli soak --minutes 1440` repeats a safe slice of the desktop suite and reports memory, handle and GDI-object growth (the 24 hour run). `cargo test --lib real_speech -- --ignored` is the audible speech check; `cargo test --lib long_pause -- --ignored` is the 10 minute pause test (`AURA_PAUSE_SECS` shortens it).
 
 **Traces never keep secrets:** values after password, api key, token or Bearer, and long mixed-case tokens, are written as `[hidden]`.
+
+### Making any model's orders executable
+
+The harness's job is to carry out what the model orders, exactly, whatever model it is.
+
+* **Coordinate convention per model:** `aura-cli calibrate --url <server>/v1 --model <id>` opens a test page, asks the model to point at known buttons and decides whether it answers in screenshot pixels, on a 0 to 1000 grid (Qwen-VL family) or 0 to 1. The result is saved in `%LOCALAPPDATA%\AgentAura\model_scale.json` and used automatically, prompts included (`coordinate_scale` in `harness.json` overrides it). Measured: `qwen/qwen3-vl-4b` answers on the 0 to 1000 grid, within a few pixels.
+* **Other models' JSON dialects are understood:** `coordinate`/`point`/`position`/`start_box`/`bbox` for x and y, `start_coordinate`/`end_coordinate`/`from`/`to` for drags, `"action": "click"` instead of `type`, `"keys": "ctrl+s"` as a string, `content`/`value` for typed text, `"element": "#7"`, a list of `actions` (the first is taken) or the action written at the top level.
+* **Miscounted element numbers are caught:** when the model names a target ("Search") but gives the number of a different element, the harness aims at the one element carrying that name, or lets the verifier look first when there is none.
+* **"Done" is checked against the screen:** when the task names exact text to type ("type the sentence hello from aura"), a done claim is rejected until that text is visible, and the model is told what is missing.
+* **The taskbar is always offered** (Start, Task View, pinned and running apps) as numbered elements, and "open X and ..." starts X without a model call.
+* **Orders suite:** `aura-cli conformance --browser chrome --only group:orders` runs a scripted model's orders (element numbers, pixels, dialects, an eight-step form, drag, scroll) through the whole agent loop and checks the test page received each one.

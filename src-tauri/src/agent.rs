@@ -238,7 +238,9 @@ impl AgentRuntime {
     pub fn with_data_root(data_root: std::path::PathBuf, with_hud: bool) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(8))
-            .timeout(Duration::from_secs(60))
+            // A small local vision model on a laptop-class machine can take well over a minute for a
+            // full screenshot prompt; stop and pause never wait for this (they cancel the request).
+            .timeout(Duration::from_secs(180))
             .user_agent("Agent-Aura/0.1.0")
             .build()
             .map_err(|error| format!("Failed to create HTTP client: {error}"))?;
@@ -1471,9 +1473,17 @@ async fn autonomous_loop(
                     })
                     .await
                     .unwrap_or_default();
-                    if !on_screen.contains(&wanted) && done_rejections < MAX_DONE_REJECTIONS {
+                    if !on_screen.contains(&wanted) {
                         done_rejections += 1;
                         trace.event(step_number, "done_check", json!({"claim": &message, "complete": false, "missing": format!("text '{expected}' not on screen"), "by": "harness"}));
+                        if done_rejections >= MAX_DONE_REJECTIONS {
+                            return Ok(AutonomousResponse {
+                                completed: false,
+                                stopped: false,
+                                steps_executed: executed_steps,
+                                message: format!("The agent said it was finished, but the text '{expected}' the task asked for is not on screen."),
+                            });
+                        }
                         session.push(StepRecord {
                             step: step_number,
                             thought: proposal.thought.clone(),

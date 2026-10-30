@@ -305,8 +305,18 @@ pub fn refine_action_to_target(elements: &[Element], target_text: &str, action: 
 }
 
 fn normalized(text: &str) -> String {
-    let lower = text.to_lowercase();
+    let lower = text.trim().to_lowercase();
     let lower = lower.strip_prefix("taskbar ").unwrap_or(&lower).to_owned();
+    // What a model reads off a key cap ("1", "+", "CE") against how the app names it for
+    // accessibility ("One", "Plus", "Clear entry"): both sides end up the same.
+    let spoken = match lower.as_str() {
+        "0" => "zero", "1" => "one", "2" => "two", "3" => "three", "4" => "four", "5" => "five", "6" => "six", "7" => "seven", "8" => "eight", "9" => "nine",
+        "+" => "plus", "-" | "\u{2212}" => "minus", "*" | "x" | "\u{00d7}" => "multiply by", "/" | "\u{00f7}" => "divide by", "=" => "equals",
+        "." | "," => "decimal separator", "ce" => "clear entry", "c" => "clear", "%" => "percent", "\u{232b}" | "backspace" => "backspace",
+        "+/-" | "\u{00b1}" => "positive negative",
+        _ => "",
+    };
+    let lower = if spoken.is_empty() { lower } else { spoken.to_owned() };
     lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ")
 }
 
@@ -380,6 +390,17 @@ mod tests {
         assert!(label_agrees(&named[1].label, "Search"));
         assert_eq!(exactly_named(&named, "Search").map(|e| e.id), Some(2));
         assert!(label_agrees("Save As...", "save as"));
+        let keypad = [
+            Element { id: 10, label: "One".into(), kind: "Button".into(), left: 0, top: 0, right: 40, bottom: 30 },
+            Element { id: 11, label: "Plus".into(), kind: "Button".into(), left: 50, top: 0, right: 90, bottom: 30 },
+            Element { id: 12, label: "Clear entry".into(), kind: "Button".into(), left: 100, top: 0, right: 140, bottom: 30 },
+            Element { id: 13, label: "Equals".into(), kind: "Button".into(), left: 150, top: 0, right: 190, bottom: 30 },
+        ];
+        assert_eq!(exactly_named(&keypad, "1").map(|e| e.id), Some(10), "a key cap and its accessible name");
+        assert_eq!(exactly_named(&keypad, "+").map(|e| e.id), Some(11));
+        assert_eq!(exactly_named(&keypad, "CE").map(|e| e.id), Some(12));
+        assert_eq!(exactly_named(&keypad, "=").map(|e| e.id), Some(13));
+        assert!(!label_agrees("Four", "0"));
         named.push(Element { id: 3, label: "Search".into(), kind: "Text".into(), left: 22, top: 2, right: 28, bottom: 8 });
         assert_eq!(exactly_named(&named, "Search").map(|e| e.id), Some(2), "a label inside its button is the same target");
         named.push(Element { id: 4, label: "Search".into(), kind: "Edit".into(), left: 500, top: 500, right: 540, bottom: 520 });

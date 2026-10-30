@@ -161,6 +161,7 @@
 - [x] Sandboxed Explorer test group (`--only group:explorer`: rename, new folder, copy/paste, delete one file, all inside a throwaway folder).
 - Measured with GUI-Owl 1.5 2B (LM Studio), grounding mode A, `eval` x2: notepad-type 0/2, calculator-sum 0/2. The 2B model misreads screens, claims "done" early and fails verification; modes B and C were not compared because a 0% baseline says nothing. Mode C's recovery of near misses is covered by a simulation (>= 95% within 14 px). OpenAI models are never used for testing (user rule).
 - [x] Per-window capture for parallel workers (PrintWindow; a covered window is read without raising it). 10 minute soak: 7 cycles, 315 cases, no failures, no leak (21 MB, 327 handles); it found and fixed stale test pages being reused and now waits while the PC is locked.
+- [x] Order execution sharpened with `qwen/qwen3-vl-4b` (LM Studio, 10.103.7.32): per-model coordinate calibration (`aura-cli calibrate`; Qwen3-VL-4B = 0-1000 grid), model JSON dialects, miscounted-element correction by name, taskbar elements, "open X and ..." fast path, done claims checked against the exact text asked for. New `orders` group: 8 scripted-model cases through the full loop, all passing.
 - Open: `zoom`/`observe` and grounding-mode pass rates with a model strong enough to complete the tasks (a larger local model or a mock), the 24 hour soak run (`aura-cli soak --minutes 1440`), display scaling 125/150/200% (manual OS change), flake watch on "long text by paste".
 
 ---
