@@ -14,6 +14,64 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+/// Hides anything in `text` that looks like a secret before it is written to a trace: values after
+/// words like password, api key, token, secret or Bearer, and long mixed letter-and-digit tokens
+/// (API keys, JWTs). Traces are for diagnosing runs, never for keeping credentials.
+pub fn mask_secrets(text: &str) -> String {
+    const WORDS: [&str; 8] = ["password", "passwd", "secret", "api_key", "apikey", "api-key", "token", "bearer"];
+    let is_value = |c: char| c.is_ascii_alphanumeric() || "_-.~+/=!@#$%^&*".contains(c);
+    let lower = text.to_ascii_lowercase();
+    let mut hidden = vec![false; text.len()];
+    for word in WORDS {
+        let mut from = 0;
+        while let Some(found) = lower[from..].find(word) {
+            let end = from + found + word.len();
+            let rest = &text[end..];
+            // Skip separators between the word and its value: quotes, colon, equals, spaces.
+            let skip = rest.len() - rest.trim_start_matches(|c: char| matches!(c, '"' | '\'' | ':' | '=' | ' ' | '\\')).len();
+            let value_start = end + skip;
+            // A bare word followed directly by more letters ("tokens", "passwords") is not a key.
+            if skip > 0 || word == "bearer" {
+                let len = text[value_start..].find(|c: char| !is_value(c)).unwrap_or(text.len() - value_start);
+                if len >= 3 {
+                    for flag in &mut hidden[value_start..value_start + len] {
+                        *flag = true;
+                    }
+                }
+            }
+            from = end;
+        }
+    }
+    // Long tokens that mix letters and digits, or that look like well-known key formats.
+    let mut index = 0;
+    for piece in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')) {
+        let start = index;
+        index += piece.len() + 1;
+        let has_digit = piece.chars().any(|c| c.is_ascii_digit());
+        let has_alpha = piece.chars().any(|c| c.is_ascii_alphabetic());
+        let known = piece.starts_with("sk-") || piece.starts_with("ghp_") || piece.starts_with("xox") || piece.starts_with("eyJ") || piece.starts_with("AKIA");
+        if piece.len() >= 24 && has_digit && has_alpha || (known && piece.len() >= 12) {
+            if let Some(range) = hidden.get_mut(start..start + piece.len()) {
+                range.iter_mut().for_each(|f| *f = true);
+            }
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut in_hidden = false;
+    for (i, ch) in text.char_indices() {
+        if hidden[i] {
+            if !in_hidden {
+                out.push_str("[hidden]");
+                in_hidden = true;
+            }
+        } else {
+            in_hidden = false;
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// How many run folders to keep; older ones are deleted when a new run starts.
 const KEEP_RUNS: usize = 30;
 
@@ -66,7 +124,7 @@ impl TraceWriter {
     /// Appends one line to `run.jsonl`.
     pub fn event(&self, step: u32, kind: &str, data: Value) {
         let Some(dir) = &self.dir else { return };
-        let line = json!({ "t_ms": now_ms() as u64, "step": step, "kind": kind, "data": data });
+        let line = mask_secrets(&json!({ "t_ms": now_ms() as u64, "step": step, "kind": kind, "data": data }).to_string());
         let result = OpenOptions::new()
             .create(true)
             .append(true)
@@ -99,12 +157,12 @@ impl StepTrace {
     }
 
     pub fn text(&self, name: &str, data: &str) {
-        self.bytes(name, data.as_bytes());
+        self.bytes(name, mask_secrets(data).as_bytes());
     }
 
     pub fn json<T: Serialize>(&self, name: &str, value: &T) {
         match serde_json::to_vec_pretty(value) {
-            Ok(bytes) => self.bytes(name, &bytes),
+            Ok(bytes) => self.bytes(name, mask_secrets(&String::from_utf8_lossy(&bytes)).as_bytes()),
             Err(error) => warn(name, &error),
         }
     }
@@ -154,6 +212,32 @@ mod tests {
         assert!(lines.contains("\"kind\":\"run_start\""));
         assert_eq!(fs::read(run_dir.join("step_001").join("obs.png")).unwrap(), vec![1, 2, 3]);
         assert!(run_dir.join("step_001").join("action.json").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn secrets_are_hidden_but_ordinary_text_is_not() {
+        let masked = mask_secrets(r#"{"api_key":"sk-abcdef1234567890abcdef","password": "hunter2!","note":"Authorization: Bearer abc123def456ghi789"}"#);
+        for secret in ["sk-abcdef1234567890abcdef", "hunter2", "abc123def456ghi789"] {
+            assert!(!masked.contains(secret), "{masked}");
+        }
+        assert!(masked.contains("[hidden]"));
+        let plain = "click the Save button in the Notepad window, tokens and passwords are discussed in chapter 4";
+        assert_eq!(mask_secrets(plain), plain);
+        let long_token = mask_secrets("key=AbCdEfGhIjKlMnOpQrStUvWx12345 end");
+        assert!(!long_token.contains("AbCdEf") && long_token.ends_with(" end"), "{long_token}");
+        assert_eq!(mask_secrets("a window title with ünïcode 日本語"), "a window title with ünïcode 日本語");
+    }
+
+    #[test]
+    fn traces_are_masked_on_disk() {
+        let root = temp_root("mask");
+        let trace = TraceWriter::start(&root, "run_m", "t", json!({}));
+        trace.event(1, "x", json!({"password": "topsecret99"}));
+        trace.step(1).text("raw.txt", "Bearer zzzzzzzzzzzz1111");
+        let dir = root.join("runs").join("run_m");
+        assert!(!fs::read_to_string(dir.join("run.jsonl")).unwrap().contains("topsecret99"));
+        assert!(!fs::read_to_string(dir.join("step_001").join("raw.txt")).unwrap().contains("zzzzzzzzzzzz1111"));
         let _ = fs::remove_dir_all(&root);
     }
 
