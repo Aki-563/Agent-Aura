@@ -1,5 +1,30 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+
+// Events from the app arrive through a polled queue (see `poll_events` in the app): Tauri's own
+// event listener is not permitted by this build's capabilities.
+type Handler<T> = (event: { payload: T }) => void;
+const handlers = new Map<string, Handler<any>[]>();
+let lastEventSeq = 0;
+let polling = false;
+function listen<T>(name: string, handler: Handler<T>): Promise<void> {
+  handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+  return Promise.resolve();
+}
+async function pollEvents(): Promise<void> {
+  if (polling) return;
+  polling = true;
+  try {
+    const reply = await invoke<{ last: number; events: { seq: number; event: string; payload: unknown }[] }>("poll_events", { after: lastEventSeq });
+    // A restarted queue (smaller counter) starts over.
+    lastEventSeq = reply.last < lastEventSeq ? 0 : reply.last;
+    for (const item of reply.events) for (const handler of handlers.get(item.event) ?? []) handler({ payload: item.payload });
+  } catch {
+    // The app is busy or closing; the next poll tries again.
+  } finally {
+    polling = false;
+  }
+}
+window.setInterval(() => void pollEvents(), 150);
 import { ReviewModal } from "./components/ReviewModal";
 import "./styles/hud.css";
 
@@ -66,7 +91,7 @@ app.innerHTML = `
         </div>
       </div>
       <div id="mini-more" class="mini-more">
-        <div class="mini-more-inner">
+        <div id="mini-more-inner" class="mini-more-inner">
           <div class="mini-actions">
             <button id="run-pause" class="mini-btn" type="button">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14M16 5v14" /></svg><span id="run-pause-label">Pause</span>

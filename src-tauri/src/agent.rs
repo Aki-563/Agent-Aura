@@ -485,6 +485,27 @@ pub fn submit_task_review(
     }
 }
 
+/// Sends one tiny image request with the configured model, exactly like a run does, so a wrong
+/// model ID, a key without access to that model or a server that rejects images shows up when the
+/// connection is tested instead of silently during the first step of a task.
+pub async fn probe_model(state: &AgentRuntime) -> Result<String, String> {
+    let config = cloned_config(state)?;
+    // A 1x1 white PNG.
+    const PIXEL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    let value = request_plan(
+        &state.client,
+        &config,
+        "You check that image input works. Reply with one JSON object.",
+        "Look at the image. Reply {\"evidence\":\"what you see\",\"complete\":true,\"missing\":\"\"}.",
+        PIXEL,
+        model_schema::DONE_CHECK,
+    )
+    .await
+    .map_err(|error| format!("The model '{}' did not answer a test request: {error}", config.model))?;
+    let text = extract_model_text(&value, config.protocol).map_err(|error| format!("The model '{}' answered in an unusable way: {error}", config.model))?;
+    Ok(truncate(&text, 120).to_owned())
+}
+
 #[tauri::command]
 pub async fn test_provider(
     state: State<'_, AgentRuntime>,
@@ -516,9 +537,11 @@ pub async fn test_provider(
         .ok()
         .and_then(|value| value.get("data").and_then(Value::as_array).map(Vec::len));
 
+    // The server is reachable; now check that this model really answers with an image attached.
+    probe_model(&state).await?;
     Ok(ConnectionTestResponse {
         ok: true,
-        message: format!("Connected to {}.", config.base_url),
+        message: format!("Connected to {}; model '{}' answered a test request.", config.base_url, config.model),
         models_returned,
     })
 }
@@ -653,6 +676,31 @@ pub trait HostBackend: Send + Sync {
     }
 }
 
+/// Events for the page, kept in a short queue it polls. Tauri's own event channel needs a
+/// capability file the build does not generate here, so the page reads events through the
+/// `poll_events` command instead (custom commands are not gated by it).
+static EVENT_QUEUE: Mutex<(u64, std::collections::VecDeque<(u64, String, Value)>)> = Mutex::new((0, std::collections::VecDeque::new()));
+const EVENT_QUEUE_MAX: usize = 60;
+
+fn queue_event(event: &str, payload: &Value) {
+    if let Ok(mut queue) = EVENT_QUEUE.lock() {
+        queue.0 += 1;
+        let seq = queue.0;
+        queue.1.push_back((seq, event.to_owned(), payload.clone()));
+        while queue.1.len() > EVENT_QUEUE_MAX {
+            queue.1.pop_front();
+        }
+    }
+}
+
+/// Everything emitted after `after` (0 = from the start of the queue), oldest first.
+#[tauri::command]
+pub fn poll_events(after: u64) -> Value {
+    let Ok(queue) = EVENT_QUEUE.lock() else { return json!({"last": after, "events": []}) };
+    let events: Vec<Value> = queue.1.iter().filter(|(seq, _, _)| *seq > after).map(|(seq, name, payload)| json!({"seq": seq, "event": name, "payload": payload})).collect();
+    json!({"last": queue.0, "events": events})
+}
+
 /// Cheap-to-clone handle to a [`HostBackend`].
 #[derive(Clone)]
 pub struct Host(Arc<dyn HostBackend>);
@@ -664,6 +712,7 @@ impl Host {
 
     pub fn emit<S: Serialize>(&self, event: &str, payload: S) -> Result<(), String> {
         let value = serde_json::to_value(payload).map_err(|error| error.to_string())?;
+        queue_event(event, &value);
         self.0.emit_value(event, value);
         Ok(())
     }

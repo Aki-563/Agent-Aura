@@ -151,6 +151,24 @@ async fn main() {
     if raw.first().map(String::as_str) == Some("schedule") {
         std::process::exit(agent_aura_lib::schedule_cli::schedule_command(&raw[1..]));
     }
+    if raw.first().map(String::as_str) == Some("doctor") {
+        // Checks the provider saved by the app: loads it, asks the model one tiny question.
+        let runtime = match AgentRuntime::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("could not start: {e}");
+                std::process::exit(2);
+            }
+        };
+        match agent_aura_lib::agent::probe_model(&runtime).await {
+            Ok(text) => println!("the saved model answered: {text}"),
+            Err(error) => {
+                println!("PROBLEM: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if raw.first().map(String::as_str) == Some("control") {
         // Talks to a running `aura-cli run` (or the app) through its local control port.
         let port = std::env::var("AURA_CONTROL_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(47_900u16);

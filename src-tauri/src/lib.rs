@@ -82,6 +82,7 @@ pub fn run() {
             agent::resume_autonomous_task,
             agent::steer_autonomous_task,
             agent::run_control_status,
+            agent::poll_events,
             agent::set_steer_box_open,
             agent::set_mini_height,
             agent::keep_run_panel_on_top,

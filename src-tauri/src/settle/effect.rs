@@ -313,7 +313,10 @@ pub fn is_small_persistent_motion(motion_box: Option<Roi>, window: Option<Roi>) 
     let area = |r: Roi| ((r.right - r.left).max(0) as i64) * ((r.bottom - r.top).max(0) as i64);
     let window_area = area(w).max(1);
     // Up to a quarter of the window: spinners, bars and skeleton blocks; whole-page redraws are larger.
-    area(m) * 4 <= window_area && area(m) > 0
+    // A text caret blinking (a thin bar a few pixels wide) is not a loading animation; a spinner,
+    // progress bar or skeleton block is at least about a dozen pixels both ways.
+    let (width, height) = ((m.right - m.left).max(0), (m.bottom - m.top).max(0));
+    area(m) * 4 <= window_area && width >= 10 && height >= 10
 }
 
 /// Counts sampled pixels whose luma differs noticeably between two same-sized RGBA frames.
@@ -609,6 +612,7 @@ mod tests {
         assert!(is_small_persistent_motion(Some(Roi { left: 100, top: 500, right: 900, bottom: 520 }), window), "a progress bar");
         assert!(!is_small_persistent_motion(Some(Roi { left: 0, top: 0, right: 1000, bottom: 700 }), window), "a whole page redraw");
         assert!(!is_small_persistent_motion(None, window));
+        assert!(!is_small_persistent_motion(Some(Roi { left: 300, top: 300, right: 303, bottom: 320 }), window), "a blinking text caret");
     }
 
     #[test]
