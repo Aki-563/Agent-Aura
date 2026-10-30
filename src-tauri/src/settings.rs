@@ -106,6 +106,12 @@ pub fn get() -> HarnessSettings {
     settings
 }
 
+/// Replaces the settings for this process only; nothing is written to disk (tests switch the
+/// grounding mode this way without touching the user's harness.json).
+pub fn set_in_memory(settings: HarnessSettings) {
+    *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(settings);
+}
+
 /// Replaces the settings and writes them to disk.
 pub fn set(settings: HarnessSettings) -> Result<(), String> {
     let text = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;

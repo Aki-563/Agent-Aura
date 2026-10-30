@@ -25,6 +25,7 @@ pub fn schedule_command(args: &[String]) -> i32 {
                 let when = match &s.when {
                     When::Every { seconds } => format!("every {seconds} s"),
                     When::DailyAt { times } => format!("daily at {}", times.join(", ")),
+                    When::Once { .. } => crate::schedule_prompt::describe(&s.when, crate::schedule::local_offset_minutes()),
                 };
                 let next_in = s.next_run_ms.saturating_sub(schedule::now_ms()) / 1000;
                 println!(

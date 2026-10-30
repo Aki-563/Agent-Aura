@@ -6,6 +6,7 @@ authors = ["Agent Aura Team"]
 license = "MIT"
 repository = ""
 edition = "2021"
+default-run = "agent-aura"
 
 [lib]
 name = "agent_aura_lib"
@@ -21,6 +22,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 log = "0.4"
 tokio = { version = "1", features = ["full"] }
+regex = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 sha2 = "0.10"
 image = "0.25"
@@ -68,7 +70,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_SystemInformation",
     "Win32_UI_Accessibility",
     "Win32_System_StationsAndDesktops",
-    "Win32_Storage_Xps"
+    "Win32_Storage_Xps",
+    "Win32_Devices_Display"
 ] }
 
 

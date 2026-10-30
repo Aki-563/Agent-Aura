@@ -2370,6 +2370,7 @@ async fn backoff(attempt: usize) {
 
 const INTERRUPTED_BY_USER: &str = "INTERRUPTED: the user paused or steered the run while the model was answering";
 
+#[cfg(test)]
 fn raw_base64_from_image_data_url(data_url: &str) -> Result<&str, String> {
     let (metadata, payload) = data_url
         .split_once(",")
@@ -3363,6 +3364,7 @@ fn coordinate_scale_for(model: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn build_proposal_prompt(width: u32, height: u32) -> String {
     build_proposal_prompt_for(width, height, &crate::settings::get().coordinate_scale)
 }
@@ -4695,6 +4697,8 @@ mod tests {
 }
 
 
+pub mod app;
+
 /// Direct access to the harness, for tests and tools: observe the screen exactly as the model
 /// would (same capture, same numbered elements), then give orders by element label. Orders go
 /// through the same scaling, bounds check, window guard, execution and settle measurement as a
@@ -4713,27 +4717,7 @@ pub mod driver {
         let config = cloned_config(state)?;
         let capture = &observation.capture;
         let image = if capture.jpeg.is_empty() { format!("data:image/png;base64,{}", BASE64.encode(&capture.webp)) } else { jpeg_data_url(&capture.jpeg) };
-        let mut answers = Vec::new();
-        let mut lines = Vec::new();
-        for (label, truth) in targets {
-            let prompt = "You point at things on a screenshot. Reply with JSON only: {\"found\": true, \"x\": X, \"y\": Y} for the centre of the named thing, using your usual coordinate convention.";
-            let input = format!("Point at the centre of: {label}");
-            let value = request_plan(&state.client, &config, prompt, &input, &image, model_schema::GROUNDING).await?;
-            let text = extract_model_text(&value, config.protocol)?;
-            let reply: Value = serde_json::from_str(model_schema::extract_json_object(&text).unwrap_or("{}")).unwrap_or_default();
-            let number = |k: &str| reply.get(k).and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())));
-            match (number("x"), number("y")) {
-                (Some(x), Some(y)) => {
-                    lines.push(format!("{label}: model said ({x:.0}, {y:.0}), true centre ({}, {})", truth.0, truth.1));
-                    answers.push(((x, y), *truth));
-                }
-                _ => lines.push(format!("{label}: no usable point in {text:?}")),
-            }
-        }
-        if answers.len() < 2 {
-            return Err(format!("too few usable answers to decide ({} of {})", answers.len(), targets.len()));
-        }
-        let (scale, error) = crate::coords::best_scale(&answers, (capture.width, capture.height));
+        let (scale, error, mut lines) = super::app::calibrate_on_image(state, &image, (capture.width, capture.height), targets).await?;
         lines.push(format!("verdict: '{}' answers in {scale} (mean miss {error:.0} px on a {}x{} image)", config.model, capture.width, capture.height));
         crate::coords::save_model_scale(&config.model, scale)?;
         lines.push(format!("saved: {scale} will be used for '{}' unless harness.json sets coordinate_scale", config.model));

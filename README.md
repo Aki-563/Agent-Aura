@@ -36,22 +36,20 @@ target\release\aura-cli.exe do click "#12" --task "open the Issues tab"   # one 
 target\release\aura-cli.exe eval --model <id> --suite basic --repeat 3 --url http://<host>:1234/v1   # model pass rates
 ```
 
-The frontend must be built (`npm run build` in `ui/`) before a release build so the exe embeds it. Copy `target/release/agent-aura.exe` to `dist/` (keep `dist/` to that exe, its manifest and `WebView2Loader.dll`). Test runs open and close real windows: do not run them while you are working in the same desktop.
+**Installer:** from the repo root, `ui
+ode_modules\.bin	auri build` builds the page, the exe (icon, version and the per-monitor-DPI manifest embedded) and `src-tauri	argeteleaseundle
+sis\Agent Aura_<version>_x64-setup.exe`, a per-user installer that needs no admin rights and fetches WebView2 if it is missing. A plain `cargo build --release` also embeds the page (build `ui/` first) and the manifest; `distgent-aura.exe` is a copy of that exe and needs no other file. Test runs open and close real windows: do not run them while you are working in the same desktop.
 
 ## Run the production app
 
-Launch `dist/agent-aura.exe`.
+Install it with the setup exe (or launch `distgent-aura.exe`). The home screen is one box: type the task and press Enter (or the arrow). While a task runs the arrow is a stop button; the footprints icon next to it sets the maximum number of steps.
 
-1. Choose **OpenAI Responses API** or **Local / OpenAI-compatible server**.
-2. Enter the exact vision-capable model ID.
-3. For OpenAI, enter the API key. For a local server, enter its `/v1` base URL and leave the key empty unless the server requires one.
-4. Select **Save & test connection**.
-5. Enter a desktop task, choose a maximum step limit, and select **Run autonomously**.
-6. Agent Aura repeatedly observes, plans, executes, and verifies without step approvals. Press **Esc** at any time to stop.
+* **Models:** the connection pill at the top right shows the active model (green when it answers); the gear opens Settings. **Add model** takes a local server's `/v1` address or the OpenAI API, the model ID and an optional key; **Connect** checks the model with a real image request and saves it as a preset in the app's database (`agent-aura.db`, the key encrypted with Windows DPAPI). Tap a preset to switch to it; the bin deletes it (and disconnects it if it was in use). A newly saved model's coordinate convention is measured automatically in the background on a generated picture with four labelled buttons (no screen, no clicks): Qwen3-VL-4B measures as the 0-1000 grid.
+* **Schedules from the prompt:** a task that names its own time is saved as a schedule instead of running now: "every day at 9am check my inbox", "open the build page every 30 minutes", "in 10 minutes open Teams", "tomorrow at 8:30, open Outlook". Only a phrase at the very start or end counts ("set an alarm at 7am" is a normal task). The toast offers **Run now instead**; Settings lists scheduled tasks with a delete button.
+* **Activity** (the pulse icon): recent tasks, and for the chosen one its result, step count, time and how many steps worked, then every step in order, left to right, with the screenshot the model looked at, the action and its outcome. "Remember this way" saves the run as a skill; tapping a step lets you write what should have happened instead.
+* **While a task runs** the window becomes a small player (no shadow) that you can drag anywhere; the place is remembered for the next run, and the player still steps aside when the agent needs to click under it. It shows what the agent is doing, the step number, and a speaker switch for the step reader. Hover it for Pause, the voice-input switch, End, the steer box and approval cards. The pointer becomes a violet-to-cyan arrow while Aura drives it and glides there along a slight curve; the screen edges glow in the state colour and a pill at the top centre names the state. Soft chimes mark the start and the end; `AURA_MUTE=1` silences them.
 
-While a run is active the screen edge glows and a banner at the top centre says what the agent is doing (taking a screenshot, thinking, working). A sound plays when a task starts and when it finishes; set the environment variable `AURA_MUTE=1` to silence it.
-
-Provider settings are saved in `%LOCALAPPDATA%\AgentAura\provider.json`; the API key in it is encrypted with Windows DPAPI, so only your Windows account on this computer can read it. It is never written to SQLite, browser storage, logs, traces or repository files. "Clear" in the app deletes the saved file. Press **Esc** while actions are executing to trigger the emergency stop.
+Provider settings are also kept in `%LOCALAPPDATA%\AgentAura\provider.json` for the active model (key DPAPI-encrypted, never written to logs, traces or repository files). Press **Esc** at any time to stop a run.
 
 ## Testing, voice, schedules, controls and the model JSON (Phase 9)
 
@@ -77,9 +75,9 @@ Provider settings are saved in `%LOCALAPPDATA%\AgentAura\provider.json`; the API
 
 **Per-app tips:** built-in profiles (browser, Excel, Word, editors, terminal, Explorer, creative apps) add a short tip to the prompt and scale the settle patience. Add your own in `%LOCALAPPDATA%\AgentAura\profiles.json` (a list of `{"processes": ["app"], "tips": "...", "settle_factor": 1.5}`).
 
-**Schedules screen:** the app has a Schedules section (add, pause, delete). Scheduled runs never ask you anything: risky actions are declined. A locked PC skips the run.
+**Schedules in the app:** written into the task itself (see above). Scheduled runs never ask you anything: risky actions are declined. A locked PC skips the run.
 
-**Checks and diagnostics:** `aura-cli doctor` asks the saved model one tiny question (Save & test connection does the same). `AURA_SELFTEST_TASK="open notepad" agent-aura.exe` runs a task through the real app and logs every event to `%LOCALAPPDATA%\AgentAura\selftest.log`. `node tools/ui-smoke.mjs "<task>"` drives the running app's page (start the app with `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222`). `aura-cli soak --minutes 1440` repeats a safe slice of the desktop suite and reports memory, handle and GDI-object growth (the 24 hour run). `cargo test --lib real_speech -- --ignored` is the audible speech check; `cargo test --lib long_pause -- --ignored` is the 10 minute pause test (`AURA_PAUSE_SECS` shortens it).
+**Checks and diagnostics:** `aura-cli doctor` asks the saved model one tiny question (Connect does the same). `AURA_SELFTEST_TASK="open notepad" agent-aura.exe` runs a task through the real app and logs every event to `%LOCALAPPDATA%\AgentAura\selftest.log`. `node tools/cdp.mjs eval|shot|errors` drives and screenshots the running app's page (start the app with `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222`). `aura-cli soak --minutes 1440` repeats a safe slice of the desktop suite and reports memory, handle and GDI-object growth (the 24 hour run). `cargo test --lib real_speech -- --ignored` is the audible speech check; `cargo test --lib long_pause -- --ignored` is the 10 minute pause test (`AURA_PAUSE_SECS` shortens it).
 
 **Traces never keep secrets:** values after password, api key, token or Bearer, and long mixed-case tokens, are written as `[hidden]`.
 
@@ -92,4 +90,5 @@ The harness's job is to carry out what the model orders, exactly, whatever model
 * **Miscounted element numbers and stray points are caught:** when the model names a target ("Search", or a key cap like "1" or "+") but gives the number of, or a point on, a different element, the harness aims at the one element carrying that name (accessible names such as "One" and "Plus" count), or lets the verifier look first when there is none.
 * **"Done" is checked against the screen:** when the task names exact text to type ("type the sentence hello from aura"), a done claim is rejected until that text is visible, and the model is told what is missing.
 * **The taskbar is always offered** (Start, Task View, pinned and running apps) as numbered elements, and "open X and ..." starts X without a model call.
-* **Orders suite:** `aura-cli conformance --browser chrome --only group:orders` runs a scripted model's orders (element numbers, pixels, dialects, an eight-step form, drag, scroll) through the whole agent loop and checks the test page received each one.
+* **Orders suite:** `aura-cli conformance --browser chrome --only group:orders` runs a scripted model's orders (element numbers, pixels, dialects, an eight-step form, drag, scroll, zoom then a click in the zoomed picture, observe, grounding modes B and C) through the whole agent loop and checks the test page received each one.
+* **Every display scale:** `aura-cli scale-test` switches the main monitor to each scale it offers up to 200 % (the same call Windows Settings uses), runs the scale-sensitive groups (`system`, `precision`, `click`, `orders`) in a fresh process at each, and puts your scale back, also if it is stopped with Esc.

@@ -60,7 +60,7 @@ fn sender() -> Option<Sender<Command>> {
 }
 
 /// The speaking loop: always acts on the newest sentence, never builds a queue.
-pub fn run(mut backend: Box<dyn TtsBackend>, commands: Receiver<Command>) {
+fn run(mut backend: Box<dyn TtsBackend>, commands: Receiver<Command>) {
     let mut configured: Option<VoiceSettings> = None;
     let mut started: Option<Instant> = None;
     while let Ok(first) = commands.recv() {

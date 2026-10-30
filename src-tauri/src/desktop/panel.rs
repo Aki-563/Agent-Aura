@@ -5,14 +5,52 @@
 use tauri::{PhysicalPosition, PhysicalSize, WebviewWindow};
 
 /// The mini player: a compact capsule that grows when hovered (the page asks for its height).
-const PANEL_WIDTH_DIP: f64 = 372.0;
-/// Collapsed height: the capsule plus room for its soft shadow.
-pub const MINI_HEIGHT_DIP: f64 = 84.0;
+const PANEL_WIDTH_DIP: f64 = 360.0;
+/// Collapsed height: the capsule plus a few transparent pixels around it (no shadow).
+pub const MINI_HEIGHT_DIP: f64 = 68.0;
 /// Tallest the player may grow (approval card, steer box).
 pub const MAX_HEIGHT_DIP: f64 = 460.0;
 const MARGIN_DIP: f64 = 12.0;
 
 static HEIGHT_DIP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(MINI_HEIGHT_DIP as u32);
+
+/// Where the user last dropped the player (physical top-left), kept between runs.
+static USER_POSITION: std::sync::Mutex<Option<Option<(i32, i32)>>> = std::sync::Mutex::new(None);
+
+fn position_file() -> Option<std::path::PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("AgentAura").join("mini_position.json"))
+}
+
+fn user_position() -> Option<(i32, i32)> {
+    let mut cached = USER_POSITION.lock().unwrap_or_else(|e| e.into_inner());
+    if cached.is_none() {
+        let loaded = position_file()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|t| serde_json::from_str::<(i32, i32)>(&t).ok());
+        *cached = Some(loaded);
+    }
+    cached.flatten()
+}
+
+/// Remembers where the player is now (called after the user dragged it).
+pub fn remember_position(window: &WebviewWindow) {
+    let Ok(position) = window.outer_position() else { return };
+    let point = (position.x, position.y);
+    *USER_POSITION.lock().unwrap_or_else(|e| e.into_inner()) = Some(Some(point));
+    if let Some(path) = position_file() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, serde_json::to_string(&point).unwrap_or_default());
+    }
+}
+
+/// The remembered place, pulled fully onto the monitor (a monitor may have been unplugged).
+pub fn clamp_to_monitor(point: (i32, i32), monitor_pos: (i32, i32), monitor_size: (u32, u32), panel: (u32, u32)) -> (i32, i32) {
+    let max_x = monitor_pos.0 + monitor_size.0 as i32 - panel.0 as i32;
+    let max_y = monitor_pos.1 + monitor_size.1 as i32 - panel.1 as i32;
+    (point.0.clamp(monitor_pos.0, max_x.max(monitor_pos.0)), point.1.clamp(monitor_pos.1, max_y.max(monitor_pos.1)))
+}
 
 /// Window geometry to restore after the run.
 pub struct SavedLayout {
@@ -114,13 +152,17 @@ pub fn set_height(window: &WebviewWindow, height_dip: f64) {
 
 /// Shrinks the window into a non-focusable corner panel. Returns what to restore afterwards.
 pub fn enter_run_mode(window: &WebviewWindow) -> Option<SavedLayout> {
+    // A minimized window reports the tiny iconic size; restoring that afterwards left the app as a
+    // small rectangle. Take the real size first.
+    if window.is_minimized().unwrap_or(false) {
+        let _ = window.unminimize();
+    }
     let saved = SavedLayout {
         position: window.outer_position().ok()?,
         size: window.outer_size().ok()?,
         was_maximized: window.is_maximized().unwrap_or(false),
     };
     let monitor = monitor_of(window)?;
-    let panel = panel_size(monitor.scale);
     let margin = (MARGIN_DIP * monitor.scale) as i32;
     if saved.was_maximized {
         let _ = window.unmaximize();
@@ -128,12 +170,17 @@ pub fn enter_run_mode(window: &WebviewWindow) -> Option<SavedLayout> {
     // A frameless capsule: no title bar, no border, no taskbar button, never takes the keyboard.
     HEIGHT_DIP.store(MINI_HEIGHT_DIP as u32, std::sync::atomic::Ordering::SeqCst);
     let panel = panel_size(monitor.scale);
+    // The home window's minimum size would stop it from becoming a small capsule.
+    let _ = window.set_min_size(None::<tauri::Size>);
     let _ = window.set_resizable(false);
     let _ = window.set_decorations(false);
     let _ = window.set_shadow(false);
     let _ = window.set_skip_taskbar(true);
     let _ = window.set_size(PhysicalSize::new(panel.0, panel.1));
-    let (x, y) = corner_position(Corner::TopRight, monitor.position, monitor.size, panel, margin);
+    let (x, y) = match user_position() {
+        Some(point) => clamp_to_monitor(point, monitor.position, monitor.size, panel),
+        None => corner_position(Corner::TopRight, monitor.position, monitor.size, panel, margin),
+    };
     let _ = window.set_position(PhysicalPosition::new(x, y));
     let _ = window.set_always_on_top(true);
     let _ = window.set_focusable(false);
@@ -148,12 +195,16 @@ pub fn leave_run_mode(window: &WebviewWindow, saved: Option<SavedLayout>) {
     let _ = window.set_shadow(true);
     let _ = window.set_resizable(true);
     let _ = window.set_skip_taskbar(false);
-    if let Some(saved) = saved {
+    let _ = window.set_min_size(Some(tauri::Size::Logical(tauri::LogicalSize::new(640.0, 480.0))));
+    if let Some(saved) = saved.filter(|s| s.size.width >= 400 && s.size.height >= 300) {
         let _ = window.set_size(saved.size);
         let _ = window.set_position(saved.position);
         if saved.was_maximized {
             let _ = window.maximize();
         }
+    } else {
+        let _ = window.set_size(tauri::LogicalSize::new(1040.0, 720.0));
+        let _ = window.center();
     }
     let _ = window.set_focus();
 }
@@ -164,6 +215,14 @@ pub fn move_away_from(window: &WebviewWindow, points: &[(i32, i32)]) -> bool {
     let Some(monitor) = monitor_of(window) else { return false };
     let panel = panel_size(monitor.scale);
     let margin = (MARGIN_DIP * monitor.scale) as i32;
+    // The user's own place first, when it is clear of the points.
+    if let Some(point) = user_position() {
+        let (x, y) = clamp_to_monitor(point, monitor.position, monitor.size, panel);
+        let padded = ((x - 24, y - 24), (panel.0 + 48, panel.1 + 48));
+        if !points.iter().any(|p| rect_contains(padded.0, padded.1, *p)) {
+            return window.set_position(PhysicalPosition::new(x, y)).is_ok();
+        }
+    }
     let Some(corner) = corner_avoiding(monitor.position, monitor.size, panel, margin, points) else {
         return false;
     };
@@ -191,6 +250,13 @@ mod tests {
         assert_ne!(corner, Corner::TopRight);
         // No points: the preferred corner is kept.
         assert_eq!(corner_avoiding(monitor.0, monitor.1, (440, 620), 12, &[]), Some(Corner::TopRight));
+    }
+
+    #[test]
+    fn a_remembered_place_is_pulled_back_onto_the_monitor() {
+        assert_eq!(clamp_to_monitor((1800, 900), (0, 0), (1920, 1080), (360, 68)), (1560, 900));
+        assert_eq!(clamp_to_monitor((-500, -20), (0, 0), (1920, 1080), (360, 68)), (0, 0));
+        assert_eq!(clamp_to_monitor((400, 300), (0, 0), (1920, 1080), (360, 68)), (400, 300));
     }
 
     #[test]

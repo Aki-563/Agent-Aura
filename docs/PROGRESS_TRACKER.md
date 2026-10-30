@@ -164,6 +164,21 @@
 - [x] Order execution sharpened with `qwen/qwen3-vl-4b` (LM Studio, 10.103.7.32): per-model coordinate calibration (`aura-cli calibrate`; Qwen3-VL-4B = 0-1000 grid), model JSON dialects, miscounted-element correction by name, taskbar elements, "open X and ..." fast path, done claims checked against the exact text asked for. New `orders` group: 9 scripted-model cases through the full loop. Key-cap names match accessible names (1=One, +=Plus, CE=Clear entry); raw-coordinate clicks are name-checked too; taskbar elements rank below app controls. Qwen3-VL-4B basic eval: 6/7 (calculator fails on the model skipping "+", not on execution).
 - Open: `zoom`/`observe` and grounding-mode pass rates with a model strong enough to complete the tasks (a larger local model or a mock), the 24 hour soak run (`aura-cli soak --minutes 1440`), display scaling 125/150/200% (manual OS change), flake watch on "long text by paste".
 
+
+### Phase 10: Ship-ready app and harness polish (2026-10-30, night)
+- [x] **New home screen:** one centred task box (Enter or the arrow runs; the arrow turns into Stop while a task runs; the footprints icon sets the step limit), connection pill and Settings at the top right, Activity behind a button. No descriptions, Inter throughout, iOS-like springs (transform and opacity only).
+- [x] **Model presets in the database** (`ModelPresets` table, key DPAPI-encrypted): Connect checks the model with a real image request and saves it; tap to switch, bin to delete. The saved provider of an older version becomes the first preset.
+- [x] **Automatic coordinate calibration** of a newly saved model on a generated four-button picture (no screen, no clicks), in the background; Qwen3-VL-4B measured as the 0-1000 grid, the same as `aura-cli calibrate` on the real page.
+- [x] **Schedules from the prompt** ("every day at 9am ...", "... every 30 minutes", "in 10 minutes ...", "tomorrow at 8:30 ..."), one-off schedules, "Run now instead"; the schedule form is gone from the UI.
+- [x] **Activity view:** recent runs, result, steps, time, steps that worked, and each step left to right with its screenshot, action and outcome; "Remember this way" and per-step corrections.
+- [x] **Mini player:** no shadow, draggable (place remembered, still steps aside for clicks), step reader switch, step number; the overlapping-words bug fixed (fast updates could leave two lines "current").
+- [x] **Pointer:** a violet-to-cyan arrow instead of the ring (sized to the system cursor size, tip = hotspot); the halo ring is gone; glides over 240-620 ms along a slight curve with a 1 ms timer, clamped to the screen.
+- [x] **Edge glow** 84 px deep at 1080p (was 22) with an accent colour drifting along the edges; the status pill no longer fades its last letters. **Sounds:** soft two- and three-note chimes with a little room, quieter.
+- [x] **Window:** a run started while the app is minimized no longer leaves it as a small rectangle (the real size is saved; a tiny saved size is replaced by the default); minimum size 640 x 480; dark title bar.
+- [x] **Packaging:** `tauri_build` runs again (icon, version and the per-monitor-DPI manifest embedded; no loose manifest or DLL next to the exe; the local cargo registry copy of `tauri` had been patched by an old GNU workaround and was restored). `tauri build` makes a per-user NSIS installer.
+- [x] **Harness:** `zoom`, `observe` and grounding modes B and C now run through the whole loop in the `orders` group; `focus_window` retries when a system pop-up holds the foreground; `aura-cli scale-test` repeats the scale-sensitive groups at every display scale the monitor offers (up to 200 %) and puts the user's scale back.
+- Open: only the 24 hour soak run (`aura-cli soak --minutes 1440`).
+
 ---
 
 ## 3. Handover Protocol for Coding Agents

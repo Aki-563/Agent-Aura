@@ -1,14 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
+import "@fontsource-variable/inter";
+import "./styles/app.css";
 
 // Events from the app arrive through a polled queue (see `poll_events` in the app): Tauri's own
 // event listener is not permitted by this build's capabilities.
-type Handler<T> = (event: { payload: T }) => void;
+type Handler<T> = (payload: T) => void;
 const handlers = new Map<string, Handler<any>[]>();
 let lastEventSeq = 0;
 let polling = false;
-function listen<T>(name: string, handler: Handler<T>): Promise<void> {
+function on<T>(name: string, handler: Handler<T>): void {
   handlers.set(name, [...(handlers.get(name) ?? []), handler]);
-  return Promise.resolve();
 }
 async function pollEvents(): Promise<void> {
   if (polling) return;
@@ -17,7 +18,7 @@ async function pollEvents(): Promise<void> {
     const reply = await invoke<{ last: number; events: { seq: number; event: string; payload: unknown }[] }>("poll_events", { after: lastEventSeq });
     // A restarted queue (smaller counter) starts over.
     lastEventSeq = reply.last < lastEventSeq ? 0 : reply.last;
-    for (const item of reply.events) for (const handler of handlers.get(item.event) ?? []) handler({ payload: item.payload });
+    for (const item of reply.events) for (const handler of handlers.get(item.event) ?? []) handler(item.payload);
   } catch {
     // The app is busy or closing; the next poll tries again.
   } finally {
@@ -25,912 +26,490 @@ async function pollEvents(): Promise<void> {
   }
 }
 window.setInterval(() => void pollEvents(), 150);
-import { ReviewModal } from "./components/ReviewModal";
-import "./styles/hud.css";
+
+// ---- Types -------------------------------------------------------------------------------------
 
 type ApiProtocol = "open_ai_responses" | "open_ai_compatible_chat";
 
-interface ProviderStatus {
-  configured: boolean;
-  protocol: ApiProtocol | null;
-  baseUrl: string | null;
-  model: string | null;
+interface Preset {
+  id: string;
+  name: string;
+  protocol: ApiProtocol;
+  baseUrl: string;
+  model: string;
   hasApiKey: boolean;
+  active: boolean;
+  coordinates: string | null;
 }
 
-interface ConnectionTestResponse {
-  ok: boolean;
-  message: string;
-  modelsReturned: number | null;
-}
-
-interface AutonomousProgress {
-  phase: "starting" | "capturing" | "observing" | "proposing" | "verifying" | "acting" | "settling" | "result" | "checking" | "paused" | "confirm" | "retrying" | "completed" | "stopped";
+interface Progress {
+  phase: string;
   step: number;
   message: string;
   thought: string | null;
   actions: Record<string, unknown>[] | null;
-  screenshotDataUrl: string | null;
-  screenshotWidth: number | null;
-  screenshotHeight: number | null;
 }
 
-interface TaskRunReview {
-  run: {
-    id: string;
-    prompt: string;
-    normalizedIntent: string;
-    status: string;
-    summary: string | null;
-  };
-  steps: Array<{
-    stepIndex: number;
-    actionSummary: string;
-    outcome: string;
-    screenshotDataUrl: string | null;
-  }>;
+interface RunSummary {
+  id: string;
+  prompt: string;
+  status: string;
+  summary: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  steps: number;
 }
 
-interface AutonomousResponse {
-  completed: boolean;
-  stopped: boolean;
-  stepsExecuted: number;
-  message: string;
+interface RunStep {
+  index: number;
+  thought: string;
+  target: string;
+  expected: string;
+  action: Record<string, unknown> | null;
+  outcome: string;
+  window: string;
+  screenshot: string | null;
 }
 
-const app = document.querySelector<HTMLDivElement>("#app")!;
-
-app.innerHTML = `
-  <section id="run-view" class="run-view" aria-live="polite">
-    <div id="mini" class="mini">
-      <div class="mini-bar">
-        <span id="mini-dot" class="mini-dot phase-starting"></span>
-        <div class="mini-text">
-          <div id="mini-main" class="swap"><span class="swap-line current">Getting ready</span></div>
-          <div id="mini-sub" class="mini-sub">Starting</div>
-        </div>
-      </div>
-      <div id="mini-more" class="mini-more">
-        <div id="mini-more-inner" class="mini-more-inner">
-          <div class="mini-actions">
-            <button id="run-pause" class="mini-btn" type="button">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14M16 5v14" /></svg><span id="run-pause-label">Pause</span>
-            </button>
-            <button id="run-mic" class="mini-btn icon-only" type="button" aria-pressed="false" title="Voice input (coming soon)">
-              <svg class="mic-on" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="12" rx="3" /><path d="M5 11a7 7 0 0 0 14 0M12 18v3" /></svg>
-              <svg class="mic-off" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="12" rx="3" /><path d="M5 11a7 7 0 0 0 14 0M12 18v3M4 4l16 16" /></svg>
-            </button>
-            <button id="run-stop" class="mini-btn danger" type="button">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2" /></svg><span>End task</span>
-            </button>
-          </div>
-          <form id="run-steer-form" class="steer" autocomplete="off">
-            <input id="run-steer-text" type="text" placeholder="Tell Aura what to change…" maxlength="400" />
-            <button id="run-steer-send" class="steer-send" type="submit" aria-label="Send" disabled>
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7" /></svg>
-            </button>
-          </form>
-          <div id="run-confirm" class="run-confirm hidden" role="alertdialog" aria-live="assertive">
-            <div id="run-confirm-title" class="run-confirm-title">Allow this action?</div>
-            <div id="run-confirm-text" class="run-confirm-text"></div>
-            <div class="run-confirm-buttons">
-              <button id="run-confirm-deny" class="mini-btn" type="button">No, choose another way</button>
-              <button id="run-confirm-allow" class="mini-btn primary" type="button">Yes, allow it</button>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-    <!-- Details the progress handlers still fill in; not shown in the mini player. -->
-    <div class="run-legacy hidden">
-      <span id="run-step"></span><div id="run-status"></div><span id="run-phase"></span><span id="run-detail"></span>
-      <div id="run-thought"></div><div id="run-action"></div><div id="run-result"></div>
-      <img id="run-shot" alt="" /><div id="run-log"></div>
-    </div>
-  </section>
-
-  <main class="shell">
-    <header class="topbar">
-      <div>
-        <div class="eyebrow">WINDOWS DESKTOP AGENT</div>
-        <h1>Agent Aura</h1>
-        <p>Observe, plan, and execute real Windows tasks autonomously.</p>
-      </div>
-      <div id="connection-badge" class="badge offline"><span></span>Not configured</div>
-    </header>
-
-    <section class="panel settings-panel">
-      <div class="section-heading">
-        <div>
-          <h2>Model connection</h2>
-          <p>Settings are saved on this computer. The API key is encrypted with Windows (only your Windows account can read it) and is never written to logs.</p>
-        </div>
-        <button id="clear-provider" class="button ghost" type="button">Clear</button>
-      </div>
-
-      <div class="form-grid">
-        <label>
-          <span>API type</span>
-          <select id="protocol">
-            <option value="open_ai_responses">OpenAI Responses API</option>
-            <option value="open_ai_compatible_chat">Local / OpenAI-compatible server</option>
-          </select>
-        </label>
-        <label>
-          <span>Model</span>
-          <input id="model" autocomplete="off" placeholder="Enter the exact model ID" />
-        </label>
-        <label class="wide">
-          <span>Base URL</span>
-          <input id="base-url" autocomplete="off" value="https://api.openai.com/v1" />
-        </label>
-        <label class="wide">
-          <span id="api-key-label">OpenAI API key</span>
-          <input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Saved encrypted on this computer" />
-        </label>
-      </div>
-
-      <div class="button-row">
-        <button id="save-provider" class="button primary" type="button">Save & test connection</button>
-      </div>
-    </section>
-
-    <section class="workspace">
-      <div class="panel task-panel">
-        <div class="section-heading">
-          <div>
-            <h2>Task</h2>
-            <p>Agent Aura runs continuously without step approvals. Press Esc at any time to stop.</p>
-          </div>
-        </div>
-        <label>
-          <span>What should the agent do?</span>
-          <textarea id="task" rows="5" placeholder="Describe a concrete task on the current Windows desktop"></textarea>
-        </label>
-        <div class="button-row run-row">
-          <label class="step-limit">
-            <span>Maximum steps</span>
-            <input id="max-steps" type="number" min="1" max="100" value="12" />
-          </label>
-          <button id="stop-task" class="button danger" type="button" disabled>Stop</button>
-          <button id="run-task" class="button primary" type="button">Run autonomously</button>
-        </div>
-
-        <div id="plan-card" class="plan-card hidden">
-          <div class="plan-copy">
-            <div class="eyebrow">MODEL PROPOSAL · ONE STEP</div>
-            <h3 id="plan-thought"></h3>
-            <div id="action-list" class="action-list"></div>
-          </div>
-        </div>
-      </div>
-
-      <aside class="panel observation-panel">
-        <div class="section-heading">
-          <div>
-            <h2>Latest observation</h2>
-            <p id="capture-meta">No screen captured yet.</p>
-          </div>
-        </div>
-        <div class="preview-frame">
-          <div id="preview-empty">The real screen capture will appear here.</div>
-          <img id="screen-preview" class="hidden" alt="Latest captured Windows desktop" />
-        </div>
-      </aside>
-    </section>
-
-    <section class="panel schedule-panel">
-      <div class="section-heading">
-        <div>
-          <h2>Schedules</h2>
-          <p>Repeat a task on a timer while Aura is open. Between runs nothing is captured and the model is not called. Scheduled runs never ask you anything: risky actions are declined.</p>
-        </div>
-      </div>
-      <div class="form-grid">
-        <label class="wide">
-          <span>Task</span>
-          <input id="sched-task" autocomplete="off" placeholder="For example: check the build page and note if anything is red" />
-        </label>
-        <label>
-          <span>Repeat</span>
-          <select id="sched-mode">
-            <option value="every">Every…</option>
-            <option value="daily">Every day at…</option>
-          </select>
-        </label>
-        <label>
-          <span id="sched-value-label">Interval (30s, 5m, 2h)</span>
-          <input id="sched-value" autocomplete="off" value="30m" />
-        </label>
-        <label>
-          <span>If the last run is still going</span>
-          <select id="sched-overlap">
-            <option value="skip">Skip this run</option>
-            <option value="queue">Run it right after</option>
-            <option value="cancel">Stop the old one</option>
-          </select>
-        </label>
-        <label>
-          <span>If the PC was asleep</span>
-          <select id="sched-missed">
-            <option value="run">Run once when it wakes</option>
-            <option value="skip">Skip the missed runs</option>
-          </select>
-        </label>
-        <label class="wide check">
-          <input id="sched-changed" type="checkbox" />
-          <span>Only run when the screen changed since the last run</span>
-        </label>
-      </div>
-      <div class="button-row">
-        <span id="sched-error" class="inline-error"></span>
-        <button id="sched-add" class="button primary" type="button">Add schedule</button>
-      </div>
-      <div id="sched-list" class="sched-list" aria-live="polite"></div>
-    </section>
-
-    <section class="panel activity-panel">
-      <div class="section-heading">
-        <div>
-          <h2>Activity</h2>
-          <p>Only real connection, capture, planning, and execution events are shown.</p>
-        </div>
-      </div>
-      <div id="activity" class="activity" aria-live="polite"></div>
-    </section>
-  </main>
-`;
-
-const protocol = element<HTMLSelectElement>("protocol");
-const model = element<HTMLInputElement>("model");
-const baseUrl = element<HTMLInputElement>("base-url");
-const apiKey = element<HTMLInputElement>("api-key");
-const apiKeyLabel = element<HTMLElement>("api-key-label");
-const task = element<HTMLTextAreaElement>("task");
-const badge = element<HTMLElement>("connection-badge");
-const planCard = element<HTMLElement>("plan-card");
-const planThought = element<HTMLElement>("plan-thought");
-const actionList = element<HTMLElement>("action-list");
-const screenPreview = element<HTMLImageElement>("screen-preview");
-const previewEmpty = element<HTMLElement>("preview-empty");
-const captureMeta = element<HTMLElement>("capture-meta");
-const activity = element<HTMLElement>("activity");
-
-protocol.addEventListener("change", updateProtocolFields);
-element<HTMLButtonElement>("save-provider").addEventListener("click", saveAndTestProvider);
-element<HTMLButtonElement>("clear-provider").addEventListener("click", clearProvider);
-element<HTMLButtonElement>("run-task").addEventListener("click", runAutonomousTask);
-element<HTMLButtonElement>("stop-task").addEventListener("click", stopAutonomousTask);
-element<HTMLButtonElement>("run-stop").addEventListener("click", stopAutonomousTask);
-element<HTMLButtonElement>("run-confirm-allow").addEventListener("click", () => void answerConfirmation(true));
-element<HTMLButtonElement>("run-confirm-deny").addEventListener("click", () => void answerConfirmation(false));
-element<HTMLButtonElement>("run-pause").addEventListener("click", () => void togglePause());
-element<HTMLButtonElement>("run-mic").addEventListener("click", toggleMic);
-initMiniPlayer();
-window.setInterval(() => void pollRunControls(), 250);
-window.setInterval(() => void keepOnTop(), 2000);
-
-updateProtocolFields();
-void refreshProviderStatus();
-void listen<{ text: string }>("agent-voice", (event) => {
-  hasVoiceLine = true;
-  setMiniText(event.payload.text);
-});
-void listen<AutonomousProgress>("agent-progress", (event) => renderAutonomousProgress(event.payload));
-void listen<{ id: string; message: string; kind?: string }>("agent-confirm", (event) =>
-  { showConfirmation(event.payload.id, event.payload.message, event.payload.kind ?? "approval"); openMini(); },
-);
-
-function element<T extends HTMLElement>(id: string): T {
-  const value = document.getElementById(id);
-  if (!value) throw new Error(`Missing UI element: ${id}`);
-  return value as T;
-}
-
-function updateProtocolFields(): void {
-  if (protocol.value === "open_ai_responses") {
-    baseUrl.value = "https://api.openai.com/v1";
-    apiKeyLabel.textContent = "OpenAI API key";
-    apiKey.placeholder = "Required; saved encrypted on this computer";
-  } else {
-    if (baseUrl.value === "https://api.openai.com/v1" || baseUrl.value.trim() === "") {
-      baseUrl.value = "http://localhost:11434/v1";
-    }
-    apiKeyLabel.textContent = "API key (optional for local servers)";
-    apiKey.placeholder = "Leave empty when the local server does not require one";
-  }
-}
-
-async function refreshProviderStatus(): Promise<void> {
-  try {
-    renderProviderStatus(await invoke<ProviderStatus>("get_provider_status"));
-  } catch (error) {
-    log("error", toMessage(error));
-  }
-}
-
-// A saved key never comes back to the page. The field shows this mask instead, so it is plain that
-// the key is stored; typing replaces it, and sending the mask unchanged means "keep the saved key".
-const SAVED_KEY_MASK = "•".repeat(24);
-
-apiKey.addEventListener("focus", () => {
-  if (apiKey.value === SAVED_KEY_MASK) apiKey.select();
-});
-
-async function saveAndTestProvider(): Promise<void> {
-  const button = element<HTMLButtonElement>("save-provider");
-  await withBusy(button, "Testing…", async () => {
-    const status = await invoke<ProviderStatus>("configure_provider", {
-      input: {
-        protocol: protocol.value as ApiProtocol,
-        baseUrl: baseUrl.value.trim(),
-        model: model.value.trim(),
-        apiKey: apiKey.value === SAVED_KEY_MASK ? "" : apiKey.value,
-      },
-    });
-    renderProviderStatus(status);
-    log("info", `Configuration loaded for ${status.model} at ${status.baseUrl}.`);
-
-    const result = await invoke<ConnectionTestResponse>("test_provider");
-    const count = result.modelsReturned == null ? "" : ` ${result.modelsReturned} model(s) reported.`;
-    log("success", `${result.message}${count}`);
-    badge.className = "badge online";
-    badge.innerHTML = "<span></span>Connected";
-  });
-}
-
-async function clearProvider(): Promise<void> {
-  try {
-    renderProviderStatus(await invoke<ProviderStatus>("clear_provider"));
-    apiKey.value = "";
-    clearPlan();
-    log("info", "Saved provider settings, the stored API key and the pending plan were deleted.");
-  } catch (error) {
-    log("error", toMessage(error));
-  }
-}
-
-async function runAutonomousTask(): Promise<void> {
-  const runButton = element<HTMLButtonElement>("run-task");
-  const stopButton = element<HTMLButtonElement>("stop-task");
-  const maxSteps = Number(element<HTMLInputElement>("max-steps").value);
-  clearPlan();
-  runButton.disabled = true;
-  runButton.textContent = "Running…";
-  stopButton.disabled = false;
-  log("info", "Autonomous execution started. Press Esc to stop immediately.");
-  resetRunView(maxSteps);
-  document.body.classList.add("running");
-  try {
-    const response = await invoke<AutonomousResponse>("run_autonomous_task", {
-      task: task.value,
-      maxSteps,
-    });
-    log(response.completed ? "success" : "info", `${response.message} Steps executed: ${response.stepsExecuted}.`);
-    if (response.completed) await showTaskReview();
-  } catch (error) {
-    log("error", toMessage(error));
-  } finally {
-    document.body.classList.remove("running");
-    runButton.disabled = false;
-    runButton.textContent = "Run autonomously";
-    stopButton.disabled = true;
-  }
-}
-
-// ---- Live run panel ------------------------------------------------------------------------
-
-let pendingConfirmation: string | null = null;
-
-function showConfirmation(id: string, message: string, kind: string): void {
-  const help = kind === "help";
-  element<HTMLElement>("run-confirm-title").textContent = help ? "The agent needs your help" : "Allow this action?";
-  element<HTMLButtonElement>("run-confirm-allow").textContent = help ? "Done, continue" : "Yes, allow it";
-  element<HTMLButtonElement>("run-confirm-deny").textContent = help ? "I can't" : "No, choose another way";
-  pendingConfirmation = id;
-  element<HTMLElement>("run-confirm-text").textContent = message;
-  element<HTMLElement>("run-confirm").classList.remove("hidden");
-  setRunStatus("confirm", "Waiting for your answer");
-}
-
-async function answerConfirmation(allow: boolean): Promise<void> {
-  const id = pendingConfirmation;
-  pendingConfirmation = null;
-  element<HTMLElement>("run-confirm").classList.add("hidden");
-  if (!id) return;
-  try {
-    await invoke("answer_confirmation", { id, allow });
-    log("info", allow ? "You allowed the action." : "You declined the action.");
-  } catch (error) {
-    log("error", toMessage(error));
-  }
-}
-
-const PHASE_LABELS: Record<string, { label: string; className: string }> = {
-  starting: { label: "Starting", className: "phase-starting" },
-  capturing: { label: "Taking a screenshot", className: "phase-capturing" },
-  observing: { label: "Looking at the screen", className: "phase-capturing" },
-  proposing: { label: "Thinking", className: "phase-thinking" },
-  retrying: { label: "Thinking again", className: "phase-thinking" },
-  verifying: { label: "Plan ready", className: "phase-thinking" },
-  acting: { label: "Acting", className: "phase-acting" },
-  settling: { label: "Waiting for the screen", className: "phase-settling" },
-  result: { label: "Checked the result", className: "phase-capturing" },
-  checking: { label: "Checking the result", className: "phase-thinking" },
-  paused: { label: "Paused", className: "phase-settling" },
-  confirm: { label: "Needs your OK", className: "phase-settling" },
-};
-
-let runMaxSteps = 0;
-let hasVoiceLine = false;
-
-function resetRunView(maxSteps: number): void {
-  runMaxSteps = maxSteps;
-  hasVoiceLine = false;
-  miniOpen = false;
-  element<HTMLElement>("mini").classList.remove("open");
-  setPausedUi(false);
-  setRunStatus("starting", "Getting ready");
-  element<HTMLElement>("run-step").textContent = `Step 0 of ${maxSteps}`;
-  element<HTMLElement>("run-thought").textContent = "—";
-  element<HTMLElement>("run-action").textContent = "—";
-  element<HTMLElement>("run-result").textContent = "—";
-  element<HTMLElement>("run-log").replaceChildren();
-  element<HTMLImageElement>("run-shot").classList.add("hidden");
-}
-
-function setRunStatus(phase: string, detail: string): void {
-  const info = PHASE_LABELS[phase] ?? { label: phase, className: "phase-starting" };
-  setMiniPhase(info.className);
-  if (!runPaused || phase === "paused") setMiniSub(info.label);
-  if (!hasVoiceLine) setMiniText(detail.length > 70 ? info.label : detail);
-  element<HTMLElement>("run-status").className = `run-status ${info.className}`;
-  element<HTMLElement>("run-phase").textContent = info.label;
-  element<HTMLElement>("run-detail").textContent = detail;
-}
-
-/** Human-readable one-liner for a typed action. */
-function describeAction(action: Record<string, unknown>): string {
-  const type = String(action.type ?? "");
-  const point = (x: unknown, y: unknown) => `(${x}, ${y})`;
-  switch (type) {
-    case "click":
-      return `${action.button && action.button !== "left" ? `${action.button}-` : ""}click at ${point(action.x, action.y)}`;
-    case "double_click":
-      return `double-click at ${point(action.x, action.y)}`;
-    case "drag_and_drop":
-      return `drag ${point(action.from_x, action.from_y)} → ${point(action.to_x, action.to_y)}`;
-    case "type_text":
-      return `type “${String(action.text ?? "").slice(0, 80)}”${action.press_enter ? " + Enter" : ""}`;
-    case "hotkey":
-      return `press ${Array.isArray(action.keys) ? action.keys.join("+") : "?"}`;
-    case "key_press":
-      return `press ${action.key}`;
-    case "open_app":
-      return `open app “${action.name}”`;
-    case "scroll":
-      return `scroll ${Number(action.clicks) > 0 ? "up" : "down"} ${Math.abs(Number(action.clicks))}`;
-    case "wait_settle":
-      return "wait for the screen";
-    case "done":
-      return `finish: ${action.summary}`;
-    case "fail":
-      return `give up: ${action.reason}`;
-    default:
-      return JSON.stringify(action);
-  }
-}
-
-function updateRunView(progress: AutonomousProgress): void {
-  const stepText = progress.step > 0 ? `Step ${progress.step} of ${runMaxSteps}` : "Starting";
-  element<HTMLElement>("run-step").textContent = stepText;
-  setRunStatus(progress.phase, progress.message);
-  if (progress.thought) element<HTMLElement>("run-thought").textContent = progress.thought;
-  if (progress.actions?.length) {
-    element<HTMLElement>("run-action").textContent = progress.actions.map(describeAction).join("; ");
-  }
-  if (progress.phase === "result") {
-    element<HTMLElement>("run-result").textContent = progress.message.replace(/^Result: /, "");
-  }
-  if (progress.phase === "proposing") {
-    element<HTMLElement>("run-result").textContent = "—";
-  }
-  if (progress.screenshotDataUrl) {
-    const shot = element<HTMLImageElement>("run-shot");
-    shot.src = progress.screenshotDataUrl;
-    shot.classList.remove("hidden");
-  }
-  const row = document.createElement("div");
-  row.textContent = `${new Date().toLocaleTimeString()}  ${progress.message}`;
-  const runLog = element<HTMLElement>("run-log");
-  runLog.prepend(row);
-  while (runLog.childElementCount > 6) runLog.lastElementChild?.remove();
-}
-
-async function showTaskReview(): Promise<void> {
-  const review = await invoke<TaskRunReview | null>("get_last_task_run");
-  if (!review) return;
-  const modal = new ReviewModal({
-    taskId: review.run.id,
-    taskPrompt: review.run.prompt,
-    steps: review.steps.map((step) => ({
-      stepIndex: step.stepIndex,
-      thumbnailUrl: step.screenshotDataUrl ?? screenPreview.src,
-      actionSummary: `${step.actionSummary} · ${step.outcome}`,
-    })),
-    onPerfect: () => {
-      return saveReview({ runId: review.run.id, verdict: "perfect" });
-    },
-    onOptimize: (optimization) => {
-      return saveReview({ runId: review.run.id, verdict: "optimize", optimization });
-    },
-    onMistake: (stepIndex, forbiddenAction, correction) => {
-      return saveReview({
-        runId: review.run.id,
-        verdict: "mistake",
-        stepIndex,
-        forbiddenAction,
-        correction,
-      });
-    },
-  });
-  modal.render(document.body);
-}
-
-async function saveReview(input: Record<string, unknown>): Promise<void> {
-  try {
-    const message = await invoke<string>("submit_task_review", { input });
-    log("success", message);
-  } catch (error) {
-    log("error", toMessage(error));
-    throw error;
-  }
-}
-
-// ---- Mini player: pause, steer, mic, changing words ----------------------------------------
-
-let runPaused = false;
-let steerOpen = false;
-let miniOpen = false;
-let collapseTimer: number | undefined;
-let lastPhaseClass = "phase-starting";
-
-async function togglePause(): Promise<void> {
-  try {
-    await invoke(runPaused ? "resume_autonomous_task" : "pause_autonomous_task");
-  } catch (error) {
-    log("error", toMessage(error));
-  }
-}
-
-function setPausedUi(paused: boolean): void {
-  runPaused = paused;
-  element<HTMLElement>("run-pause-label").textContent = paused ? "Resume" : "Pause";
-  element<HTMLElement>("run-pause").classList.toggle("active", paused);
-  if (paused) {
-    setMiniSub("Paused");
-  }
-}
-
-/** Shows `text` as the main line. The old line lifts away and blurs while the new one rises in. */
-function setMiniText(text: string): void {
-  const host = element<HTMLElement>("mini-main");
-  const current = host.querySelector<HTMLElement>(".swap-line.current");
-  if (current && current.textContent === text) return;
-  const next = document.createElement("span");
-  next.className = "swap-line entering";
-  next.textContent = text;
-  host.appendChild(next);
-  current?.classList.replace("current", "leaving");
-  // Two frames so the browser registers the starting state before the transition begins.
-  requestAnimationFrame(() => requestAnimationFrame(() => next.classList.replace("entering", "current")));
-  window.setTimeout(() => host.querySelectorAll(".swap-line.leaving").forEach((line) => line.remove()), 650);
-}
-
-function setMiniSub(text: string): void {
-  const sub = element<HTMLElement>("mini-sub");
-  if (sub.textContent === text) return;
-  sub.classList.add("fading");
-  window.setTimeout(() => {
-    sub.textContent = text;
-    sub.classList.remove("fading");
-  }, 160);
-}
-
-function setMiniPhase(className: string): void {
-  if (className === lastPhaseClass) return;
-  const dot = element<HTMLElement>("mini-dot");
-  dot.classList.replace(lastPhaseClass, className) || dot.classList.add(className);
-  lastPhaseClass = className;
-}
-
-/** The window is resized to fit the player: the page tells the window how tall it needs to be. */
-function desiredHeight(): number {
-  const bar = 56;
-  const more = element<HTMLElement>("mini-more-inner").scrollHeight;
-  return miniOpen ? bar + more + 36 : 84;
-}
-
-async function syncHeight(): Promise<void> {
-  try {
-    await invoke("set_mini_height", { height: desiredHeight() });
-  } catch {
-    // Resizing is cosmetic; a failure leaves the player at its current size.
-  }
-}
-
-function openMini(): void {
-  window.clearTimeout(collapseTimer);
-  if (miniOpen) return;
-  miniOpen = true;
-  // Grow the window first (it is transparent), then let the card unfold with an eased animation.
-  void syncHeight().then(() => element<HTMLElement>("mini").classList.add("open"));
-}
-
-function scheduleCollapse(): void {
-  window.clearTimeout(collapseTimer);
-  collapseTimer = window.setTimeout(() => {
-    const confirmShown = !element<HTMLElement>("run-confirm").classList.contains("hidden");
-    if (steerOpen || confirmShown || !miniOpen) return;
-    miniOpen = false;
-    element<HTMLElement>("mini").classList.remove("open");
-    // Shrink the window after the card has folded away.
-    window.setTimeout(() => {
-      if (!miniOpen) void syncHeight();
-    }, 520);
-  }, 650);
-}
-
-function initMiniPlayer(): void {
-  const view = element<HTMLElement>("run-view");
-  view.addEventListener("mouseenter", openMini);
-  view.addEventListener("mouseleave", scheduleCollapse);
-  const input = element<HTMLInputElement>("run-steer-text");
-  const send = element<HTMLButtonElement>("run-steer-send");
-  input.addEventListener("input", () => (send.disabled = input.value.trim().length === 0));
-  input.addEventListener("focus", () => void beginSteering());
-  input.addEventListener("blur", () => void endSteering(false));
-  element<HTMLFormElement>("run-steer-form").addEventListener("submit", (event) => {
-    event.preventDefault();
-    void sendSteer();
-  });
-  input.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
-      input.value = "";
-      input.blur();
-    }
-  });
-  // Keep the window height right when the content changes (approval card appears, text wraps).
-  new ResizeObserver(() => miniOpen && void syncHeight()).observe(element<HTMLElement>("mini-more-inner"));
-  setMicUi(localStorage.getItem("aura.mic") === "on");
-}
-
-/** Typing a correction pauses the run (so nothing happens mid-sentence) and lets the box take focus. */
-async function beginSteering(): Promise<void> {
-  if (steerOpen) return;
-  steerOpen = true;
-  try {
-    await invoke("set_steer_box_open", { open: true });
-  } catch (error) {
-    log("error", toMessage(error));
-  }
-}
-
-async function endSteering(sent: boolean): Promise<void> {
-  if (!steerOpen) return;
-  steerOpen = false;
-  const input = element<HTMLInputElement>("run-steer-text");
-  try {
-    await invoke("set_steer_box_open", { open: false });
-    // Leaving the box empty-handed resumes; a half-written message stays and the run stays paused.
-    if (!sent && input.value.trim().length === 0) await invoke("resume_autonomous_task");
-  } catch (error) {
-    log("error", toMessage(error));
-  }
-  scheduleCollapse();
-}
-
-async function sendSteer(): Promise<void> {
-  const input = element<HTMLInputElement>("run-steer-text");
-  const text = input.value.trim();
-  if (!text) return;
-  input.value = "";
-  element<HTMLButtonElement>("run-steer-send").disabled = true;
-  try {
-    await invoke("steer_autonomous_task", { text });
-    log("info", `New instruction sent: ${text}`);
-    setMiniText("Got it, adjusting");
-  } catch (error) {
-    log("error", toMessage(error));
-  }
-  steerOpen = true; // endSteering only acts when the box was open
-  await endSteering(true);
-  input.blur();
-}
-
-function setMicUi(on: boolean): void {
-  const button = element<HTMLButtonElement>("run-mic");
-  button.setAttribute("aria-pressed", String(on));
-  button.classList.toggle("active", on);
-  button.title = on ? "Voice input on (coming soon)" : "Voice input off (coming soon)";
-}
-
-/** Voice input is not wired yet; the switch keeps the setting for when it is. */
-function toggleMic(): void {
-  const on = element<HTMLButtonElement>("run-mic").getAttribute("aria-pressed") !== "true";
-  localStorage.setItem("aura.mic", on ? "on" : "off");
-  setMicUi(on);
-}
-
-async function keepOnTop(): Promise<void> {
-  if (!document.body.classList.contains("running")) return;
-  try {
-    await invoke("keep_run_panel_on_top");
-  } catch {
-    // Best effort.
-  }
-}
-
-async function pollRunControls(): Promise<void> {
-  if (!document.body.classList.contains("running")) return;
-  try {
-    const status = await invoke<{ paused: boolean; pauseReason: string; openSteerBox: boolean }>("run_control_status");
-    if (status.paused !== runPaused) {
-      setPausedUi(status.paused);
-      log("info", runPaused ? `Paused: ${status.pauseReason}` : "Resumed: the agent looks at the screen again.");
-    }
-    if (status.openSteerBox) {
-      openMini();
-      element<HTMLInputElement>("run-steer-text").focus();
-    }
-  } catch {
-    // The status poll is best effort; a failed poll changes nothing.
-  }
-}
-
-async function stopAutonomousTask(): Promise<void> {
-  try {
-    await invoke("stop_autonomous_task");
-    log("info", "Stop requested. Waiting for the current operation to return.");
-  } catch (error) {
-    log("error", toMessage(error));
-  }
-}
-
-function renderAutonomousProgress(progress: AutonomousProgress): void {
-  updateRunView(progress);
-  log("info", `Step ${progress.step}: ${progress.message}`);
-  if (progress.screenshotDataUrl) {
-    screenPreview.src = progress.screenshotDataUrl;
-    screenPreview.classList.remove("hidden");
-    previewEmpty.classList.add("hidden");
-    captureMeta.textContent = `${progress.screenshotWidth}×${progress.screenshotHeight} WebP · autonomous step ${progress.step}`;
-  }
-  if (progress.thought && progress.actions) {
-    renderStep(progress.thought, progress.actions);
-  }
-}
-
-function renderProviderStatus(status: ProviderStatus): void {
-  if (!status.configured) {
-    badge.className = "badge offline";
-    badge.innerHTML = "<span></span>Not configured";
-    return;
-  }
-  badge.className = "badge ready";
-  badge.innerHTML = "<span></span>Configured";
-  if (status.protocol) {
-    protocol.value = status.protocol;
-    updateProtocolFields();
-  }
-  if (status.baseUrl) baseUrl.value = status.baseUrl;
-  if (status.model) model.value = status.model;
-  // The key itself never comes back to the page; the field only says whether one is saved.
-  if (status.hasApiKey) {
-    // Do not overwrite a new key the user is typing; otherwise show the saved-key mask.
-    if (apiKey.value === "" || apiKey.value === SAVED_KEY_MASK) apiKey.value = SAVED_KEY_MASK;
-    apiKey.placeholder = "Key saved (encrypted). Type a new one to replace it";
-  } else if (apiKey.value === SAVED_KEY_MASK) {
-    apiKey.value = "";
-  }
-}
-
-function renderStep(thought: string, actions: Record<string, unknown>[]): void {
-  planThought.textContent = thought;
-  actionList.replaceChildren();
-  for (const [index, action] of actions.entries()) {
-    const row = document.createElement("div");
-    row.className = "action-row";
-    const number = document.createElement("span");
-    number.className = "action-number";
-    number.textContent = String(index + 1);
-    const code = document.createElement("code");
-    code.textContent = JSON.stringify(action);
-    row.append(number, code);
-    actionList.append(row);
-  }
-  planCard.classList.remove("hidden");
-}
-
-function clearPlan(): void {
-  planCard.classList.add("hidden");
-  planThought.textContent = "";
-  actionList.replaceChildren();
-}
-
-async function withBusy(button: HTMLButtonElement, busyLabel: string, operation: () => Promise<void>): Promise<void> {
-  const original = button.textContent ?? "";
-  button.disabled = true;
-  button.textContent = busyLabel;
-  try {
-    await operation();
-  } catch (error) {
-    log("error", toMessage(error));
-  } finally {
-    button.disabled = false;
-    button.textContent = original;
-  }
-}
-
-function log(kind: "info" | "success" | "error", message: string): void {
-  const row = document.createElement("div");
-  row.className = `activity-row ${kind}`;
-  const time = document.createElement("time");
-  time.textContent = new Date().toLocaleTimeString();
-  const text = document.createElement("span");
-  text.textContent = message;
-  row.append(time, text);
-  activity.prepend(row);
-}
-
-function toMessage(error: unknown): string {
-  if (typeof error === "string") return error;
-  if (error instanceof Error) return error.message;
-  try { return JSON.stringify(error); } catch { return "Unknown error"; }
-}
-
-// ---- Schedules --------------------------------------------------------------------------------
-
-interface ScheduleRow {
+interface Schedule {
   id: string;
   task: string;
   when: string;
   enabled: boolean;
   nextInSeconds: number;
-  overlap: string;
-  missed: string;
-  onlyIfChanged: boolean;
-  lastSummary: string;
 }
 
-const schedMode = element<HTMLSelectElement>("sched-mode");
-const schedValue = element<HTMLInputElement>("sched-value");
-const schedValueLabel = element<HTMLElement>("sched-value-label");
-const schedList = element<HTMLElement>("sched-list");
-const schedError = element<HTMLElement>("sched-error");
+// ---- Icons -------------------------------------------------------------------------------------
 
-schedMode.addEventListener("change", () => {
-  const daily = schedMode.value === "daily";
-  schedValueLabel.textContent = daily ? "Times (09:00, 17:30)" : "Interval (30s, 5m, 2h)";
-  schedValue.value = daily ? "09:00" : "30m";
+const svg = (body: string, cls = "i") => `<svg class="${cls}" viewBox="0 0 24 24" aria-hidden="true">${body}</svg>`;
+const ICON = {
+  gear: svg('<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>'),
+  activity: svg('<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>'),
+  arrow: svg('<path d="M12 19V5M5 12l7-7 7 7"/>', "i arrow"),
+  stop: svg('<rect x="6.5" y="6.5" width="11" height="11" rx="2.5"/>', "i stop"),
+  steps: svg('<path d="M4 16v-2.38C4 11.5 2.97 10.5 3 8c.03-2.72 1.49-6 4.5-6C9.37 2 10 3.8 10 5.5c0 3.11-2 5.66-2 8.68V16a2 2 0 1 1-4 0Z"/><path d="M20 20v-2.38c0-2.12 1.03-3.12 1-5.62-.03-2.72-1.49-6-4.5-6C14.63 6 14 7.8 14 9.5c0 3.11 2 5.66 2 8.68V20a2 2 0 1 0 4 0Z"/><path d="M16 17h4"/><path d="M4 13h4"/>'),
+  speakerOn: svg('<path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="M16 9a5 5 0 0 1 0 6"/><path d="M19.364 18.364a9 9 0 0 0 0-12.728"/>', "i on"),
+  speakerOff: svg('<path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="M22 9l-6 6M16 9l6 6"/>', "i off"),
+  micOn: svg('<rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>', "i on"),
+  micOff: svg('<rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3M4 4l16 16"/>', "i off"),
+  pause: svg('<rect x="6" y="5" width="4" height="14" rx="1.2"/><rect x="14" y="5" width="4" height="14" rx="1.2"/>'),
+  play: svg('<path d="M7 5.5v13a1 1 0 0 0 1.5.86l10.6-6.5a1 1 0 0 0 0-1.72L8.5 4.64A1 1 0 0 0 7 5.5z"/>'),
+  end: svg('<rect x="6" y="6" width="12" height="12" rx="2.5"/>'),
+  trash: svg('<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>'),
+  check: svg('<path d="M20 6 9 17l-5-5"/>'),
+};
+
+// ---- Markup ------------------------------------------------------------------------------------
+
+const app = document.querySelector<HTMLDivElement>("#app")!;
+app.innerHTML = `
+  <section id="run-view" class="run-view" aria-live="polite">
+    <div id="mini" class="mini">
+      <div id="mini-bar" class="mini-bar">
+        <span id="mini-orb" class="mini-orb phase-starting"></span>
+        <div class="mini-text">
+          <div id="mini-main" class="swap"><span class="swap-line current">Getting ready</span></div>
+          <div class="mini-sub"><span id="mini-phase">Starting</span><span id="mini-step"></span></div>
+        </div>
+        <button id="mini-voice" class="mini-icon" type="button" aria-pressed="true" title="Step reader">${ICON.speakerOn}${ICON.speakerOff}</button>
+      </div>
+      <div class="mini-more">
+        <div id="mini-more-inner" class="mini-more-inner">
+          <div class="mini-actions">
+            <button id="run-pause" class="mini-btn" type="button"><span id="run-pause-icon">${ICON.pause}</span><span id="run-pause-label">Pause</span></button>
+            <button id="run-mic" class="mini-btn icon-only" type="button" aria-pressed="false" title="Voice input (coming soon)">${ICON.micOn}${ICON.micOff}</button>
+            <button id="run-stop" class="mini-btn danger" type="button">${ICON.end}<span>End</span></button>
+          </div>
+          <form id="steer-form" class="steer" autocomplete="off">
+            <input id="steer-text" type="text" placeholder="Tell Aura what to change…" maxlength="400" />
+            <button id="steer-send" class="steer-send" type="submit" aria-label="Send" disabled>${ICON.arrow}</button>
+          </form>
+          <div id="confirm" class="run-confirm hidden" role="alertdialog" aria-live="assertive">
+            <div id="confirm-title" class="run-confirm-title">Allow this action?</div>
+            <div id="confirm-text" class="run-confirm-text"></div>
+            <div class="run-confirm-buttons">
+              <button id="confirm-deny" class="mini-btn" type="button">No</button>
+              <button id="confirm-allow" class="mini-btn primary" type="button">Allow</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <main id="home" class="home">
+    <header class="topbar">
+      <div class="brand"><span class="brand-orb"></span>Aura</div>
+      <div class="top-actions">
+        <button id="open-activity" class="icon-btn" type="button" title="Activity" aria-label="Activity">${ICON.activity}</button>
+        <button id="status" class="status-pill" type="button" title="Model connection"><span class="status-dot"></span><span id="status-text">No model</span></button>
+        <button id="open-settings" class="icon-btn" type="button" title="Settings" aria-label="Settings">${ICON.gear}</button>
+      </div>
+    </header>
+    <section class="stage">
+      <div class="orb" aria-hidden="true"></div>
+      <form id="composer" class="composer" autocomplete="off">
+        <textarea id="task" rows="1" placeholder="What should Aura do?" spellcheck="true"></textarea>
+        <div class="composer-tools">
+          <button id="steps-btn" class="steps-btn" type="button" aria-expanded="false" title="Maximum steps">${ICON.steps}<span id="steps-value">20</span></button>
+          <button id="send" class="send-btn" type="submit" aria-label="Run" disabled>${ICON.arrow}${ICON.stop}</button>
+        </div>
+      </form>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status"><span id="toast-text" class="toast-text"></span><button id="toast-action" class="toast-action" type="button"></button></div>
+
+  <div id="settings" class="backdrop" aria-hidden="true">
+    <div class="sheet" role="dialog" aria-label="Settings">
+      <div class="sheet-head"><h2>Settings</h2><button class="text-btn" type="button" data-close>Done</button></div>
+      <div class="sheet-body">
+        <div class="group-label">Models</div>
+        <div id="presets" class="group"></div>
+        <div id="add-block">
+        <div class="group-label">Add a model</div>
+        <div class="group">
+          <form id="model-form" class="form" autocomplete="off">
+            <div id="protocol" class="segmented"><span class="thumb"></span><button type="button" data-protocol="open_ai_compatible_chat" class="on">Local server</button><button type="button" data-protocol="open_ai_responses">OpenAI</button></div>
+            <label class="field"><span>Server</span><input id="base-url" spellcheck="false" placeholder="http://localhost:1234/v1" /></label>
+            <label class="field"><span>Model</span><input id="model" spellcheck="false" placeholder="qwen/qwen3-vl-4b" /></label>
+            <label class="field"><span id="key-label">API key (optional)</span><input id="api-key" type="password" spellcheck="false" placeholder="Saved encrypted on this PC" /></label>
+            <div id="model-error" class="form-error"></div>
+            <button id="connect" class="primary-btn" type="submit">Connect</button>
+          </form>
+        </div>
+        </div>
+        <div class="group-label">Voice</div>
+        <div class="group">
+          <div class="row"><div class="row-main"><div class="row-title">Read each step aloud</div></div><button id="voice-switch" class="switch" type="button" role="switch" aria-checked="true" aria-label="Read each step aloud"></button></div>
+        </div>
+        <div id="schedules-block" class="hidden">
+          <div class="group-label">Scheduled</div>
+          <div id="schedules" class="group"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="activity" class="backdrop" aria-hidden="true">
+    <div class="sheet wide" role="dialog" aria-label="Activity">
+      <div class="sheet-head"><h2>Activity</h2><button class="text-btn" type="button" data-close>Done</button></div>
+      <div class="sheet-body">
+        <div id="runs" class="runs"></div>
+        <div id="run-detail"></div>
+      </div>
+    </div>
+  </div>
+`;
+
+function $<T extends HTMLElement = HTMLElement>(id: string): T {
+  const value = document.getElementById(id);
+  if (!value) throw new Error(`Missing UI element: ${id}`);
+  return value as T;
+}
+
+function toMessage(error: unknown): string {
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return error.message;
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return "Unknown error";
+  }
+}
+
+const escapeHtml = (text: string) => text.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+
+// ---- Toast -------------------------------------------------------------------------------------
+
+let toastTimer: number | undefined;
+let toastHandler: (() => void) | null = null;
+function toast(text: string, options: { action?: string; onAction?: () => void; error?: boolean; ms?: number } = {}): void {
+  const box = $("toast");
+  $("toast-text").textContent = text;
+  $("toast-action").textContent = options.action ?? "";
+  toastHandler = options.onAction ?? null;
+  box.classList.toggle("error", !!options.error);
+  box.classList.add("show");
+  window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => box.classList.remove("show"), options.ms ?? 4200);
+}
+$("toast-action").addEventListener("click", () => {
+  $("toast").classList.remove("show");
+  const handler = toastHandler;
+  toastHandler = null;
+  handler?.();
 });
 
-element<HTMLButtonElement>("sched-add").addEventListener("click", async () => {
-  schedError.textContent = "";
+// ---- Connection status -----------------------------------------------------------------------
+
+let presets: Preset[] = [];
+
+function setStatus(state: "none" | "checking" | "online" | "offline", text: string, title = ""): void {
+  const pill = $("status");
+  pill.className = `status-pill ${state}`;
+  $("status-text").textContent = text;
+  pill.title = title || text;
+}
+
+function activePreset(): Preset | undefined {
+  return presets.find((p) => p.active);
+}
+
+async function loadPresets(): Promise<void> {
   try {
-    await invoke("add_schedule", {
-      task: element<HTMLInputElement>("sched-task").value,
-      mode: schedMode.value,
-      value: schedValue.value,
-      overlap: element<HTMLSelectElement>("sched-overlap").value,
-      missed: element<HTMLSelectElement>("sched-missed").value,
-      onlyIfChanged: element<HTMLInputElement>("sched-changed").checked,
-    });
-    element<HTMLInputElement>("sched-task").value = "";
-    await refreshSchedules();
+    presets = await invoke<Preset[]>("list_model_presets");
   } catch (error) {
-    schedError.textContent = toMessage(error);
+    presets = [];
+    toast(toMessage(error), { error: true });
   }
+  renderPresets();
+}
+
+async function checkConnection(): Promise<void> {
+  const active = activePreset();
+  if (!active) {
+    setStatus("none", "No model", "Add a model in Settings");
+    return;
+  }
+  setStatus("checking", active.name);
+  try {
+    const reply = await invoke<{ state: string; model?: string; message?: string }>("ping_provider");
+    if (reply.state === "online") setStatus("online", active.name, `${active.model} · connected`);
+    else if (reply.state === "offline") setStatus("offline", active.name, reply.message ?? "Not reachable");
+    else setStatus("none", "No model", "Add a model in Settings");
+  } catch (error) {
+    setStatus("offline", active.name, toMessage(error));
+  }
+}
+
+$("status").addEventListener("click", () => openSheet("settings"));
+
+// ---- Sheets ------------------------------------------------------------------------------------
+
+function openSheet(id: "settings" | "activity"): void {
+  const sheet = $(id);
+  sheet.setAttribute("aria-hidden", "false");
+  sheet.classList.add("open");
+  if (id === "settings") {
+    void loadPresets();
+    void refreshSchedules();
+    void loadVoice();
+  } else {
+    void loadRuns();
+  }
+}
+
+function closeSheet(sheet: HTMLElement): void {
+  sheet.classList.remove("open");
+  sheet.setAttribute("aria-hidden", "true");
+}
+
+for (const id of ["settings", "activity"]) {
+  const sheet = $(id);
+  sheet.addEventListener("mousedown", (event) => {
+    if (event.target === sheet) closeSheet(sheet);
+  });
+  sheet.querySelector("[data-close]")!.addEventListener("click", () => closeSheet(sheet));
+}
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  for (const sheet of document.querySelectorAll<HTMLElement>(".backdrop.open")) closeSheet(sheet);
+  closeStepsPop();
+});
+$("open-settings").addEventListener("click", () => openSheet("settings"));
+$("open-activity").addEventListener("click", () => openSheet("activity"));
+
+// ---- Settings: models --------------------------------------------------------------------------
+
+let protocol: ApiProtocol = "open_ai_compatible_chat";
+const calibrating = new Set<string>();
+
+function setProtocol(next: ApiProtocol): void {
+  protocol = next;
+  const seg = $("protocol");
+  seg.classList.toggle("second", next === "open_ai_responses");
+  for (const b of seg.querySelectorAll<HTMLButtonElement>("button")) b.classList.toggle("on", b.dataset.protocol === next);
+  const baseUrl = $<HTMLInputElement>("base-url");
+  if (next === "open_ai_responses") {
+    baseUrl.value = "https://api.openai.com/v1";
+    $("key-label").textContent = "API key";
+    $<HTMLInputElement>("model").placeholder = "Model ID";
+  } else {
+    if (baseUrl.value === "https://api.openai.com/v1") baseUrl.value = "";
+    $("key-label").textContent = "API key (optional)";
+    $<HTMLInputElement>("model").placeholder = "qwen/qwen3-vl-4b";
+  }
+}
+for (const b of $("protocol").querySelectorAll<HTMLButtonElement>("button")) b.addEventListener("click", () => setProtocol(b.dataset.protocol as ApiProtocol));
+
+function coordinatesLabel(preset: Preset): string {
+  if (calibrating.has(preset.model)) return "";
+  switch (preset.coordinates) {
+    case "norm1000":
+      return "0–1000 grid";
+    case "norm1":
+      return "0–1 grid";
+    case "pixels":
+      return "pixels";
+    default:
+      return "";
+  }
+}
+
+let addOpen = false;
+
+function renderPresets(): void {
+  const list = $("presets");
+  list.replaceChildren();
+  $("add-block").classList.toggle("hidden", presets.length > 0 && !addOpen);
+  if (presets.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "No models yet.";
+    list.append(empty);
+    return;
+  }
+  for (const preset of presets) {
+    const row = document.createElement("div");
+    row.className = `row clickable${preset.active ? " active" : ""}`;
+    const host = preset.protocol === "open_ai_responses" ? "OpenAI" : preset.baseUrl.replace(/^https?:\/\//, "").replace(/\/v1\/?$/, "");
+    const coords = coordinatesLabel(preset);
+    row.innerHTML = `
+      <span class="row-check">${preset.active ? ICON.check : ""}</span>
+      <div class="row-main"><div class="row-title"></div><div class="row-meta"></div></div>
+      ${calibrating.has(preset.model) ? '<span class="badge busy">Calibrating…</span>' : coords ? `<span class="badge" title="How this model writes coordinates">${coords}</span>` : ""}
+      <button class="row-btn" type="button" title="Delete" aria-label="Delete">${ICON.trash}</button>`;
+    row.querySelector(".row-title")!.textContent = preset.name;
+    row.querySelector(".row-meta")!.textContent = `${preset.model} · ${host}`;
+    const remove = row.querySelector<HTMLButtonElement>(".row-btn")!;
+    remove.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (!remove.classList.contains("confirm")) {
+        remove.classList.add("confirm");
+        remove.textContent = "Delete";
+        window.setTimeout(() => {
+          if (remove.isConnected && remove.classList.contains("confirm")) renderPresets();
+        }, 3000);
+        return;
+      }
+      void deletePreset(preset);
+    });
+    row.addEventListener("click", () => {
+      if (!preset.active) void usePreset(preset);
+    });
+    list.append(row);
+  }
+  if (!addOpen) {
+    const add = document.createElement("div");
+    add.className = "row clickable";
+    add.innerHTML = '<span class="row-check row-add">+</span><div class="row-main"><div class="row-title row-add">Add model</div></div>';
+    add.addEventListener("click", () => {
+      addOpen = true;
+      renderPresets();
+      $<HTMLInputElement>("base-url").focus();
+    });
+    list.append(add);
+  }
+}
+
+async function usePreset(preset: Preset): Promise<void> {
+  setStatus("checking", preset.name);
+  try {
+    await invoke<Preset>("use_model_preset", { id: preset.id });
+    await loadPresets();
+    await checkConnection();
+  } catch (error) {
+    toast(toMessage(error), { error: true });
+    await loadPresets();
+    await checkConnection();
+  }
+}
+
+async function deletePreset(preset: Preset): Promise<void> {
+  try {
+    await invoke("delete_model_preset", { id: preset.id });
+  } catch (error) {
+    toast(toMessage(error), { error: true });
+  }
+  await loadPresets();
+  await checkConnection();
+}
+
+$("model-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = $<HTMLButtonElement>("connect");
+  const error = $("model-error");
+  error.textContent = "";
+  button.disabled = true;
+  button.textContent = "Connecting…";
+  try {
+    const preset = await invoke<Preset>("connect_model", {
+      input: {
+        protocol,
+        baseUrl: $<HTMLInputElement>("base-url").value.trim(),
+        model: $<HTMLInputElement>("model").value.trim(),
+        apiKey: $<HTMLInputElement>("api-key").value,
+      },
+      name: null,
+    });
+    $<HTMLInputElement>("api-key").value = "";
+    $<HTMLInputElement>("model").value = "";
+    addOpen = false;
+    await loadPresets();
+    setStatus("online", preset.name, `${preset.model} · connected`);
+    toast(`Connected to ${preset.name}`);
+  } catch (e) {
+    error.textContent = toMessage(e);
+    await loadPresets();
+    await checkConnection();
+  } finally {
+    button.disabled = false;
+    button.textContent = "Connect";
+  }
+});
+
+on<{ model: string; state: string; coordinates?: string; message?: string }>("model-calibration", (event) => {
+  if (event.state === "running") calibrating.add(event.model);
+  else calibrating.delete(event.model);
+  if (event.state === "done") {
+    for (const p of presets) if (p.model === event.model) p.coordinates = event.coordinates ?? p.coordinates;
+  }
+  renderPresets();
+});
+
+// ---- Settings: voice and schedules -------------------------------------------------------------
+
+let voiceOn = true;
+function renderVoice(): void {
+  $("voice-switch").setAttribute("aria-checked", String(voiceOn));
+  const mini = $("mini-voice");
+  mini.setAttribute("aria-pressed", String(voiceOn));
+  mini.title = voiceOn ? "Step reader on" : "Step reader off";
+}
+async function loadVoice(): Promise<void> {
+  try {
+    voiceOn = await invoke<boolean>("get_voice_enabled");
+  } catch {
+    // Keep the last known value.
+  }
+  renderVoice();
+}
+async function toggleVoice(): Promise<void> {
+  voiceOn = !voiceOn;
+  renderVoice();
+  try {
+    voiceOn = await invoke<boolean>("set_voice_enabled", { enabled: voiceOn });
+  } catch (error) {
+    voiceOn = !voiceOn;
+    toast(toMessage(error), { error: true });
+  }
+  renderVoice();
+}
+$("voice-switch").addEventListener("click", () => void toggleVoice());
+$("mini-voice").addEventListener("click", (event) => {
+  event.stopPropagation();
+  void toggleVoice();
 });
 
 function countdown(seconds: number): string {
@@ -941,50 +520,621 @@ function countdown(seconds: number): string {
 }
 
 async function refreshSchedules(): Promise<void> {
-  const rows = await invoke<ScheduleRow[]>("list_schedules");
-  schedList.replaceChildren();
-  if (rows.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "sched-empty";
-    empty.textContent = "No schedules yet.";
-    schedList.append(empty);
-    return;
+  let rows: Schedule[] = [];
+  try {
+    rows = await invoke<Schedule[]>("list_schedules");
+  } catch {
+    rows = [];
   }
-  for (const row of rows) {
+  const live = rows.filter((r) => r.enabled);
+  $("schedules-block").classList.toggle("hidden", live.length === 0);
+  const list = $("schedules");
+  list.replaceChildren();
+  for (const row of live) {
     const item = document.createElement("div");
-    item.className = `sched-item${row.enabled ? "" : " off"}`;
-    const text = document.createElement("div");
-    text.className = "sched-text";
-    const title = document.createElement("div");
-    title.className = "sched-title";
-    title.textContent = row.task;
-    const meta = document.createElement("div");
-    meta.className = "sched-meta";
-    const parts = [row.when, row.enabled ? `next run ${countdown(row.nextInSeconds)}` : "paused"];
-    if (row.onlyIfChanged) parts.push("only when the screen changed");
-    if (row.lastSummary) parts.push(`last: ${row.lastSummary}`);
-    meta.textContent = parts.join(" · ");
-    text.append(title, meta);
-    const toggle = document.createElement("button");
-    toggle.className = "button ghost";
-    toggle.type = "button";
-    toggle.textContent = row.enabled ? "Pause" : "Resume";
-    toggle.addEventListener("click", async () => {
-      await invoke("set_schedule_enabled", { id: row.id, enabled: !row.enabled }).catch((e) => log("error", toMessage(e)));
+    item.className = "row";
+    item.innerHTML = `<div class="row-main"><div class="row-title"></div><div class="row-meta"></div></div><button class="row-btn" type="button" title="Delete" aria-label="Delete">${ICON.trash}</button>`;
+    item.querySelector(".row-title")!.textContent = row.task;
+    item.querySelector(".row-meta")!.textContent = `${row.when} · next ${countdown(row.nextInSeconds)}`;
+    item.querySelector("button")!.addEventListener("click", async () => {
+      await invoke("remove_schedule", { id: row.id }).catch((e) => toast(toMessage(e), { error: true }));
       await refreshSchedules();
     });
-    const remove = document.createElement("button");
-    remove.className = "button ghost";
-    remove.type = "button";
-    remove.textContent = "Delete";
-    remove.addEventListener("click", async () => {
-      await invoke("remove_schedule", { id: row.id }).catch((e) => log("error", toMessage(e)));
-      await refreshSchedules();
-    });
-    item.append(text, toggle, remove);
-    schedList.append(item);
+    list.append(item);
   }
 }
 
-void refreshSchedules();
-window.setInterval(() => void refreshSchedules(), 30_000);
+// ---- Composer ----------------------------------------------------------------------------------
+
+const task = $<HTMLTextAreaElement>("task");
+const send = $<HTMLButtonElement>("send");
+let maxSteps = Number(localStorage.getItem("aura.maxSteps")) || 20;
+let running = false;
+
+function autosize(): void {
+  task.style.height = "auto";
+  task.style.height = `${Math.min(task.scrollHeight, 168)}px`;
+  send.disabled = !running && task.value.trim().length === 0;
+  $("home").classList.toggle("typing", task.value.length > 0);
+}
+task.addEventListener("input", autosize);
+task.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+    event.preventDefault();
+    $<HTMLFormElement>("composer").requestSubmit();
+  }
+});
+$("composer").addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (running) void stopRun();
+  else void submitTask();
+});
+
+function setRunningUi(on: boolean): void {
+  running = on;
+  send.classList.toggle("stop-mode", on);
+  send.setAttribute("aria-label", on ? "Stop" : "Run");
+  autosize();
+}
+
+// Maximum steps: an icon in the composer opens a small stepper.
+function renderSteps(): void {
+  $("steps-value").textContent = String(maxSteps);
+  const out = document.getElementById("steps-out");
+  if (out) out.textContent = String(maxSteps);
+  for (const chip of document.querySelectorAll<HTMLButtonElement>("#steps-pop .chips button")) chip.classList.toggle("on", Number(chip.dataset.v) === maxSteps);
+}
+function setSteps(value: number): void {
+  maxSteps = Math.max(1, Math.min(100, Math.round(value)));
+  localStorage.setItem("aura.maxSteps", String(maxSteps));
+  renderSteps();
+}
+function closeStepsPop(): void {
+  const pop = document.getElementById("steps-pop");
+  if (!pop) return;
+  $("steps-btn").setAttribute("aria-expanded", "false");
+  pop.classList.add("closing");
+  window.setTimeout(() => pop.remove(), 180);
+}
+$("steps-btn").addEventListener("click", (event) => {
+  event.stopPropagation();
+  if (document.getElementById("steps-pop")) {
+    closeStepsPop();
+    return;
+  }
+  const pop = document.createElement("div");
+  pop.id = "steps-pop";
+  pop.className = "steps-pop";
+  pop.innerHTML = `
+    <div class="steps-pop-title">Maximum steps</div>
+    <div class="stepper"><button type="button" data-d="-1" aria-label="Fewer">−</button><output id="steps-out"></output><button type="button" data-d="1" aria-label="More">+</button></div>
+    <div class="chips">${[10, 20, 40, 80].map((v) => `<button type="button" data-v="${v}">${v}</button>`).join("")}</div>`;
+  pop.addEventListener("click", (e) => e.stopPropagation());
+  for (const b of pop.querySelectorAll<HTMLButtonElement>(".stepper button")) b.addEventListener("click", () => setSteps(maxSteps + Number(b.dataset.d)));
+  for (const b of pop.querySelectorAll<HTMLButtonElement>(".chips button")) b.addEventListener("click", () => setSteps(Number(b.dataset.v)));
+  $("composer").append(pop);
+  $("steps-btn").setAttribute("aria-expanded", "true");
+  renderSteps();
+});
+document.addEventListener("click", () => closeStepsPop());
+renderSteps();
+
+async function submitTask(): Promise<void> {
+  const text = task.value.trim();
+  if (!text) return;
+  if (!activePreset()) {
+    toast("Add a model first", { action: "Settings", onAction: () => openSheet("settings") });
+    return;
+  }
+  // "every day at 9am check my inbox": saved as a schedule instead of running now.
+  try {
+    const scheduled = await invoke<{ id: string; task: string; when: string } | null>("schedule_from_prompt", { prompt: text });
+    if (scheduled) {
+      task.value = "";
+      autosize();
+      toast(`Scheduled · ${scheduled.when} · ${scheduled.task}`, {
+        action: "Run now instead",
+        ms: 7000,
+        onAction: () => {
+          void invoke("remove_schedule", { id: scheduled.id }).finally(() => void startRun(text));
+        },
+      });
+      return;
+    }
+  } catch (error) {
+    toast(toMessage(error), { error: true });
+    return;
+  }
+  await startRun(text);
+}
+
+async function startRun(text: string): Promise<void> {
+  setRunningUi(true);
+  resetMini();
+  document.body.classList.add("running");
+  try {
+    const response = await invoke<{ completed: boolean; stopped: boolean; stepsExecuted: number; message: string }>("run_autonomous_task", { task: text, maxSteps });
+    task.value = "";
+    const done = response.completed ? "Done" : response.stopped ? "Stopped" : "Not finished";
+    toast(`${done} · ${response.stepsExecuted} step${response.stepsExecuted === 1 ? "" : "s"}`, { action: "View", ms: 8000, onAction: () => openSheet("activity") });
+  } catch (error) {
+    toast(toMessage(error), { error: true, ms: 7000 });
+  } finally {
+    document.body.classList.remove("running");
+    setRunningUi(false);
+    task.focus();
+  }
+}
+
+async function stopRun(): Promise<void> {
+  try {
+    await invoke("stop_autonomous_task");
+  } catch (error) {
+    toast(toMessage(error), { error: true });
+  }
+}
+
+// ---- Mini player -------------------------------------------------------------------------------
+
+const PHASES: Record<string, { label: string; cls: string }> = {
+  starting: { label: "Starting", cls: "phase-starting" },
+  capturing: { label: "Looking", cls: "phase-capturing" },
+  observing: { label: "Looking", cls: "phase-capturing" },
+  proposing: { label: "Thinking", cls: "phase-thinking" },
+  retrying: { label: "Thinking again", cls: "phase-thinking" },
+  verifying: { label: "Checking the plan", cls: "phase-thinking" },
+  acting: { label: "Acting", cls: "phase-acting" },
+  settling: { label: "Waiting for the screen", cls: "phase-settling" },
+  result: { label: "Checked", cls: "phase-capturing" },
+  checking: { label: "Checking the result", cls: "phase-thinking" },
+  paused: { label: "Paused", cls: "phase-settling" },
+  confirm: { label: "Needs your OK", cls: "phase-settling" },
+};
+
+let miniOpen = false;
+let steerOpen = false;
+let paused = false;
+let hasVoiceLine = false;
+let collapseTimer: number | undefined;
+let phaseClass = "phase-starting";
+
+/** Shows `text` as the main line: every older line lifts away, the new one rises in. However
+ *  fast the updates come, only one line is ever "current", so words never pile up. */
+function setMiniText(text: string): void {
+  const host = $("mini-main");
+  const lines = [...host.querySelectorAll<HTMLElement>(".swap-line")];
+  const newest = lines[lines.length - 1];
+  if (newest && !newest.classList.contains("leaving") && newest.textContent === text) return;
+  for (const line of lines) {
+    if (line.classList.contains("leaving")) continue;
+    line.classList.remove("entering", "current");
+    line.classList.add("leaving");
+    window.setTimeout(() => line.remove(), 420);
+  }
+  // Never more than one line on its way out.
+  const leaving = host.querySelectorAll(".swap-line.leaving");
+  for (let i = 0; i < leaving.length - 1; i++) leaving[i].remove();
+  const next = document.createElement("span");
+  next.className = "swap-line entering";
+  next.textContent = text;
+  next.title = text;
+  host.append(next);
+  const promote = () => {
+    if (next.classList.contains("entering")) next.classList.replace("entering", "current");
+  };
+  requestAnimationFrame(() => requestAnimationFrame(promote));
+  window.setTimeout(promote, 60);
+}
+
+function setMiniPhase(label: string, cls: string): void {
+  if (cls !== phaseClass) {
+    $("mini-orb").classList.replace(phaseClass, cls);
+    phaseClass = cls;
+  }
+  const phase = $("mini-phase");
+  if (phase.textContent === label) return;
+  phase.classList.add("fading");
+  window.setTimeout(() => {
+    phase.textContent = label;
+    phase.classList.remove("fading");
+  }, 140);
+}
+
+function resetMini(): void {
+  hasVoiceLine = false;
+  miniOpen = false;
+  $("mini").classList.remove("open");
+  $("confirm").classList.add("hidden");
+  setPausedUi(false);
+  setMiniPhase("Starting", "phase-starting");
+  setMiniText("Getting ready");
+  $("mini-step").textContent = "";
+  renderVoice();
+}
+
+function onProgress(progress: Progress): void {
+  const info = PHASES[progress.phase] ?? { label: progress.phase, cls: "phase-starting" };
+  if (!paused || progress.phase === "paused") setMiniPhase(info.label, info.cls);
+  if (progress.step > 0) $("mini-step").textContent = `· Step ${progress.step}`;
+  if (!hasVoiceLine && progress.message) setMiniText(progress.message.length > 80 ? info.label : progress.message);
+}
+
+on<Progress>("agent-progress", onProgress);
+on<{ text: string }>("agent-voice", (event) => {
+  hasVoiceLine = true;
+  setMiniText(event.text);
+});
+on<{ id: string; message: string; kind?: string }>("agent-confirm", (event) => {
+  showConfirmation(event.id, event.message, event.kind ?? "approval");
+  openMini();
+});
+
+let pendingConfirmation: string | null = null;
+function showConfirmation(id: string, message: string, kind: string): void {
+  const help = kind === "help";
+  $("confirm-title").textContent = help ? "Aura needs your help" : "Allow this action?";
+  $("confirm-allow").textContent = help ? "Done, continue" : "Allow";
+  $("confirm-deny").textContent = help ? "I can't" : "No, another way";
+  pendingConfirmation = id;
+  $("confirm-text").textContent = message;
+  $("confirm").classList.remove("hidden");
+  setMiniPhase("Needs your OK", "phase-settling");
+}
+async function answerConfirmation(allow: boolean): Promise<void> {
+  const id = pendingConfirmation;
+  pendingConfirmation = null;
+  $("confirm").classList.add("hidden");
+  if (!id) return;
+  try {
+    await invoke("answer_confirmation", { id, allow });
+  } catch (error) {
+    setMiniText(toMessage(error));
+  }
+  scheduleCollapse();
+}
+$("confirm-allow").addEventListener("click", () => void answerConfirmation(true));
+$("confirm-deny").addEventListener("click", () => void answerConfirmation(false));
+
+function setPausedUi(on: boolean): void {
+  paused = on;
+  $("run-pause-label").textContent = on ? "Resume" : "Pause";
+  $("run-pause-icon").innerHTML = on ? ICON.play : ICON.pause;
+  $("run-pause").classList.toggle("active", on);
+  if (on) setMiniPhase("Paused", "phase-settling");
+}
+$("run-pause").addEventListener("click", async () => {
+  try {
+    await invoke(paused ? "resume_autonomous_task" : "pause_autonomous_task");
+  } catch (error) {
+    setMiniText(toMessage(error));
+  }
+});
+$("run-stop").addEventListener("click", () => void stopRun());
+$("run-mic").addEventListener("click", () => {
+  const button = $("run-mic");
+  const next = button.getAttribute("aria-pressed") !== "true";
+  button.setAttribute("aria-pressed", String(next));
+  localStorage.setItem("aura.mic", next ? "on" : "off");
+});
+$("run-mic").setAttribute("aria-pressed", String(localStorage.getItem("aura.mic") === "on"));
+
+/** The window is sized to the player: the page tells the app how tall it needs to be. */
+async function syncHeight(): Promise<void> {
+  const height = Math.ceil($("mini").getBoundingClientRect().height) + 12;
+  try {
+    await invoke("set_mini_height", { height: miniOpen ? Math.max(height, 68) : 68 });
+  } catch {
+    // Cosmetic only.
+  }
+}
+
+function openMini(): void {
+  window.clearTimeout(collapseTimer);
+  if (miniOpen) return;
+  miniOpen = true;
+  // Grow the (transparent) window to the full height first, then let the card unfold into it.
+  const target = 54 + 12 + $("mini-more-inner").scrollHeight + 14;
+  void invoke("set_mini_height", { height: target })
+    .catch(() => undefined)
+    .then(() => $("mini").classList.add("open"));
+}
+
+function scheduleCollapse(): void {
+  window.clearTimeout(collapseTimer);
+  collapseTimer = window.setTimeout(() => {
+    const asking = !$("confirm").classList.contains("hidden");
+    if (steerOpen || asking || !miniOpen) return;
+    miniOpen = false;
+    $("mini").classList.remove("open");
+    window.setTimeout(() => {
+      if (!miniOpen) void syncHeight();
+    }, 520);
+  }, 650);
+}
+
+const runView = $("run-view");
+runView.addEventListener("mouseenter", openMini);
+runView.addEventListener("mouseleave", scheduleCollapse);
+new ResizeObserver(() => {
+  if (miniOpen) void syncHeight();
+}).observe($("mini-more-inner"));
+
+// Drag the player by its bar; the app remembers where it was put down.
+$("mini-bar").addEventListener("mousedown", (event) => {
+  if (event.button !== 0 || (event.target as HTMLElement).closest("button")) return;
+  void invoke("start_window_drag").catch(() => undefined);
+});
+
+// Typing a correction pauses the run and lets the box take the keyboard.
+const steerText = $<HTMLInputElement>("steer-text");
+steerText.addEventListener("input", () => ($<HTMLButtonElement>("steer-send").disabled = steerText.value.trim().length === 0));
+steerText.addEventListener("focus", async () => {
+  if (steerOpen) return;
+  steerOpen = true;
+  await invoke("set_steer_box_open", { open: true }).catch(() => undefined);
+});
+steerText.addEventListener("blur", () => void endSteering(false));
+steerText.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    steerText.value = "";
+    steerText.blur();
+  }
+});
+$("steer-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const text = steerText.value.trim();
+  if (!text) return;
+  steerText.value = "";
+  $<HTMLButtonElement>("steer-send").disabled = true;
+  try {
+    await invoke("steer_autonomous_task", { text });
+    setMiniText("Got it, adjusting");
+  } catch (error) {
+    setMiniText(toMessage(error));
+  }
+  steerOpen = true;
+  await endSteering(true);
+  steerText.blur();
+});
+async function endSteering(sent: boolean): Promise<void> {
+  if (!steerOpen) return;
+  steerOpen = false;
+  try {
+    await invoke("set_steer_box_open", { open: false });
+    // Leaving the box empty-handed resumes; a half-written message keeps the run paused.
+    if (!sent && steerText.value.trim().length === 0) await invoke("resume_autonomous_task");
+  } catch {
+    // Best effort.
+  }
+  scheduleCollapse();
+}
+
+window.setInterval(async () => {
+  if (!document.body.classList.contains("running")) return;
+  try {
+    const status = await invoke<{ paused: boolean; pauseReason: string; openSteerBox: boolean }>("run_control_status");
+    if (status.paused !== paused) setPausedUi(status.paused);
+    if (status.openSteerBox) {
+      openMini();
+      steerText.focus();
+    }
+  } catch {
+    // Best effort.
+  }
+}, 250);
+window.setInterval(() => {
+  if (document.body.classList.contains("running")) void invoke("keep_run_panel_on_top").catch(() => undefined);
+}, 2000);
+
+// A run this page did not start (a schedule) still turns the window into the player.
+let externalRun = false;
+window.setInterval(async () => {
+  try {
+    const status = await invoke<{ running: boolean }>("run_control_status");
+    if (status.running && !document.body.classList.contains("running")) {
+      externalRun = true;
+      for (const sheet of document.querySelectorAll<HTMLElement>(".backdrop.open")) closeSheet(sheet);
+      resetMini();
+      document.body.classList.add("running");
+      setRunningUi(true);
+    } else if (!status.running && externalRun) {
+      externalRun = false;
+      document.body.classList.remove("running");
+      setRunningUi(false);
+      toast("Scheduled task finished", { action: "View", ms: 8000, onAction: () => openSheet("activity") });
+    }
+  } catch {
+    // Best effort.
+  }
+}, 1000);
+
+// ---- Activity ----------------------------------------------------------------------------------
+
+let runs: RunSummary[] = [];
+let selectedRun: string | null = null;
+
+async function loadRuns(): Promise<void> {
+  try {
+    runs = await invoke<RunSummary[]>("list_task_runs", { limit: 30 });
+  } catch (error) {
+    runs = [];
+    toast(toMessage(error), { error: true });
+  }
+  const strip = $("runs");
+  strip.replaceChildren();
+  if (runs.length === 0) {
+    $("run-detail").innerHTML = '<div class="empty">No tasks yet.</div>';
+    return;
+  }
+  if (!selectedRun || !runs.some((r) => r.id === selectedRun)) selectedRun = runs[0].id;
+  for (const run of runs) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = `run-chip${run.id === selectedRun ? " on" : ""}`;
+    chip.innerHTML = `<span class="state-dot ${run.status}"></span><span></span>`;
+    chip.lastElementChild!.textContent = run.prompt;
+    chip.title = run.prompt;
+    chip.addEventListener("click", () => {
+      selectedRun = run.id;
+      for (const c of strip.children) c.classList.toggle("on", c === chip);
+      void showRun(run.id);
+    });
+    strip.append(chip);
+  }
+  await showRun(selectedRun);
+}
+
+function parseTime(value: string | null): number | null {
+  if (!value) return null;
+  const t = Date.parse(value.replace(" ", "T") + "Z");
+  return Number.isNaN(t) ? null : t;
+}
+
+function duration(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+function describeAction(action: Record<string, unknown> | null): string {
+  if (!action) return "No action";
+  const type = String(action.type ?? "");
+  switch (type) {
+    case "click":
+      return `${action.button && action.button !== "left" ? `${action.button} ` : ""}click`;
+    case "double_click":
+      return "Double-click";
+    case "triple_click":
+      return "Triple-click";
+    case "type_text":
+      return `Type “${String(action.text ?? "").slice(0, 60)}”${action.press_enter ? " ⏎" : ""}`;
+    case "hotkey":
+      return `Press ${Array.isArray(action.keys) ? action.keys.join(" + ") : ""}`;
+    case "key_press":
+      return `Press ${action.key}`;
+    case "open_app":
+      return `Open ${action.name}`;
+    case "focus_window":
+      return `Switch to ${action.name}`;
+    case "open_url":
+      return `Open ${action.url}`;
+    case "scroll":
+      return `Scroll ${Number(action.clicks) > 0 ? "up" : "down"}`;
+    case "drag_and_drop":
+      return "Drag";
+    case "wait_settle":
+    case "wait":
+      return "Wait";
+    case "done":
+      return "Finish";
+    case "fail":
+      return "Give up";
+    default:
+      return type.replace(/_/g, " ") || "Action";
+  }
+}
+
+/** How a step ended, as the harness recorded it ("succeeded", "failed", "uncertain", ...). */
+function outcomeKind(outcome: string): "ok" | "bad" | "unsure" {
+  if (outcome === "succeeded" || outcome === "success") return "ok";
+  if (outcome === "failed" || outcome === "refused" || outcome === "error") return "bad";
+  return "unsure";
+}
+const OUTCOME_LABEL = { ok: "Worked", bad: "Failed", unsure: "Unsure" };
+
+const STATUS_LABEL: Record<string, string> = { completed: "Done", stopped: "Stopped", incomplete: "Not finished", failed: "Failed", running: "Running" };
+
+let mistakeStep: number | null = null;
+
+async function showRun(id: string): Promise<void> {
+  const host = $("run-detail");
+  let detail: { run: RunSummary; steps: RunStep[] };
+  try {
+    detail = await invoke("get_task_run_detail", { id });
+  } catch (error) {
+    host.innerHTML = `<div class="empty">${escapeHtml(toMessage(error))}</div>`;
+    return;
+  }
+  if (selectedRun !== id) return;
+  mistakeStep = null;
+  const { run, steps } = detail;
+  const start = parseTime(run.startedAt);
+  const end = parseTime(run.completedAt);
+  const total = start && end ? end - start : null;
+  const good = steps.filter((s) => outcomeKind(s.outcome) === "ok").length;
+  host.innerHTML = `
+    <div class="run-head"><div class="run-task"></div><div class="run-summary"></div></div>
+    <div class="stats">
+      <div class="stat"><div class="stat-value">${STATUS_LABEL[run.status] ?? escapeHtml(run.status)}</div><div class="stat-label">Result</div></div>
+      <div class="stat"><div class="stat-value">${steps.length}</div><div class="stat-label">Steps</div></div>
+      <div class="stat"><div class="stat-value">${total != null ? duration(total) : "—"}</div><div class="stat-label">Time</div></div>
+      <div class="stat"><div class="stat-value">${steps.length ? `${Math.round((good / steps.length) * 100)}%` : "—"}</div><div class="stat-label">Steps that worked</div></div>
+    </div>
+    <div class="steps"></div>
+    <div class="feedback"></div>`;
+  host.querySelector(".run-task")!.textContent = run.prompt;
+  host.querySelector(".run-summary")!.textContent = run.summary ?? "";
+  const strip = host.querySelector(".steps")!;
+  steps.forEach((step, i) => {
+    const card = document.createElement("div");
+    card.className = "step";
+    card.style.animationDelay = `${Math.min(i, 10) * 35}ms`;
+    const kind = outcomeKind(step.outcome);
+    card.innerHTML = `
+      <div class="step-shot">${step.screenshot ? `<img loading="lazy" alt="" />` : ""}<span class="num">${step.index}</span><span class="result ${kind}">${OUTCOME_LABEL[kind]}</span></div>
+      <div class="step-body"><div class="step-action"></div><div class="step-thought"></div></div>`;
+    if (step.screenshot) card.querySelector("img")!.src = step.screenshot;
+    const target = step.target ? ` · ${step.target}` : "";
+    const what = describeAction(step.action);
+    card.querySelector(".step-action")!.textContent = `${what.charAt(0).toUpperCase()}${what.slice(1)}${target}`;
+    card.querySelector(".step-thought")!.textContent = step.thought;
+    card.addEventListener("click", () => {
+      mistakeStep = mistakeStep === step.index ? null : step.index;
+      for (const c of strip.children) c.classList.toggle("selected", c === card && mistakeStep !== null);
+      renderFeedback(run, steps);
+    });
+    strip.append(card);
+  });
+  renderFeedback(run, steps);
+}
+
+function renderFeedback(run: RunSummary, steps: RunStep[]): void {
+  const box = document.querySelector<HTMLElement>("#run-detail .feedback");
+  if (!box || steps.length === 0 || run.status === "running") {
+    if (box) box.replaceChildren();
+    return;
+  }
+  if (mistakeStep === null) {
+    box.innerHTML = `<button class="pill-btn good" type="button">Remember this way</button><span class="feedback-hint">Tap a step that went wrong to correct it.</span>`;
+    box.querySelector("button")!.addEventListener("click", () => void review({ runId: run.id, verdict: "perfect" }));
+    return;
+  }
+  box.innerHTML = `<input class="note" placeholder="What should Aura do at step ${mistakeStep} instead?" /><button class="pill-btn bad" type="button">Save correction</button>`;
+  const note = box.querySelector<HTMLInputElement>("input")!;
+  note.focus();
+  box.querySelector("button")!.addEventListener("click", () => {
+    const step = steps.find((s) => s.index === mistakeStep);
+    void review({ runId: run.id, verdict: "mistake", stepIndex: mistakeStep, forbiddenAction: step ? JSON.stringify(step.action) : "", correction: note.value });
+  });
+}
+
+async function review(input: Record<string, unknown>): Promise<void> {
+  try {
+    const message = await invoke<string>("submit_task_review", { input });
+    toast(message);
+  } catch (error) {
+    toast(toMessage(error), { error: true });
+  }
+}
+
+// ---- Start -------------------------------------------------------------------------------------
+
+autosize();
+void loadVoice();
+void loadPresets().then(checkConnection);
+window.setInterval(() => {
+  if (!running && document.visibilityState === "visible") void checkConnection();
+}, 120_000);
+task.focus();

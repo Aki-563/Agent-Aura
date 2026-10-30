@@ -932,12 +932,25 @@ fn app_window(name: &str) -> Option<isize> {
 
 /// Brings the named app to the front, starting it with `open_app` when it is not running.
 fn ensure_app(name: &str, title_part: &str) -> Result<(), String> {
-    if let Some(window) = desktop_target::find_window_by_name(name) {
-        desktop_target::bring_to_front(window);
-    } else {
-        act(A::OpenApp { name: name.to_owned() })?;
+    let existing = desktop_target::find_window_by_name(name);
+    match existing {
+        Some(window) => {
+            desktop_target::bring_to_front(window);
+        }
+        None => act(A::OpenApp { name: name.to_owned() })?,
     }
-    if wait_until(12_000, || desktop_target::foreground_title().to_lowercase().contains(&title_part.to_lowercase())) {
+    let mut last_raise = Instant::now();
+    let in_front = || desktop_target::foreground_title().to_lowercase().contains(&title_part.to_lowercase());
+    // A system pop-up can take the foreground for a moment: raise the window again now and then.
+    if wait_until(12_000, || {
+        if !in_front() && last_raise.elapsed() > Duration::from_millis(1500) {
+            if let Some(window) = desktop_target::find_window_by_name(name) {
+                desktop_target::bring_to_front(window);
+            }
+            last_raise = Instant::now();
+        }
+        in_front()
+    }) {
         std::thread::sleep(Duration::from_millis(500));
         Ok(())
     } else {
@@ -1164,11 +1177,20 @@ fn open_page(path: &str, title: &str) -> Result<(), String> {
     match BROWSER.lock().ok().and_then(|b| b.clone()) {
         // Reuse the tab only when it is one of our test pages; otherwise start the isolated browser,
         // so a browser window the user owns is never navigated.
-        Some(_) if desktop_target::foreground_title().contains("Aura Fixture") => act(A::OpenUrl { url })?,
+        Some(_) if desktop_target::foreground_title().contains("Aura Fixture") => act(A::OpenUrl { url: url.clone() })?,
         Some(program) => open_in_new_browser_window(&program, &url)?,
-        None => act(A::OpenUrl { url })?,
+        None => act(A::OpenUrl { url: url.clone() })?,
     }
-    if wait_until(20_000, || fx::saw(&format!("load:Aura Fixture {title}"))) {
+    let loaded = || fx::saw(&format!("load:Aura Fixture {title}"));
+    let mut seen = wait_until(12_000, loaded);
+    if !seen {
+        // Chrome sometimes drops a hand-off to its running instance; ask once more.
+        if let Some(program) = BROWSER.lock().ok().and_then(|b| b.clone()) {
+            open_in_new_browser_window(&program, &url)?;
+            seen = wait_until(15_000, loaded);
+        }
+    }
+    if seen {
         std::thread::sleep(Duration::from_millis(900));
         // A browser started by a background process may not get the foreground by itself.
         if !desktop_target::foreground_title().contains("Aura Fixture") {
@@ -2320,8 +2342,14 @@ fn orders_a_miscounted_element_is_corrected_by_its_name(_lab: &Lab) -> Result<()
 
 /// Runs whole proposals (target text included), each a step, then done.
 fn run_proposals(proposals: Vec<serde_json::Value>) -> Result<(), String> {
+    run_proposals_with(proposals, Vec::new())
+}
+
+/// Like `run_proposals`, with extra scripted replies (grounding answers, for example).
+fn run_proposals_with(proposals: Vec<serde_json::Value>, extra: Vec<(&'static str, String)>) -> Result<(), String> {
     use crate::mock_server::{replies, MockServer};
     let mut script: Vec<(&str, String)> = proposals.into_iter().map(|p| ("aura_proposal", p.to_string())).collect();
+    script.extend(extra);
     script.push(("aura_proposal", replies::proposal(serde_json::json!({"type": "done", "summary": "done"}), "finish")));
     script.push(("aura_verification", replies::accept_verification()));
     script.push(("aura_done_check", replies::done_check(true, "")));
@@ -2347,6 +2375,74 @@ fn orders_a_point_on_the_wrong_button_is_moved_to_the_named_one(_lab: &Lab) -> R
     expect_no_event("click:alpha")
 }
 
+/// A proposal whose target is only described (no visible text), so the grounding mode decides.
+fn described_click(description: &str, x: i32, y: i32) -> serde_json::Value {
+    serde_json::json!({
+        "previousOutcome": "not_applicable", "reflection": "r", "thought": format!("click {description}"),
+        "target": {"description": description},
+        "expectedOutcome": "it is clicked", "action": {"type": "click", "x": x, "y": y}, "impact": "routine"
+    })
+}
+
+/// Runs `body` with the grounding mode switched for this process only, then puts it back.
+fn with_grounding_mode<T>(mode: crate::settings::GroundingMode, body: impl FnOnce() -> T) -> T {
+    let before = crate::settings::get();
+    let mut changed = before.clone();
+    changed.grounding_mode = mode;
+    crate::settings::set_in_memory(changed);
+    let result = body();
+    crate::settings::set_in_memory(before);
+    result
+}
+
+fn orders_zoom_then_click_in_the_zoomed_picture(_lab: &Lab) -> Result<(), String> {
+    open_page("/click", "Click")?;
+    let (_, bx, by) = seen(ORDERS_TASK, "Beta")?;
+    // A 160 x 90 region centred on Beta. The next picture is that region enlarged to 1280 wide, so
+    // Beta's centre is the picture's centre: (640, 360).
+    run_scripted(ORDERS_TASK, vec![
+        serde_json::json!({"type": "zoom", "x": bx - 80, "y": by - 45, "width": 160, "height": 90}),
+        serde_json::json!({"type": "click", "x": 640, "y": 360}),
+    ])?;
+    expect_event("click:beta")?;
+    expect_no_event("click:alpha")?;
+    expect_no_event("click:gamma")
+}
+
+fn orders_observe_sends_nothing_then_the_click_lands(_lab: &Lab) -> Result<(), String> {
+    open_page("/click", "Click")?;
+    // Pixels, not an element number: numbers belong to one observation, and the model is shown
+    // fresh ones after the observe step.
+    let (_, gx, gy) = seen(ORDERS_TASK, "Gamma")?;
+    run_scripted(ORDERS_TASK, vec![serde_json::json!({"type": "observe"}), serde_json::json!({"type": "click", "x": gx, "y": gy})])?;
+    expect_event("click:gamma")?;
+    expect_no_event("click:alpha")
+}
+
+fn orders_grounding_mode_b_moves_the_point_to_what_the_pointer_model_found(_lab: &Lab) -> Result<(), String> {
+    open_page("/click", "Click")?;
+    let (_, ax, ay) = seen(ORDERS_TASK, "Alpha")?;
+    let (gamma, _, _) = seen(ORDERS_TASK, "Gamma")?;
+    // The proposal points at Alpha but describes Gamma; the second (grounding) call answers Gamma.
+    let grounding = serde_json::json!({"found": true, "element": gamma}).to_string();
+    with_grounding_mode(crate::settings::GroundingMode::B, || {
+        run_proposals_with(vec![described_click("the third button", ax + 3, ay + 2)], vec![("aura_grounding", grounding)])
+    })?;
+    expect_event("click:gamma")?;
+    expect_no_event("click:alpha")
+}
+
+fn orders_grounding_mode_c_moves_a_near_miss_onto_the_described_button(_lab: &Lab) -> Result<(), String> {
+    open_page("/click", "Click")?;
+    let observation = driver::observe(ORDERS_TASK)?;
+    let gamma = observation.find("Gamma").ok_or("'Gamma' is not among the numbered elements")?;
+    let (gx, _) = gamma.center();
+    // Just below the button: a near miss that would click nothing.
+    let below = gamma.bottom + 6;
+    with_grounding_mode(crate::settings::GroundingMode::C, || run_proposals(vec![described_click("Gamma button", gx, below)]))?;
+    expect_event("click:gamma")
+}
+
 fn orders_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
     vec![
         ("orders", "click by element number", orders_click_by_element_number),
@@ -2358,6 +2454,10 @@ fn orders_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
         ("orders", "scroll, then click what appeared", orders_scroll_then_click_what_appeared),
         ("orders", "a miscounted element is corrected by its name", orders_a_miscounted_element_is_corrected_by_its_name),
         ("orders", "a point on the wrong button is moved to the named one", orders_a_point_on_the_wrong_button_is_moved_to_the_named_one),
+        ("orders", "zoom, then click in the zoomed picture", orders_zoom_then_click_in_the_zoomed_picture),
+        ("orders", "observe sends nothing, then the click lands", orders_observe_sends_nothing_then_the_click_lands),
+        ("orders", "grounding mode B: the pointer model's answer is used", orders_grounding_mode_b_moves_the_point_to_what_the_pointer_model_found),
+        ("orders", "grounding mode C: a near miss is moved onto the button", orders_grounding_mode_c_moves_a_near_miss_onto_the_described_button),
     ]
 }
 

@@ -99,3 +99,16 @@ CREATE TABLE IF NOT EXISTS TaskStepAnchors (
 INSERT OR IGNORE INTO SchemaMigrations(version) VALUES (2);
 CREATE INDEX IF NOT EXISTS idx_task_runs_intent ON TaskRuns(normalized_intent, status);
 CREATE INDEX IF NOT EXISTS idx_trajectory_run ON TrajectorySteps(run_id, step_index);
+
+-- Saved model connections (presets). The API key is DPAPI-encrypted (see vault.rs), never plain.
+CREATE TABLE IF NOT EXISTS ModelPresets (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    protocol TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    model TEXT NOT NULL,
+    api_key_encrypted TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_model_presets_identity ON ModelPresets(protocol, base_url, model);

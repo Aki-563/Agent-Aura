@@ -7,6 +7,7 @@ pub mod control;
 pub mod coords;
 pub mod db;
 pub mod desktop;
+pub mod display_scale;
 pub mod driver_cli;
 pub mod eval;
 pub mod eval_fixture;
@@ -28,6 +29,7 @@ pub mod soak;
 pub mod schedule;
 pub mod schedule_app;
 pub mod schedule_cli;
+pub mod schedule_prompt;
 pub mod sound;
 pub mod system_state;
 pub mod testlog;
@@ -93,6 +95,18 @@ pub fn run() {
             schedule_app::add_schedule,
             schedule_app::remove_schedule,
             schedule_app::set_schedule_enabled,
+            schedule_app::schedule_from_prompt,
+            agent::app::list_model_presets,
+            agent::app::connect_model,
+            agent::app::use_model_preset,
+            agent::app::delete_model_preset,
+            agent::app::ping_provider,
+            agent::app::calibrate_model,
+            agent::app::get_voice_enabled,
+            agent::app::set_voice_enabled,
+            agent::app::start_window_drag,
+            agent::app::list_task_runs,
+            agent::app::get_task_run_detail,
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {

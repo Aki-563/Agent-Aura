@@ -82,6 +82,19 @@ impl HudState {
         }
     }
 
+    /// The second colour that drifts along the edges with the base colour.
+    fn accent_color(&self) -> [f32; 3] {
+        match self {
+            Self::Thinking => [236.0, 72.0, 153.0],
+            Self::Working => [59.0, 130.0, 246.0],
+            Self::Settling => [251.0, 113.0, 133.0],
+            Self::Emergency => [249.0, 115.0, 22.0],
+            Self::Capturing => [34.0, 211.0, 238.0],
+            Self::Finished => [16.0, 185.0, 129.0],
+            Self::Inactive => [0.0, 0.0, 0.0],
+        }
+    }
+
     /// The words shown at the top centre of the screen while this state is active.
     pub fn label(&self) -> Option<&'static str> {
         match self {
@@ -95,6 +108,9 @@ impl HudState {
         }
     }
 }
+
+/// Width the pill adds around its text: the dot on the left and the padding on the right.
+const PILL_CHROME: i32 = 24 + 14 + 26;
 
 /// How long the green "finished" state stays on screen.
 const FINISHED_SHOW_SECS: f32 = 2.4;
@@ -157,7 +173,7 @@ impl GlowRenderer {
             context: Arc::new(Mutex::new(RenderContext {
                 state: HudState::Inactive,
                 state_since: Instant::now(),
-                halo_enabled: true,
+                halo_enabled: false,
                 ripples: Vec::new(),
             })),
             running: Arc::new(AtomicBool::new(false)),
@@ -243,6 +259,7 @@ impl GlowRenderer {
             let mut color_from = [147.0f32, 51.0, 234.0];
             let mut color_to = color_from;
             let mut color_cur = color_from;
+            let mut accent_cur = [236.0f32, 72.0, 153.0];
             let mut color_started = Instant::now();
             let mut master_p: f32 = 0.0;
             let mut alpha_disp: f32 = 0.0;
@@ -296,7 +313,6 @@ impl GlowRenderer {
                     if just_shown {
                         color_from = target;
                         color_to = target;
-                        color_cur = target;
                     } else if target != color_to {
                         color_from = color_cur;
                         color_to = target;
@@ -304,6 +320,14 @@ impl GlowRenderer {
                     }
                 }
                 color_cur = lerp3(color_from, color_to, ease_in_out(color_started.elapsed().as_secs_f32() / COLOR_TRANSITION_SECS));
+                if active {
+                    let target = current_state.accent_color();
+                    if just_shown {
+                        accent_cur = target;
+                    } else {
+                        accent_cur = lerp3(accent_cur, target, 1.0 - (-dt / 0.25).exp());
+                    }
+                }
                 let color = RgbColor { r: color_cur[0].round() as u8, g: color_cur[1].round() as u8, b: color_cur[2].round() as u8 };
 
                 // Keep above every other window, including other always-on-top ones.
@@ -356,7 +380,7 @@ impl GlowRenderer {
 
                     // 2. Screen-edge glow (soft quadratic falloff)
                     if alpha_scale > 0.01 {
-                        Self::render_edge_glow(buffer_slice, width, height, &color, 22, alpha_scale);
+                        Self::render_edge_glow(buffer_slice, width, height, &color_cur, &accent_cur, alpha_scale, elapsed_secs);
                     }
 
                     // 2b. Status pill at the top centre of the primary screen
@@ -377,7 +401,7 @@ impl GlowRenderer {
                         if swap >= 1.0 {
                             label_prev = None;
                         }
-                        let target_w = (mask.width + 60) as f32;
+                        let target_w = (mask.width + PILL_CHROME) as f32;
                         if pill_w_disp < 1.0 || just_shown {
                             pill_w_disp = target_w;
                         } else {
@@ -536,60 +560,56 @@ impl GlowRenderer {
         }
     }
 
-    /// Renders screen-edge glow along display boundaries.
-    fn render_edge_glow(
-        buffer: &mut [u32],
-        width: i32,
-        height: i32,
-        color: &RgbColor,
-        glow_size: i32,
-        alpha_scale: f32,
-    ) {
-        let g = glow_size;
+    /// Depth of the edge glow in pixels for a screen this tall (84 px at 1080p, more on bigger screens).
+    fn glow_depth(height: i32) -> i32 {
+        (84.0 * (height as f32 / 1080.0).clamp(1.0, 2.0)) as i32
+    }
 
-        // Top border
-        for y in 0..g.min(height) {
-            let factor = (1.0 - (y as f32 / g as f32)).powf(2.2);
-            let a = ((255.0 * factor * alpha_scale) as u32).min(255);
-            let px = Self::pack_premultiplied(color, a);
-            for x in 0..width {
-                let idx = (y * width + x) as usize;
-                buffer[idx] = Self::blend_max(buffer[idx], px);
+    /// Brightness at `d` pixels in from the edge: a bright rim that melts into a wide soft haze.
+    fn glow_falloff(d: f32, depth: f32) -> f32 {
+        let rim = (-d / (depth * 0.12)).exp();
+        let haze = (1.0 - d / depth).max(0.0).powf(2.2);
+        (0.9 * rim + 0.62 * haze).min(1.0)
+    }
+
+    /// Renders the screen-edge glow: the state colour with an accent colour drifting slowly along
+    /// the edges, brightest at the edge and fading far into the screen.
+    #[allow(clippy::too_many_arguments)]
+    fn render_edge_glow(buffer: &mut [u32], width: i32, height: i32, color: &[f32; 3], accent: &[f32; 3], alpha_scale: f32, time: f32) {
+        let g = Self::glow_depth(height).min(width / 2).min(height / 2).max(1);
+        let falloff: Vec<f32> = (0..g).map(|d| Self::glow_falloff(d as f32, g as f32)).collect();
+        let perimeter = 2.0 * (width + height) as f32;
+        let tint = |p: f32| -> [f32; 3] {
+            let k = 0.5 + 0.5 * ((p / perimeter * 2.0 - time * 0.08) * std::f32::consts::TAU).sin();
+            let m = 0.6 * k;
+            [color[0] + (accent[0] - color[0]) * m, color[1] + (accent[1] - color[1]) * m, color[2] + (accent[2] - color[2]) * m]
+        };
+        let pack = |c: &[f32; 3], a: f32| -> u32 {
+            let a = a.clamp(0.0, 1.0);
+            let a8 = (a * 255.0) as u32;
+            let ch = |v: f32| ((v * a) as u32).min(a8);
+            (a8 << 24) | (ch(c[0]) << 16) | (ch(c[1]) << 8) | ch(c[2])
+        };
+        let (w, h) = (width as f32, height as f32);
+        let top: Vec<[f32; 3]> = (0..width).map(|x| tint(x as f32)).collect();
+        let bottom: Vec<[f32; 3]> = (0..width).map(|x| tint(w + h + (w - 1.0 - x as f32))).collect();
+        let right: Vec<[f32; 3]> = (0..height).map(|y| tint(w + y as f32)).collect();
+        let left: Vec<[f32; 3]> = (0..height).map(|y| tint(2.0 * w + h + (h - 1.0 - y as f32))).collect();
+        for d in 0..g {
+            let a = falloff[d as usize] * alpha_scale;
+            if a < 0.004 {
+                continue;
             }
-        }
-
-        // Bottom border
-        for y in 0..g.min(height) {
-            let row = height - 1 - y;
-            let factor = (1.0 - (y as f32 / g as f32)).powf(2.2);
-            let a = ((255.0 * factor * alpha_scale) as u32).min(255);
-            let px = Self::pack_premultiplied(color, a);
-            for x in 0..width {
-                let idx = (row * width + x) as usize;
-                buffer[idx] = Self::blend_max(buffer[idx], px);
+            let (top_row, bottom_row) = ((d * width) as usize, ((height - 1 - d) * width) as usize);
+            for x in 0..width as usize {
+                buffer[top_row + x] = Self::blend_max(buffer[top_row + x], pack(&top[x], a));
+                buffer[bottom_row + x] = Self::blend_max(buffer[bottom_row + x], pack(&bottom[x], a));
             }
-        }
-
-        // Left border
-        for x in 0..g.min(width) {
-            let factor = (1.0 - (x as f32 / g as f32)).powf(2.2);
-            let a = ((255.0 * factor * alpha_scale) as u32).min(255);
-            let px = Self::pack_premultiplied(color, a);
             for y in 0..height {
-                let idx = (y * width + x) as usize;
-                buffer[idx] = Self::blend_max(buffer[idx], px);
-            }
-        }
-
-        // Right border
-        for x in 0..g.min(width) {
-            let col = width - 1 - x;
-            let factor = (1.0 - (x as f32 / g as f32)).powf(2.2);
-            let a = ((255.0 * factor * alpha_scale) as u32).min(255);
-            let px = Self::pack_premultiplied(color, a);
-            for y in 0..height {
-                let idx = (y * width + col) as usize;
-                buffer[idx] = Self::blend_max(buffer[idx], px);
+                let row = (y * width) as usize;
+                let (l, r) = (row + d as usize, row + (width - 1 - d) as usize);
+                buffer[l] = Self::blend_max(buffer[l], pack(&left[y as usize], a));
+                buffer[r] = Self::blend_max(buffer[r], pack(&right[y as usize], a));
             }
         }
     }
@@ -675,7 +695,8 @@ impl GlowRenderer {
             CreateFontW, GetTextExtentPoint32W, SetBkMode, SetTextColor, TextOutW, ANTIALIASED_QUALITY, FW_SEMIBOLD,
         };
         let wide: Vec<u16> = text.encode_utf16().collect();
-        let face: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
+        // The Windows 11 display face; GDI falls back to Segoe UI where it is missing.
+        let face: Vec<u16> = "Segoe UI Variable Display\0".encode_utf16().collect();
         unsafe {
             let hdc = CreateCompatibleDC(ptr::null_mut());
             if hdc.is_null() {
@@ -741,6 +762,7 @@ impl GlowRenderer {
         let dot_cx = left_f + 24.0;
         let text_area_left = left_f + 24.0 + 14.0;
         let text_area_w = (pill_w - (24.0 + 14.0) - 22.0).max(1.0);
+        let tint_line = [255.0 * 0.7 + color[0] * 0.3, 255.0 * 0.7 + color[1] * 0.3, 255.0 * 0.7 + color[2] * 0.3];
 
         let x0 = (left_f.floor() as i32 - 2).max(0);
         let x1 = ((left_f + pill_w).ceil() as i32 + 2).min(width);
@@ -759,11 +781,11 @@ impl GlowRenderer {
                 }
                 let edge = (0.5 - dist).clamp(0.0, 1.0);
                 // Body: near-black; a one pixel light hairline just inside the edge.
-                let hairline = (1.0 - (-dist - 0.5).abs().min(1.0)).clamp(0.0, 1.0) * 0.16;
+                let hairline = (1.0 - (-dist - 0.5).abs().min(1.0)).clamp(0.0, 1.0) * 0.22;
                 let (mut r, mut g, mut b) = (10.0f32, 10.0f32, 12.0f32);
-                r += (255.0 - r) * hairline;
-                g += (255.0 - g) * hairline;
-                b += (255.0 - b) * hairline;
+                r += (tint_line[0] - r) * hairline;
+                g += (tint_line[1] - g) * hairline;
+                b += (tint_line[2] - b) * hairline;
                 let mut a = 0.93 * opacity * edge;
 
                 // State dot with a soft halo.
@@ -789,8 +811,9 @@ impl GlowRenderer {
                     let tx = (x as f32 - text_left).floor() as i32;
                     let ty = (y as f32 - text_top).floor() as i32;
                     if tx >= 0 && ty >= 0 && tx < mask.width && ty < mask.height && (tx as f32) < text_area_w + 4.0 {
-                        // Fade the last few pixels so a long line does not end in a hard cut.
-                        let tail = ((text_area_w - tx as f32) / 12.0).clamp(0.0, 1.0);
+                        // While the capsule is still narrower than its words (it is growing), the
+                        // words fade at the edge instead of being cut; at full width nothing fades.
+                        let tail = ((text_area_w + 4.0 - tx as f32) / 8.0).clamp(0.0, 1.0);
                         let cover = mask.coverage[(ty * mask.width + tx) as usize] as f32 / 255.0 * line_opacity * opacity * tail;
                         r = r * (1.0 - cover) + 255.0 * cover;
                         g = g * (1.0 - cover) + 255.0 * cover;
@@ -952,5 +975,46 @@ mod tests {
 
         renderer.set_state(HudState::Inactive);
         renderer.stop();
+    }
+
+    /// Writes what the overlay draws (edge glow, status pill, working pointer) over a grey
+    /// "desktop" to AURA_PREVIEW_PNG, for a person to look at: the real overlay is excluded from
+    /// screenshots. Run with --ignored.
+    #[test]
+    #[ignore]
+    fn render_preview_frame() {
+        let Ok(path) = std::env::var("AURA_PREVIEW_PNG") else { panic!("set AURA_PREVIEW_PNG") };
+        let (w, h) = (1600i32, 900i32);
+        let mut buffer = vec![0u32; (w * h) as usize];
+        let state = HudState::Thinking;
+        let base = state.base_color();
+        let color = [base.r as f32, base.g as f32, base.b as f32];
+        GlowRenderer::render_edge_glow(&mut buffer, w, h, &color, &state.accent_color(), 1.0, 1.3);
+        let mask = GlowRenderer::render_label_mask("Thinking").unwrap();
+        let lines = vec![(&mask, 1.0f32, 0.0f32)];
+        GlowRenderer::render_label_pill(&mut buffer, w, h, w / 2, 22, (mask.width + PILL_CHROME) as f32, 44.0, &lines, &color, 1.0, 1.0);
+        // Composite over a mid-grey desktop with a white window, plus the pointer at (800, 450).
+        let mut image = image::RgbaImage::new(w as u32, h as u32);
+        for y in 0..h {
+            for x in 0..w {
+                let window = (300..1300).contains(&x) && (200..760).contains(&y);
+                let bg = if window { [250.0, 250.0, 250.0] } else { [58.0, 66.0, 82.0] };
+                let px = buffer[(y * w + x) as usize];
+                let a = ((px >> 24) & 0xFF) as f32 / 255.0;
+                let c = [((px >> 16) & 0xFF) as f32, ((px >> 8) & 0xFF) as f32, (px & 0xFF) as f32];
+                let out = [0, 1, 2].map(|i| (c[i] + bg[i] * (1.0 - a)).min(255.0) as u8);
+                image.put_pixel(x as u32, y as u32, image::Rgba([out[0], out[1], out[2], 255]));
+            }
+        }
+        let size = 48;
+        let arrow = crate::overlay::cursor::arrow_pixels(size);
+        for (i, [r, g, b, a]) in arrow.into_iter().enumerate() {
+            let (x, y) = (800 + i as u32 % size as u32, 450 + i as u32 / size as u32);
+            let under = *image.get_pixel(x, y);
+            let a = a as f32 / 255.0;
+            let mix = |c: u8, u: u8| (c as f32 * a + u as f32 * (1.0 - a)) as u8;
+            image.put_pixel(x, y, image::Rgba([mix(r, under[0]), mix(g, under[1]), mix(b, under[2]), 255]));
+        }
+        image.save(&path).unwrap();
     }
 }

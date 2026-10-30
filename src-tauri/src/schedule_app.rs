@@ -49,10 +49,7 @@ pub fn start(app: AppHandle) {
 }
 
 fn describe(s: &Schedule) -> Value {
-    let when = match &s.when {
-        When::Every { seconds } => format!("every {}", if seconds % 3600 == 0 { format!("{} h", seconds / 3600) } else if seconds % 60 == 0 { format!("{} min", seconds / 60) } else { format!("{seconds} s") }),
-        When::DailyAt { times } => format!("daily at {}", times.join(", ")),
-    };
+    let when = crate::schedule_prompt::describe(&s.when, schedule::local_offset_minutes());
     json!({
         "id": s.id, "task": s.task, "when": when, "enabled": s.enabled,
         "nextInSeconds": s.next_run_ms.saturating_sub(schedule::now_ms()) / 1000,
@@ -112,4 +109,16 @@ pub fn set_schedule_enabled(id: String, enabled: bool) -> Result<(), String> {
         }
         Ok(())
     })
+}
+
+/// A task typed with its own schedule ("every day at 9am check my inbox") is saved as a schedule
+/// instead of running now. Returns None when the prompt names no schedule (run it now).
+#[tauri::command]
+pub fn schedule_from_prompt(prompt: String) -> Result<Option<Value>, String> {
+    let tz = schedule::local_offset_minutes();
+    let Some(parsed) = crate::schedule_prompt::parse(&prompt, schedule::now_ms(), tz) else {
+        return Ok(None);
+    };
+    let id = with_store(|store| store.add(&parsed.task, parsed.when.clone(), Overlap::Skip, Missed::RunOnce, false, schedule::now_ms(), tz))?;
+    Ok(Some(json!({"id": id, "task": parsed.task, "when": crate::schedule_prompt::describe(&parsed.when, tz)})))
 }

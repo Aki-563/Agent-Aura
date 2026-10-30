@@ -22,6 +22,8 @@ pub enum When {
     Every { seconds: u64 },
     /// Every day at these local times, written "HH:MM".
     DailyAt { times: Vec<String> },
+    /// Once, at this Unix time in milliseconds; switched off after it ran.
+    Once { at_ms: u64 },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -127,6 +129,7 @@ pub fn next_run_after(when: &When, anchor_ms: u64, after_ms: u64, tz_offset_min:
             }
             None
         }
+        When::Once { at_ms } => (*at_ms > after_ms).then_some(*at_ms),
     }
 }
 
@@ -205,6 +208,10 @@ impl Store {
             let missed = now_ms - s.next_run_ms > MISSED_GRACE_MS;
             let snapshot = s.clone();
             s.next_run_ms = next_run_after(&s.when, s.anchor_ms, now_ms, tz).unwrap_or(u64::MAX);
+            if matches!(s.when, When::Once { .. }) {
+                // A one-off schedule has done its job (or missed it for good).
+                s.enabled = false;
+            }
             if !(missed && s.missed == Missed::Skip) {
                 due.push(snapshot);
             }

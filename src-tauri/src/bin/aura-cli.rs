@@ -59,6 +59,7 @@ enum Command {
     Parallel,
     Soak,
     Calibrate,
+    ScaleTest,
 }
 
 struct Args {
@@ -89,6 +90,7 @@ fn parse_args() -> Result<Args, String> {
         Some("parallel") => Command::Parallel,
         Some("soak") => Command::Soak,
         Some("calibrate") => Command::Calibrate,
+        Some("scale-test") => Command::ScaleTest,
         _ => return Err(usage()),
     };
     let mut args = Args {
@@ -131,7 +133,7 @@ fn parse_args() -> Result<Args, String> {
     if args.command == Command::Parallel && args.windows.is_empty() {
         return Err(format!("parallel needs one or more --window \"name=task\"\n{}", usage()));
     }
-    if !matches!(args.command, Command::Conformance | Command::Soak) && (args.model.is_empty() || (args.command == Command::Run && args.task.is_empty())) {
+    if !matches!(args.command, Command::Conformance | Command::Soak | Command::ScaleTest) && (args.model.is_empty() || (args.command == Command::Run && args.task.is_empty())) {
         return Err(format!("--model is required (and --task for `run`)\n{}", usage()));
     }
     Ok(args)
@@ -142,6 +144,7 @@ fn usage() -> String {
      [--max-steps <n>] [--auto-approve]\n       aura-cli parallel --model <id> --window \"Notepad=type hello\" --window \"Calculator=compute 6*7\" [--model-slots <n>]\n       aura-cli conformance [--only <group or name>]
        aura-cli soak --minutes <n> [--browser chrome]
        aura-cli calibrate --url <base url> --model <id>   (measures the model's coordinate convention)
+       aura-cli scale-test [--only group:...]            (repeats scale-sensitive tests at 100-200% display scale, then restores it)
        aura-cli eval --model <id> [--suite basic|intermediate|all] \
      [--only <task id>] [--repeat <n>] [--url <base url>] [--openai] [--key <api key>]\n       \
      (the key can also come from AURA_API_KEY or OPENAI_API_KEY)"
@@ -209,6 +212,9 @@ async fn main() {
     agent_aura_lib::make_process_dpi_aware();
     if let Err(error) = KillSwitch::start_monitoring() {
         eprintln!("warning: the Esc kill switch could not be installed: {error}");
+    }
+    if args.command == Command::ScaleTest {
+        std::process::exit(scale_test(&args));
     }
     if args.command == Command::Soak {
         println!("soak: {} minute(s) of safe desktop cases in a separate Chrome, watching memory, handles and GDI objects. Do not use the mouse or keyboard; Esc stops.", args.minutes);
@@ -378,4 +384,70 @@ It drives the real screen through the default browser; press Esc to stop.
             std::process::exit(1);
         }
     }
+}
+
+/// Runs the scale-sensitive conformance groups at every display scale the monitor offers (up to
+/// 200 %), each in a fresh process so it starts at that scale, and puts the original scale back.
+fn scale_test(args: &Args) -> i32 {
+    use agent_aura_lib::display_scale;
+    let info = match display_scale::get() {
+        Ok(info) => info,
+        Err(error) => {
+            eprintln!("cannot read the display scale: {error}");
+            return 2;
+        }
+    };
+    let guard = match display_scale::ScaleGuard::remember() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("cannot read the display scale: {error}");
+            return 2;
+        }
+    };
+    let groups = args.only.clone().unwrap_or_else(|| "group:system,precision,click,orders".to_owned());
+    let scales: Vec<u32> = info.allowed().into_iter().filter(|s| *s <= 200).collect();
+    println!("display scale test: now {}%, recommended {}%, testing {:?} with {groups}; the original scale is put back at the end. Do not use the mouse or keyboard; Esc stops.", info.current, info.recommended, scales);
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            eprintln!("{error}");
+            return 2;
+        }
+    };
+    let browser = args.browser.clone().unwrap_or_else(|| "chrome".to_owned());
+    let mut rows = Vec::new();
+    for scale in scales {
+        if KillSwitch::is_triggered() {
+            break;
+        }
+        if let Err(error) = display_scale::set(scale) {
+            println!("{scale}%: could not switch: {error}");
+            rows.push((scale, 0usize, 1usize));
+            continue;
+        }
+        // Windows re-lays out every window after a scale change.
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let now = display_scale::get().map(|i| i.current).unwrap_or(0);
+        if now != scale {
+            println!("{scale}%: Windows reports {now}% after switching");
+        }
+        let output = std::process::Command::new(&exe).args(["conformance", "--browser", &browser, "--only", &groups]).env("AURA_MUTE", "1").output();
+        let text = output.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        let passed = text.lines().filter(|l| l.starts_with("ok ")).count();
+        let failed: Vec<&str> = text.lines().filter(|l| l.starts_with("FAIL")).collect();
+        for line in &failed {
+            println!("{scale}%: {line}");
+        }
+        println!("{scale}%: {passed} passed, {} failed", failed.len());
+        rows.push((scale, passed, failed.len()));
+    }
+    let original = guard.original();
+    drop(guard);
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let back = display_scale::get().map(|i| i.current).unwrap_or(0);
+    println!("display scale put back to {back}% (was {original}%)");
+    for (scale, passed, failed) in &rows {
+        println!("{scale:>4}%  {passed:>3} passed  {failed:>3} failed");
+    }
+    if rows.iter().all(|(_, passed, failed)| *failed == 0 && *passed > 0) && back == original { 0 } else { 1 }
 }

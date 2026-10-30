@@ -461,7 +461,7 @@ pub fn wait_for_effect(
     let mut last_spinner_ms: Option<u64> = None;
     let mut faint_reference: (Vec<u8>, u64) = (baseline.to_vec(), 0);
     let mut reasons: Vec<&'static str> = Vec::new();
-    let mut note = |reason: &'static str, reasons: &mut Vec<&'static str>| {
+    let note = |reason: &'static str, reasons: &mut Vec<&'static str>| {
         if !reasons.contains(&reason) {
             reasons.push(reason);
         }
@@ -482,7 +482,7 @@ pub fn wait_for_effect(
             let roi = focus.map(|f| f.roi);
             let masks: Vec<Roi> = focus.and_then(|f| f.caret).map(|c| Roi { left: c.left - 2, top: c.top - 2, right: c.right + 2, bottom: c.bottom + 2 }).into_iter().collect();
             let (mut vs_baseline, total, _) = count_changes_masked(baseline, &frame.data, width, height, roi, &masks);
-            let (vs_previous, _, motion_box) = count_changes_masked(&previous, &frame.data, width, height, roi, &masks);
+            let (vs_previous, _, _motion_box) = count_changes_masked(&previous, &frame.data, width, height, roi, &masks);
             // A different active window than before the action is a visible effect by itself.
             if baseline_window != 0 && focus.is_some_and(|f| f.window_id != baseline_window) {
                 vs_baseline = vs_baseline.max(profile.min_changed);

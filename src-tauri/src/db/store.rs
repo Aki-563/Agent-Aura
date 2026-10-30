@@ -480,6 +480,103 @@ impl DbStore {
         }
         Ok(best.map(|(skill, _)| skill))
     }
+
+    /// Saves (or updates, keyed by protocol + server + model) a model connection preset.
+    /// Returns the preset's id.
+    pub fn save_model_preset(&mut self, name: &str, protocol: &str, base_url: &str, model: &str, api_key_encrypted: &str) -> Result<String> {
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM ModelPresets WHERE protocol = ?1 AND base_url = ?2 AND model = ?3",
+                params![protocol, base_url, model],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let id = existing.unwrap_or_else(|| format!("p{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
+        self.conn.execute(
+            "INSERT INTO ModelPresets (id, name, protocol, base_url, model, api_key_encrypted) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET name = ?2, api_key_encrypted = ?6, last_used_at = CURRENT_TIMESTAMP",
+            params![id, name, protocol, base_url, model, api_key_encrypted],
+        )?;
+        Ok(id)
+    }
+
+    /// Saved presets, most recently used first.
+    pub fn list_model_presets(&self) -> Result<Vec<ModelPreset>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, protocol, base_url, model, api_key_encrypted FROM ModelPresets ORDER BY last_used_at DESC, created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ModelPreset { id: row.get(0)?, name: row.get(1)?, protocol: row.get(2)?, base_url: row.get(3)?, model: row.get(4)?, api_key_encrypted: row.get(5)? })
+        })?;
+        rows.collect()
+    }
+
+    pub fn get_model_preset(&self, id: &str) -> Result<Option<ModelPreset>> {
+        self.conn
+            .query_row(
+                "SELECT id, name, protocol, base_url, model, api_key_encrypted FROM ModelPresets WHERE id = ?1",
+                params![id],
+                |row| Ok(ModelPreset { id: row.get(0)?, name: row.get(1)?, protocol: row.get(2)?, base_url: row.get(3)?, model: row.get(4)?, api_key_encrypted: row.get(5)? }),
+            )
+            .optional()
+    }
+
+    pub fn touch_model_preset(&mut self, id: &str) -> Result<()> {
+        self.conn.execute("UPDATE ModelPresets SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn delete_model_preset(&mut self, id: &str) -> Result<bool> {
+        Ok(self.conn.execute("DELETE FROM ModelPresets WHERE id = ?1", params![id])? > 0)
+    }
+
+    /// The most recent runs, newest first, with their start and end times (UTC, SQLite format)
+    /// and how many steps they recorded.
+    pub fn recent_task_runs(&self, limit: u32) -> Result<Vec<TaskRunSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.prompt, r.status, r.summary, r.started_at, r.completed_at,
+                    (SELECT COUNT(*) FROM TrajectorySteps s WHERE s.run_id = r.id)
+             FROM TaskRuns r ORDER BY r.started_at DESC, r.rowid DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(TaskRunSummary {
+                id: row.get(0)?,
+                prompt: row.get(1)?,
+                status: row.get(2)?,
+                summary: row.get(3)?,
+                started_at: row.get(4)?,
+                completed_at: row.get(5)?,
+                steps: row.get(6)?,
+            })
+        })?;
+        rows.collect()
+    }
+}
+
+/// A saved model connection.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPreset {
+    pub id: String,
+    pub name: String,
+    pub protocol: String,
+    pub base_url: String,
+    pub model: String,
+    #[serde(skip_serializing)]
+    pub api_key_encrypted: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRunSummary {
+    pub id: String,
+    pub prompt: String,
+    pub status: String,
+    pub summary: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub steps: i64,
 }
 
 fn normalized_similarity(left: &str, right: &str) -> f32 {
@@ -505,6 +602,38 @@ fn normalized_similarity(left: &str, right: &str) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_presets_are_saved_once_per_connection_listed_and_deleted() {
+        let mut store = DbStore::open_in_memory().unwrap();
+        let a = store.save_model_preset("Qwen", "open_ai_compatible_chat", "http://10.0.0.1:1234/v1", "qwen3-vl", "").unwrap();
+        let again = store.save_model_preset("Qwen (renamed)", "open_ai_compatible_chat", "http://10.0.0.1:1234/v1", "qwen3-vl", "").unwrap();
+        assert_eq!(a, again, "the same server and model is one preset");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = store.save_model_preset("GPT", "open_ai_responses", "https://api.openai.com/v1", "gpt-x", "ENCRYPTED").unwrap();
+        assert_ne!(a, b);
+        let list = store.list_model_presets().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(store.get_model_preset(&a).unwrap().unwrap().name, "Qwen (renamed)");
+        assert!(!serde_json::to_string(&list).unwrap().contains("ENCRYPTED"), "the key blob never goes to the page");
+        assert!(store.delete_model_preset(&a).unwrap());
+        assert!(!store.delete_model_preset(&a).unwrap());
+        assert_eq!(store.list_model_presets().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recent_runs_report_their_step_counts() {
+        let mut store = DbStore::open_in_memory().unwrap();
+        store.start_task_run("r1", "open notepad", "open notepad").unwrap();
+        store.save_trajectory_step("r1", 1, "{}", "{}", "{}", "success", "", None, "").unwrap();
+        store.save_trajectory_step("r1", 2, "{}", "{}", "{}", "success", "", None, "").unwrap();
+        store.finish_task_run("r1", "completed", "done").unwrap();
+        store.start_task_run("r2", "open paint", "open paint").unwrap();
+        let runs = store.recent_task_runs(10).unwrap();
+        assert_eq!(runs.len(), 2);
+        let r1 = runs.iter().find(|r| r.id == "r1").unwrap();
+        assert_eq!((r1.steps, r1.status.as_str()), (2, "completed"));
+    }
 
     #[test]
     fn test_store_initialization_starts_empty() {

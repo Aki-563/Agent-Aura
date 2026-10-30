@@ -814,18 +814,33 @@ impl InputActuator {
         }
         let distance = ((x - start.x) as f64).hypot((y - start.y) as f64);
         let Some(total) = glide_duration(distance) else { return Ok(()) };
+        // 1 ms timer resolution for the glide, so the steps come every ~4 ms (smooth at 120 Hz+)
+        // instead of the default 15.6 ms tick.
+        let bounds = Self::get_screen_bounds();
+        unsafe { windows_sys::Win32::Media::timeBeginPeriod(1) };
         let began = std::time::Instant::now();
-        loop {
-            Self::check_killswitch()?;
+        let mut last = (start.x, start.y);
+        let result = loop {
+            if let Err(error) = Self::check_killswitch() {
+                break Err(error);
+            }
             let t = began.elapsed().as_secs_f64() / total.as_secs_f64();
             if t >= 1.0 {
-                break;
+                break Ok(());
             }
+            // The bow may lean past a screen edge when the move runs along it: keep it on screen.
             let (px, py) = glide_point((start.x, start.y), (x, y), t);
-            Self::move_to(px, py)?;
+            let point = (px.clamp(bounds.x, bounds.x + bounds.width - 1), py.clamp(bounds.y, bounds.y + bounds.height - 1));
+            if point != last {
+                if let Err(error) = Self::move_to(point.0, point.1) {
+                    break Err(error);
+                }
+                last = point;
+            }
             thread::sleep(Duration::from_millis(4));
-        }
-        Ok(())
+        };
+        unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
+        result
     }
 
     /// Where the pointer really is, in physical pixels.
@@ -1378,7 +1393,20 @@ impl InputActuator {
                 "No open window matches '{name}'. Use a number or title from the WINDOWS OPEN list, or open_app to start it."
             ))
         })?;
-        if !crate::desktop::target::bring_to_front(hwnd) {
+        // A system pop-up (a notification, a taskbar preview) can hold the foreground for a moment:
+        // try again briefly before giving up.
+        let mut in_front = false;
+        for attempt in 0..4 {
+            if attempt > 0 {
+                Self::check_killswitch()?;
+                thread::sleep(Duration::from_millis(350));
+            }
+            if crate::desktop::target::bring_to_front(hwnd) {
+                in_front = true;
+                break;
+            }
+        }
+        if !in_front {
             return Err(InputError::ActionFailed(format!("Could not bring '{name}' to the front.")));
         }
         crate::desktop::target::set_target(Some(hwnd));
@@ -1598,7 +1626,7 @@ pub fn glide_duration(distance: f64) -> Option<Duration> {
     if distance < 6.0 {
         return None;
     }
-    Some(Duration::from_millis((140.0 + distance * 0.30).clamp(160.0, 560.0) as u64))
+    Some(Duration::from_millis((200.0 + distance * 0.30).clamp(240.0, 620.0) as u64))
 }
 
 /// Ease-in-out ("smootherstep"): zero speed and zero acceleration at both ends.
@@ -1607,10 +1635,19 @@ pub fn ease_in_out(t: f64) -> f64 {
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 }
 
-/// The pointer position `t` (0..1) of the way along a glide.
+/// The pointer position `t` (0..1) of the way along a glide: eased along the line, bowed slightly
+/// to one side in the middle the way a hand moves a mouse (at most 3% of the distance, 18 px),
+/// and exactly on the end points.
 pub fn glide_point(from: (i32, i32), to: (i32, i32), t: f64) -> (i32, i32) {
     let e = ease_in_out(t);
-    (from.0 + ((to.0 - from.0) as f64 * e).round() as i32, from.1 + ((to.1 - from.1) as f64 * e).round() as i32)
+    let (dx, dy) = ((to.0 - from.0) as f64, (to.1 - from.1) as f64);
+    let length = dx.hypot(dy);
+    let bow = if length > 0.0 { (length * 0.03).min(18.0) * (std::f64::consts::PI * e).sin() / length } else { 0.0 };
+    // Perpendicular (-dy, dx), scaled to `bow` pixels.
+    (
+        from.0 + (dx * e - dy * bow).round() as i32,
+        from.1 + (dy * e + dx * bow).round() as i32,
+    )
 }
 
 #[cfg(test)]
@@ -1633,7 +1670,9 @@ mod tests {
         }
         assert_eq!(glide_point((100, 200), (900, 600), 0.0), (100, 200));
         assert_eq!(glide_point((100, 200), (900, 600), 1.0), (900, 600));
-        assert_eq!(glide_point((100, 200), (900, 600), 0.5), (500, 400));
+        let (mx, my) = glide_point((100, 200), (900, 600), 0.5);
+        let off_line = ((mx - 500) as f64).hypot((my - 400) as f64);
+        assert!(off_line > 5.0 && off_line <= 19.0, "a gentle bow in the middle: {off_line}");
     }
 
     #[test]
@@ -1641,8 +1680,8 @@ mod tests {
         assert_eq!(glide_duration(3.0), None, "already there: no glide");
         let short = glide_duration(100.0).unwrap();
         let across = glide_duration(1900.0).unwrap();
-        assert!(short >= Duration::from_millis(160) && short <= Duration::from_millis(200));
-        assert_eq!(across, Duration::from_millis(560), "capped so a long move never drags on");
+        assert!(short >= Duration::from_millis(220) && short <= Duration::from_millis(260));
+        assert_eq!(across, Duration::from_millis(620), "capped so a long move never drags on");
         assert!(glide_duration(800.0).unwrap() > short);
     }
 

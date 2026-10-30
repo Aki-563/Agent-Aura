@@ -8,9 +8,9 @@ use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sound {
-    /// A task is starting: three rising notes.
+    /// A task is starting: two soft rising notes.
     Start,
-    /// The task finished: a bright arpeggio that lands on a chord.
+    /// The task finished: a gentle three-note rise with a faint sparkle.
     Finished,
     /// The run ended without finishing (stopped, failed, step limit): two soft falling notes.
     Stopped,
@@ -18,7 +18,8 @@ pub enum Sound {
 
 const SAMPLE_RATE: u32 = 44_100;
 
-/// One decaying note with a touch of second and third harmonic, mixed into `out`.
+/// One soft, glassy note: a sine with a quiet octave and a faint bell partial, a rounded 14 ms
+/// attack and a long exponential tail, mixed into `out`.
 fn add_note(out: &mut [f32], frequency: f32, start_secs: f32, length_secs: f32, volume: f32) {
     let first = (start_secs * SAMPLE_RATE as f32) as usize;
     let count = (length_secs * SAMPLE_RATE as f32) as usize;
@@ -28,44 +29,59 @@ fn add_note(out: &mut [f32], frequency: f32, start_secs: f32, length_secs: f32, 
             break;
         }
         let t = i as f32 / SAMPLE_RATE as f32;
-        // 6 ms attack, then an exponential decay that has died away by the end of the note.
-        let attack = (t / 0.006).min(1.0);
-        let decay = (-t * 5.5 / length_secs.max(0.05)).exp();
+        // Raised-cosine attack: no click, no hard edge.
+        let attack = if t < 0.014 { 0.5 - 0.5 * (std::f32::consts::PI * t / 0.014).cos() } else { 1.0 };
+        let decay = (-t * 4.2 / length_secs.max(0.05)).exp();
         let phase = 2.0 * std::f32::consts::PI * frequency * t;
-        let tone = phase.sin() + 0.28 * (2.0 * phase).sin() + 0.10 * (3.0 * phase).sin();
+        // The bell partial dies away much faster than the body of the note.
+        let shimmer = 0.06 * (2.76 * phase).sin() * (-t * 18.0).exp();
+        let tone = phase.sin() + 0.12 * (2.0 * phase).sin() + shimmer;
         out[index] += tone * attack * decay * volume;
     }
 }
 
 /// Builds the WAV file bytes (RIFF header + 16-bit mono PCM) for a sound.
 pub fn synthesize(sound: Sound) -> Vec<u8> {
+    // Soft two- and three-note chimes in the spirit of a phone's charging sound, not a doorbell.
     let (length, notes): (f32, Vec<(f32, f32, f32, f32)>) = match sound {
         // (frequency Hz, start s, length s, volume)
-        Sound::Start => (0.85, vec![(523.25, 0.00, 0.40, 0.55), (783.99, 0.09, 0.40, 0.55), (1046.50, 0.18, 0.55, 0.6)]),
-        Sound::Finished => (1.25, vec![
-            (659.25, 0.00, 0.45, 0.45),
-            (783.99, 0.08, 0.45, 0.45),
-            (987.77, 0.16, 0.45, 0.45),
-            (1318.51, 0.24, 0.60, 0.5),
-            (659.25, 0.36, 0.85, 0.35),
-            (987.77, 0.36, 0.85, 0.35),
-            (1318.51, 0.36, 0.85, 0.35),
+        Sound::Start => (0.9, vec![(1046.50, 0.00, 0.50, 0.55), (1567.98, 0.085, 0.65, 0.42)]),
+        Sound::Finished => (1.3, vec![
+            (1046.50, 0.00, 0.45, 0.45),
+            (1318.51, 0.09, 0.45, 0.40),
+            (1567.98, 0.18, 0.80, 0.40),
+            (2093.00, 0.27, 0.85, 0.16),
         ]),
-        Sound::Stopped => (0.75, vec![(659.25, 0.00, 0.30, 0.45), (523.25, 0.13, 0.45, 0.45)]),
+        Sound::Stopped => (0.85, vec![(880.00, 0.00, 0.45, 0.45), (659.25, 0.11, 0.62, 0.40)]),
     };
     let total = (length * SAMPLE_RATE as f32) as usize;
-    let mut mix = vec![0.0f32; total];
+    let mut dry = vec![0.0f32; total];
     for (frequency, start, len, volume) in notes {
-        add_note(&mut mix, frequency, start, len, volume);
+        add_note(&mut dry, frequency, start, len, volume);
     }
-    // Normalise to a comfortable peak, with a short fade-out so there is never a click.
+    // A little room: a few quiet early reflections soften the tail.
+    let mut mix = dry.clone();
+    for (delay_ms, gain) in [(37.0f32, 0.16f32), (71.0, 0.10), (113.0, 0.06), (167.0, 0.035)] {
+        let delay = (delay_ms / 1000.0 * SAMPLE_RATE as f32) as usize;
+        for i in delay..total {
+            mix[i] += dry[i - delay] * gain;
+        }
+    }
+    // Gentle one-pole low-pass (about 6 kHz) takes the edge off the highest partials.
+    let alpha = 1.0 - (-2.0 * std::f32::consts::PI * 6000.0 / SAMPLE_RATE as f32).exp();
+    let mut state = 0.0f32;
+    for value in mix.iter_mut() {
+        state += alpha * (*value - state);
+        *value = state;
+    }
+    // Normalise to a soft peak, with a long fade-out so there is never a click.
     let peak = mix.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(0.0001);
-    let fade = (0.03 * SAMPLE_RATE as f32) as usize;
+    let fade = (0.12 * SAMPLE_RATE as f32) as usize;
     let mut pcm: Vec<u8> = Vec::with_capacity(total * 2);
     for (i, value) in mix.iter().enumerate() {
         let tail = total - i;
-        let gain = if tail < fade { tail as f32 / fade as f32 } else { 1.0 };
-        let sample = (value / peak * 0.62 * gain * i16::MAX as f32) as i16;
+        let gain = if tail < fade { (tail as f32 / fade as f32).powi(2) } else { 1.0 };
+        let sample = (value / peak * 0.45 * gain * i16::MAX as f32) as i16;
         pcm.extend_from_slice(&sample.to_le_bytes());
     }
     let mut wav = Vec::with_capacity(44 + pcm.len());
