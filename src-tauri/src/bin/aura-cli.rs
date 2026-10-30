@@ -151,6 +151,10 @@ async fn main() {
     if raw.first().map(String::as_str) == Some("schedule") {
         std::process::exit(agent_aura_lib::schedule_cli::schedule_command(&raw[1..]));
     }
+    if raw.first().map(String::as_str) == Some("intruder") {
+        // A test helper: shows one window for the obstruction tests (see conformance.rs).
+        std::process::exit(agent_aura_lib::conformance::run_intruder(&raw[1..]));
+    }
     if raw.first().map(String::as_str) == Some("doctor") {
         // Checks the provider saved by the app: loads it, asks the model one tiny question.
         let runtime = match AgentRuntime::new() {

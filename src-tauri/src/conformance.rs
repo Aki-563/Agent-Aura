@@ -1811,6 +1811,150 @@ fn safety_password_and_captcha_are_recognised(_lab: &Lab) -> Result<(), String> 
     Ok(())
 }
 
+// ----------------------------------------------------------------------------- obstructions (H11)
+
+/// A real window, owned by another process, that the test puts over the target: a toast, a hover
+/// card, a floating widget, a dialog. (A window of this process would count as Aura's own.)
+struct Intruder {
+    child: Option<std::process::Child>,
+}
+
+/// The window itself; run by `aura-cli intruder <title> <x> <y> <w> <h> <topmost> <no_activate> <tool> <lifetime_ms>`.
+pub fn run_intruder(args: &[String]) -> i32 {
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    let num = |i: usize| args.get(i).and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
+    let flag = |i: usize| args.get(i).map_or(false, |v| v == "1");
+    let title = args.first().cloned().unwrap_or_default();
+    let (topmost, no_activate, tool, lifetime) = (flag(5), flag(6), flag(7), num(8) as u64);
+    unsafe {
+        let wide = |t: &str| t.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let mut ex = 0u32;
+        if topmost {
+            ex |= WS_EX_TOPMOST;
+        }
+        if no_activate {
+            ex |= WS_EX_NOACTIVATE;
+        }
+        if tool {
+            ex |= WS_EX_TOOLWINDOW;
+        }
+        let (class, name) = (wide("STATIC"), wide(&title));
+        let hwnd = CreateWindowExW(ex, class.as_ptr(), name.as_ptr(), WS_POPUP | WS_VISIBLE | WS_BORDER, num(1), num(2), num(3), num(4), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null());
+        if hwnd.is_null() {
+            return 1;
+        }
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        SetWindowPos(hwnd, if topmost { HWND_TOPMOST } else { HWND_TOP }, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        let born = Instant::now();
+        let mut message: MSG = std::mem::zeroed();
+        while lifetime == 0 || born.elapsed() < Duration::from_millis(lifetime) {
+            while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        DestroyWindow(hwnd);
+    }
+    0
+}
+
+impl Intruder {
+    /// `topmost`/`no_activate`/`tool`: the window styles; `lifetime`: closes itself after that long.
+    fn show(title: &str, rect: (i32, i32, i32, i32), topmost: bool, no_activate: bool, tool: bool, lifetime: Option<Duration>) -> Intruder {
+        let b = |v: bool| if v { "1" } else { "0" };
+        let child = std::env::current_exe().ok().and_then(|exe| {
+            std::process::Command::new(exe)
+                .arg("intruder")
+                .args([title, &rect.0.to_string(), &rect.1.to_string(), &rect.2.to_string(), &rect.3.to_string(), b(topmost), b(no_activate), b(tool), &lifetime.map_or(0, |l| l.as_millis()).to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok()
+        });
+        // The child needs a moment to start and show its window.
+        std::thread::sleep(Duration::from_millis(700));
+        Intruder { child }
+    }
+}
+
+impl Drop for Intruder {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// One attempt, no retries: the click is aimed with an observation taken before the intruder
+/// appeared, as happens when something pops up while the model is thinking.
+fn click_with_a_stale_observation(label: &str, show: impl FnOnce((i32, i32)) -> Intruder) -> Result<(String, Intruder), String> {
+    open_page("/click", "Click")?;
+    let observation = driver::observe("")?;
+    let (cx, cy) = observation
+        .all_candidates()
+        .into_iter()
+        .find(|(_, l, _)| l.eq_ignore_ascii_case(label))
+        .map(|(_, _, (l, t, r, b))| ((l + r) / 2, (t + b) / 2))
+        .ok_or_else(|| format!("'{label}' is not on screen"))?;
+    let intruder = show((cx, cy));
+    let report = driver::act(&observation, Order::Click(label))?;
+    Ok((report.effect, intruder))
+}
+
+fn obstruct_toast_over_the_target_is_waited_out(_lab: &Lab) -> Result<(), String> {
+    let (_, _intruder) = click_with_a_stale_observation("Beta", |(x, y)| {
+        Intruder::show("Notification: build finished", (x - 150, y - 45, 300, 90), true, true, true, Some(Duration::from_millis(2500)))
+    })?;
+    expect_event("click:beta")?;
+    expect_no_event("click:alpha")
+}
+
+fn obstruct_hover_card_closes_when_the_pointer_moves_away(_lab: &Lab) -> Result<(), String> {
+    let (_, _intruder) = click_with_a_stale_observation("Beta", |(x, y)| Intruder::show("", (x - 80, y - 30, 160, 60), false, true, false, Some(Duration::from_millis(1500))))?;
+    expect_event("click:beta")
+}
+
+fn obstruct_a_floating_widget_is_stepped_over(_lab: &Lab) -> Result<(), String> {
+    let (_, _intruder) = click_with_a_stale_observation("Beta", |(x, y)| Intruder::show("", (x - 60, y - 60, 120, 120), true, false, true, None))?;
+    expect_event("click:beta")?;
+    // The target window was raised only for the action.
+    let chrome = desktop_target::find_window_by_name("Aura Fixture").ok_or("the test page window is gone")?;
+    let style = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(chrome, windows_sys::Win32::UI::WindowsAndMessaging::GWL_EXSTYLE) };
+    if style & 0x8 != 0 {
+        return Err("the target window was left always-on-top after the action".into());
+    }
+    Ok(())
+}
+
+fn obstruct_a_real_window_over_the_target_is_not_clicked_through(_lab: &Lab) -> Result<(), String> {
+    let result = click_with_a_stale_observation("Beta", |(x, y)| Intruder::show("Some Other Program", (x - 200, y - 150, 400, 300), false, true, false, None));
+    match result {
+        Err(message) if message.contains("covered") || message.contains("no longer in front") => expect_no_event("click:beta"),
+        Err(other) => Err(format!("refused for the wrong reason: {other}")),
+        Ok(_) => Err("the click went ahead although another program's window covered the target".into()),
+    }
+}
+
+fn obstruct_a_toast_that_takes_the_focus_is_waited_out(_lab: &Lab) -> Result<(), String> {
+    let (_, _intruder) = click_with_a_stale_observation("Beta", |(x, y)| {
+        // An activatable topmost toast beside the target.
+        Intruder::show("Reminder: stand up", (x + 300, y - 40, 300, 80), true, false, true, Some(Duration::from_millis(2000)))
+    })?;
+    expect_event("click:beta")
+}
+
+fn obstruct_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
+    vec![
+        ("obstruct", "a toast over the target is waited out", obstruct_toast_over_the_target_is_waited_out),
+        ("obstruct", "a hover card closes when the pointer moves", obstruct_hover_card_closes_when_the_pointer_moves_away),
+        ("obstruct", "a floating widget is stepped over", obstruct_a_floating_widget_is_stepped_over),
+        ("obstruct", "another program's window is not clicked through", obstruct_a_real_window_over_the_target_is_not_clicked_through),
+        ("obstruct", "a toast that takes the focus is waited out", obstruct_a_toast_that_takes_the_focus_is_waited_out),
+    ]
+}
+
 // ----------------------------------------------------------------------------- system (T3)
 
 /// Whether the window is on the virtual desktop the user is looking at.
@@ -2292,7 +2436,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
         None => true,
     };
     let lab_cases: Vec<_> = cases().into_iter().filter(|(g, n, _)| selected(g, n)).collect();
-    let driver_selected: Vec<_> = driver_cases().into_iter().chain(draw_cases()).chain(load_cases()).chain(windows_cases()).chain(safety_cases()).chain(system_cases()).filter(|(g, n, _)| selected(g, n)).collect();
+    let driver_selected: Vec<_> = driver_cases().into_iter().chain(draw_cases()).chain(load_cases()).chain(windows_cases()).chain(safety_cases()).chain(system_cases()).chain(obstruct_cases()).filter(|(g, n, _)| selected(g, n)).collect();
     let app_cases: Vec<_> = driver_selected.into_iter().chain(body_cases().into_iter().filter(|(g, n, _)| selected(g, n))).chain(native_cases().into_iter().filter(|(g, n, _)| selected(g, n))).collect();
     if lab_cases.is_empty() && app_cases.is_empty() {
         return Err("no case matches that filter".into());
@@ -2316,7 +2460,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
     let mut results = Vec::new();
     let mut lab_open = !lab_cases.is_empty();
     for (group, name, case) in lab_cases.into_iter().chain(app_cases) {
-        if group != "native" && group != "driver" && group != "body" && group != "draw" && group != "load" && group != "windows" && group != "safety" && group != "system" {
+        if group != "native" && group != "driver" && group != "body" && group != "draw" && group != "load" && group != "windows" && group != "safety" && group != "system" && group != "obstruct" {
             // lab case: nothing to close
         } else if lab_open {
             // Close the lab tab before the real-application cases.
@@ -2330,8 +2474,8 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
             trail.clear();
         }
         let started = Instant::now();
-        let outcome = if group == "native" || group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" { case(&lab) } else { lab.reset().and_then(|_| case(&lab)) };
-        if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" {
+        let outcome = if group == "native" || group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" || group == "obstruct" { case(&lab) } else { lab.reset().and_then(|_| case(&lab)) };
+        if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" || group == "obstruct" {
             let _ = press("escape");
             close_fixture_tab();
         }
@@ -2343,7 +2487,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
             millis: started.elapsed().as_millis(),
             detail: outcome
                 .err()
-                .map(|e| if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" { format!("{e} [orders: {}]", trail_text()) } else { e })
+                .map(|e| if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" || group == "obstruct" { format!("{e} [orders: {}]", trail_text()) } else { e })
                 .unwrap_or_default(),
         };
         progress(&result);

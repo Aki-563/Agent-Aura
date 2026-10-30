@@ -1515,6 +1515,10 @@ async fn autonomous_loop(
         let observed_window = encoded.window.clone();
         let targets = expected_targets(std::slice::from_ref(&canvas_action), &actions, &encoded.elements);
         let mut input_guard = run_input_guard(&actions, Some(observed_window.clone()), targets.clone()).await?;
+        for note in crate::desktop::obstruction::take_notes() {
+            trace.event(step_number, "obstruction", json!({"note": &note}));
+            session.add_interruption(note);
+        }
         if let InputGuard::Covered(points) = &input_guard {
             trace.event(step_number, "panel_in_the_way", json!({"points": points}));
             if window.move_panel_away(points) {
@@ -1641,6 +1645,7 @@ async fn autonomous_loop(
         let executed = tokio::task::spawn_blocking(move || execute_actions(&actions))
             .await
             .map_err(|error| format!("Action worker failed: {error}"))?;
+        crate::desktop::obstruction::restore_raised();
         if let Err(error) = executed {
             if crate::input::killswitch::is_killed() {
                 return Ok(stopped_response(executed_steps));
@@ -3557,7 +3562,9 @@ impl crate::workers::WorkerBackend for DesktopWorkers {
             let windows_before = desktop_target::window_titles();
             let typed = matches!(action, ActionPrimitive::TypeText { .. } | ActionPrimitive::TypeWith { .. });
             let to_run = actions.clone();
-            if let Err(error) = tokio::task::spawn_blocking(move || execute_actions(&to_run)).await.map_err(|e| e.to_string())? {
+            let ran = tokio::task::spawn_blocking(move || execute_actions(&to_run)).await.map_err(|e| e.to_string())?;
+            crate::desktop::obstruction::restore_raised();
+            if let Err(error) = ran {
                 if crate::input::killswitch::is_killed() {
                     return Ok(Turn::Finished { completed: false, message: "stopped".to_owned() });
                 }
@@ -3812,6 +3819,23 @@ fn check_observation_fresh(actions: &[ActionPrimitive], observed: &WindowContext
         std::thread::sleep(Duration::from_millis(250));
         current = desktop_target::effective_foreground();
     }
+    if current != Some(observed_hwnd) && desktop_target::is_alive(observed_hwnd) {
+        // A notification or hover card that took the focus goes away by itself: give it time, then
+        // put the target window back.
+        if let Some(thief) = current {
+            let kind = crate::desktop::obstruction::classify(&crate::desktop::obstruction::describe(thief));
+            if matches!(kind, crate::desktop::obstruction::Kind::Toast | crate::desktop::obstruction::Kind::Tooltip) {
+                let started = Instant::now();
+                while desktop_target::effective_foreground() == Some(thief) && started.elapsed() < Duration::from_secs(6) {
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+                desktop_target::bring_to_front(observed_hwnd);
+                std::thread::sleep(Duration::from_millis(250));
+                current = desktop_target::effective_foreground();
+                crate::desktop::obstruction::note_external(format!("Obstruction: {} stole the focus; waited {:.1} s and brought '{}' back.", kind.word(), started.elapsed().as_secs_f32(), observed.title));
+            }
+        }
+    }
     if current != Some(observed_hwnd) {
         let now = current.map(|hwnd| desktop_target::title_of(hwnd)).unwrap_or_default();
         return Err(format!(
@@ -3823,12 +3847,18 @@ fn check_observation_fresh(actions: &[ActionPrimitive], observed: &WindowContext
         let Some((root, pid)) = desktop_target::window_at(x, y) else { continue };
         let same_program = root == observed_hwnd || pid == observed.process_id;
         if !same_program && !desktop_target::is_shell_window(root) && !desktop_target::is_own_window(root) {
-            return Err(format!(
-                "the point ({x}, {y}) is now covered by '{}' ({}), not by the window you looked at ('{}')",
-                desktop_target::title_of(root),
-                desktop_target::process_name_of(root),
-                observed.title
-            ));
+            // Something sits over the target. Harmless fixes first (wait, move the pointer away,
+            // raise the target above an overlay); only then tell the model.
+            let outcome = crate::desktop::obstruction::clear_cover((x, y), observed_hwnd);
+            if !outcome.cleared {
+                return Err(format!(
+                    "the point ({x}, {y}) is covered by '{}' ({}), not by the window you looked at ('{}'). {}",
+                    desktop_target::title_of(root),
+                    desktop_target::process_name_of(root),
+                    observed.title,
+                    if outcome.steps.is_empty() { String::new() } else { format!("Tried: {}.", outcome.steps.join("; ")) }
+                ));
+            }
         }
     }
     let has_pointer_target = actions.iter().any(|a| !action_points(std::slice::from_ref(a)).is_empty());
@@ -4702,7 +4732,9 @@ pub mod driver {
         let baseline_window = desktop_target::effective_foreground().map_or(0, |hwnd| hwnd as isize);
         let profile = SettleProfile::for_action(&actions[0]);
         let text_input = crate::settle::effect::is_text_input(&actions[0]);
-        execute_actions(&actions)?;
+        let ran = execute_actions(&actions);
+        crate::desktop::obstruction::restore_raised();
+        ran?;
         let report = wait_for_effect_on_monitor(capture.monitor_index, &capture.rgba, profile, baseline_window).ok();
         let title_after = foreground_window_context().title;
         let effect = describe_effect(report.as_ref(), text_input, &capture.window.title, &title_after);

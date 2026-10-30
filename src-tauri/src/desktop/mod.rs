@@ -5,5 +5,6 @@ pub mod affinity;
 pub mod panel;
 pub mod target;
 pub mod layout;
+pub mod obstruction;
 pub mod registry;
 pub mod windowops;
