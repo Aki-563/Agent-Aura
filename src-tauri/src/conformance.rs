@@ -610,7 +610,10 @@ fn drag_right_to_left(lab: &Lab) -> Result<(), String> {
 }
 
 fn drag_to_select_text(lab: &Lab) -> Result<(), String> {
-    let (sx, sy) = lab.at("para", 0.01, 0.5)?;
+    // The very start of the first letter: a press in the right half of a glyph starts the
+    // selection after it (browsers snap to the nearest character boundary).
+    let (sx, sy) = lab.at("para", 0.0, 0.5)?;
+    let sx = sx + 1;
     let (ex, ey) = lab.at("para", 0.45, 0.5)?;
     act(A::DragAndDrop { from_x: sx, from_y: sy, to_x: ex, to_y: ey, duration_ms: 400, hold_keys: vec![] })?;
     if wait_until(2500, || fx::state("selection").is_some_and(|s| s.len() > 8 && s.len() < 40 && s.starts_with("The"))) {

@@ -123,6 +123,9 @@ body.running .run-view {
 .run-log { flex: 1; overflow: hidden; font-family: ui-monospace, Consolas, monospace; font-size: 11px; color: #6b7280; }
 .run-log div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .run-stop { width: 100%; padding: 10px; font-weight: 700; }
+.run-controls { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.run-controls .run-stop { grid-column: 1 / -1; }
+#run-steer textarea { width: 100%; box-sizing: border-box; margin: 6px 0; font: inherit; }
 @keyframes run-pulse {
   0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--phase, #6d28d9) 60%, transparent); }
   100% { box-shadow: 0 0 0 12px transparent; }

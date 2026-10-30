@@ -449,6 +449,9 @@ pub struct ScreenBounds {
 #[derive(Debug, PartialEq)]
 pub enum InputError {
     Killed,
+    /// The run was paused (Pause key, steer box) or the user touched the mouse or keyboard
+    /// mid-action: the action was cut short and everything held was released.
+    Paused,
     OutOfBounds { x: i32, y: i32, bounds: ScreenBounds },
     InvalidKey(String),
     SendInputFailed(u32),
@@ -460,6 +463,7 @@ impl std::fmt::Display for InputError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Killed => write!(f, "Emergency kill-switch triggered: input aborted immediately"),
+            Self::Paused => write!(f, "PAUSED: the action was cut short because the run was paused or the user took over"),
             Self::OutOfBounds { x, y, bounds } => write!(
                 f,
                 "Coordinate ({}, {}) is out of physical bounds [x: {}, y: {}, w: {}, h: {}]",
@@ -731,9 +735,13 @@ impl InputActuator {
         }
     }
 
+    /// Checked before every input event: a stop aborts, a pause or the user taking over cuts the
+    /// action short (the caller releases everything held).
     fn check_killswitch() -> Result<(), InputError> {
         if killswitch::is_killed() {
             Err(InputError::Killed)
+        } else if crate::control::input_should_yield() {
+            Err(InputError::Paused)
         } else {
             Ok(())
         }
@@ -1517,7 +1525,8 @@ impl InputActuator {
             ActionPrimitive::Note { .. } | ActionPrimitive::AskUser { .. } => Ok(()),
             ActionPrimitive::OpenUrl { url } => Self::open_url(url),
             ActionPrimitive::WaitSettle { max_timeout_ms, .. } => {
-                thread::sleep(Duration::from_millis(*max_timeout_ms));
+                // Interruptible: a stop or pause during a wait ends it at once.
+                ext::sleep_interruptible(*max_timeout_ms)?;
                 Ok(())
             }
             ActionPrimitive::Done { .. } | ActionPrimitive::Fail { .. } => Ok(()),

@@ -58,6 +58,34 @@ impl MockServer {
     pub fn requests_of(&self, kind: &str) -> Vec<String> {
         self.requests().into_iter().filter(|body| body.contains(&format!("\"name\":\"{kind}\""))).collect()
     }
+
+    /// A handle another thread can use to see how many requests of a kind have arrived (tests
+    /// time a stop or steer against the model call, not against the wall clock).
+    pub fn watcher(&self) -> RequestWatcher {
+        RequestWatcher(Arc::clone(&self.shared))
+    }
+}
+
+#[derive(Clone)]
+pub struct RequestWatcher(Arc<Mutex<Shared>>);
+
+impl RequestWatcher {
+    pub fn count(&self, kind: &str) -> usize {
+        let needle = format!("\"name\":\"{kind}\"");
+        self.0.lock().map(|s| s.requests.iter().filter(|body| body.contains(&needle)).count()).unwrap_or(0)
+    }
+
+    /// Blocks until the `n`-th request of `kind` has arrived (or `timeout` passes).
+    pub fn wait_for(&self, kind: &str, n: usize, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if self.count(kind) >= n {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
 }
 
 impl Drop for MockServer {
@@ -121,6 +149,35 @@ async fn handle_connection(mut stream: TcpStream, shared: Arc<Mutex<Shared>>) ->
                 None => state.last.get(&kind).cloned().unwrap_or_else(|| "{}".to_owned()),
             }
         };
+        // Failure directives at the start of a scripted reply (they can be combined in order):
+        // `@delay:<ms>|` waits first, `@hang` never answers, `@drop` closes the connection with no
+        // answer, `@status:<code>|` answers with that HTTP status.
+        let mut reply = reply;
+        let mut status = 200u16;
+        loop {
+            if let Some(rest) = reply.strip_prefix("@delay:") {
+                let (ms, after) = rest.split_once('|').unwrap_or((rest, ""));
+                tokio::time::sleep(std::time::Duration::from_millis(ms.trim().parse().unwrap_or(0))).await;
+                reply = after.to_owned();
+            } else if reply.starts_with("@hang") {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                return Ok(());
+            } else if reply.starts_with("@drop") {
+                return Ok(());
+            } else if let Some(rest) = reply.strip_prefix("@status:") {
+                let (code, after) = rest.split_once('|').unwrap_or((rest, ""));
+                status = code.trim().parse().unwrap_or(500);
+                reply = after.to_owned();
+            } else {
+                break;
+            }
+        }
+        if status != 200 {
+            let body = format!("{{\"error\":{{\"message\":\"scripted failure {status}\"}}}}");
+            let response = format!("HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            stream.write_all(response.as_bytes()).await?;
+            return stream.shutdown().await;
+        }
         serde_json::json!({"choices": [{"index": 0, "message": {"role": "assistant", "content": reply}, "finish_reason": "stop"}]})
             .to_string()
     };

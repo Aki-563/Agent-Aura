@@ -3,6 +3,7 @@ use tauri::Manager;
 pub mod agent;
 pub mod capture;
 pub mod conformance;
+pub mod control;
 pub mod coords;
 pub mod db;
 pub mod desktop;
@@ -21,8 +22,10 @@ pub mod radar;
 pub mod recipe;
 pub mod reliability;
 pub mod settle;
+pub mod settings;
 pub mod sound;
 pub mod trace;
+pub mod voice;
 
 /// Per-monitor DPI awareness must be set before any window is created or any screen metric is
 /// read. Otherwise Windows reports virtualized (scaled-down) sizes, so the HUD overlay covered only
@@ -63,6 +66,11 @@ pub fn run() {
             agent::discard_pending_step,
             agent::run_autonomous_task,
             agent::stop_autonomous_task,
+            agent::pause_autonomous_task,
+            agent::resume_autonomous_task,
+            agent::steer_autonomous_task,
+            agent::run_control_status,
+            agent::set_steer_box_open,
             agent::answer_confirmation,
             agent::get_last_task_run,
             agent::submit_task_review,

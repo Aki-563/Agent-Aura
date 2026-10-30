@@ -243,3 +243,134 @@ async fn live_eval_open_notepad_with_a_scripted_model() {
     assert_eq!(before.len(), after.len(), "cleanup must leave exactly the windows that were open before");
     assert!(crate::eval::save_report(&runtime, &report).is_some());
 }
+
+// ---------------------------------------------------------------- stop, pause and steer (§H1)
+
+/// One control action, fired `after_ms` after the `nth` request of `kind` reached the fake model.
+struct ControlEvent {
+    kind: &'static str,
+    nth: usize,
+    after_ms: u64,
+    act: fn(),
+}
+
+/// Runs a task (holding the serial lock for the whole time, so control actions can never land
+/// in another test's run) while a controller thread fires `events` relative to model requests.
+/// Returns the outcome and when the last event fired.
+async fn run_with_control(task: &str, max_steps: u32, script: Vec<(&str, String)>, events: Vec<ControlEvent>) -> (Outcome, Option<std::time::Instant>) {
+    let _serial = SERIAL.lock().await;
+    let server = MockServer::start(script).await.expect("mock server");
+    let watcher = server.watcher();
+    let controller = std::thread::spawn(move || {
+        let mut fired = None;
+        for event in events {
+            if !watcher.wait_for(event.kind, event.nth, std::time::Duration::from_secs(60)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(event.after_ms));
+            (event.act)();
+            fired = Some(std::time::Instant::now());
+        }
+        fired
+    });
+    let data_root = scratch_dir();
+    let runtime = AgentRuntime::with_data_root(data_root.clone(), false).expect("runtime");
+    runtime
+        .set_provider(ProviderConfigInput { protocol: ApiProtocol::OpenAiCompatibleChat, base_url: server.base_url.clone(), model: "mock-model".to_owned(), api_key: String::new() })
+        .expect("provider");
+    let events_log = Arc::new(Mutex::new(Vec::new()));
+    let host = Host::new(HeadlessHost { events: Arc::clone(&events_log), answer: None });
+    let response = execute_run(&runtime, &host, task.to_owned(), max_steps).await.expect("run");
+    let fired = controller.join().ok().flatten();
+    let events = events_log.lock().unwrap().clone();
+    (Outcome { response, server, events, data_root }, fired)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_during_a_hanging_model_call_ends_the_run_within_half_a_second() {
+    // The model never answers (like an unreachable model machine); stop must not wait for it.
+    let (outcome, fired) = run_with_control(
+        "anything",
+        3,
+        vec![("aura_proposal", "@hang".to_owned())],
+        vec![ControlEvent { kind: "aura_proposal", nth: 1, after_ms: 300, act: crate::control::stop }],
+    )
+    .await;
+    let after_stop = fired.expect("stop fired").elapsed();
+    assert!(outcome.response.stopped, "{}", outcome.response.message);
+    assert_eq!(outcome.response.steps_executed, 0);
+    assert!(after_stop < std::time::Duration::from_millis(500), "the run ended {after_stop:?} after stop");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_steer_during_the_model_call_drops_the_old_answer_and_reaches_the_next_prompt() {
+    fn steer() {
+        crate::control::steer("use the other tab instead");
+    }
+    let (outcome, _) = run_with_control(
+        "remember something then finish",
+        6,
+        vec![
+            // The first answer would arrive after the steer: it must never be executed.
+            ("aura_proposal", format!("@delay:1500|{}", replies::proposal(note("STALE NOTE"), "old plan"))),
+            ("aura_proposal", replies::proposal(note("fresh note"), "new plan")),
+            ("aura_proposal", replies::proposal(done("done"), "finish")),
+            ("aura_done_check", replies::done_check(true, "")),
+        ],
+        vec![ControlEvent { kind: "aura_proposal", nth: 1, after_ms: 300, act: steer }],
+    )
+    .await;
+    assert!(outcome.response.completed, "{}", outcome.response.message);
+    let proposals = outcome.server.requests_of("aura_proposal");
+    assert!(proposals.len() >= 2);
+    assert!(proposals[1..].iter().all(|p| p.contains("use the other tab instead")), "every later prompt carries the instruction");
+    assert!(proposals.iter().all(|p| !p.contains("STALE NOTE")), "the stale answer was never executed (its note never shows up)");
+    assert!(proposals.last().unwrap().contains("fresh note"), "the new plan ran");
+    let done_checks = outcome.server.requests_of("aura_done_check");
+    assert!(done_checks.iter().any(|p| p.contains("use the other tab instead")), "the completion check judges the amended task");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pause_then_resume_looks_again_and_tells_the_model() {
+    fn pause() {
+        crate::control::pause("test pause");
+    }
+    fn resume() {
+        crate::control::resume();
+    }
+    let (outcome, _) = run_with_control(
+        "remember then finish",
+        6,
+        vec![
+            ("aura_proposal", format!("@delay:1500|{}", replies::proposal(note("STALE"), "old"))),
+            ("aura_proposal", replies::proposal(done("done"), "finish")),
+            ("aura_done_check", replies::done_check(true, "")),
+        ],
+        vec![
+            ControlEvent { kind: "aura_proposal", nth: 1, after_ms: 300, act: pause },
+            ControlEvent { kind: "aura_proposal", nth: 1, after_ms: 1500, act: resume },
+        ],
+    )
+    .await;
+    assert!(outcome.response.completed, "{}", outcome.response.message);
+    let proposals = outcome.server.requests_of("aura_proposal");
+    assert_eq!(proposals.len(), 2, "one dropped request, one after the resume");
+    assert!(proposals[1].contains("the run was paused for"), "the model is told about the pause");
+    assert!(proposals.iter().all(|p| !p.contains("STALE")), "the answer from before the pause was dropped");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_racing_the_model_answer_never_lets_the_answer_run() {
+    // The answer arrives 400 ms after the request; stop lands from 60 ms before to 30 ms after.
+    for after_ms in [340u64, 370, 390, 400, 410, 430] {
+        let (outcome, _) = run_with_control(
+            "race",
+            2,
+            vec![("aura_proposal", format!("@delay:400|{}", replies::proposal(json!({"type": "wait_settle", "seconds": 0.2}), "x")))],
+            vec![ControlEvent { kind: "aura_proposal", nth: 1, after_ms, act: crate::control::stop }],
+        )
+        .await;
+        assert!(outcome.response.stopped, "stop at {after_ms} ms: the run must end stopped, got {}", outcome.response.message);
+        assert_eq!(outcome.response.steps_executed, 0, "stop at {after_ms} ms: the answer must not run");
+    }
+}

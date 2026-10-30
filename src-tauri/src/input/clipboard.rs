@@ -18,6 +18,14 @@ pub struct ClipboardBridge;
 impl ClipboardBridge {
     /// Sets UTF-16 Unicode text directly into the Windows clipboard via Win32 API.
     pub fn set_text(text: &str) -> Result<(), String> {
+        Self::set_text_with(text, false)
+    }
+
+    /// Like `set_text`, and when `private` also marks the content as not for clipboard history,
+    /// cloud clipboard or clipboard monitors (the standard Windows formats). Used for Aura's own
+    /// transient paste text: it never shows up in Win+V history, and history listeners do not
+    /// grab the clipboard in the moment the target app wants to read it.
+    pub fn set_text_with(text: &str, private: bool) -> Result<(), String> {
         let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
         let bytes_len = utf16.len() * std::mem::size_of::<u16>();
 
@@ -59,6 +67,9 @@ impl ClipboardBridge {
             if SetClipboardData(CF_UNICODETEXT, h_mem).is_null() {
                 CloseClipboard();
                 return Err("SetClipboardData failed".into());
+            }
+            if private {
+                Self::mark_private();
             }
 
             CloseClipboard();
@@ -117,15 +128,66 @@ impl ClipboardBridge {
     pub fn paste_text(text: &str) -> Result<(), String> {
         // Keep what the user had copied: put it back after the paste has been consumed.
         let previous = Self::get_text().ok().filter(|text| !text.is_empty());
-        Self::set_text(text)?;
-        thread::sleep(Duration::from_millis(15));
+        Self::set_text_with(text, true)?;
+        // The target app reads the clipboard when it gets Ctrl+V. If another program (clipboard
+        // history, a clipboard manager) still has it open from our write, that read can fail and
+        // nothing is pasted. Wait until the clipboard is free and holds our text.
+        Self::wait_until_free_with(text, Duration::from_millis(400));
         let pasted = crate::input::send_input::InputActuator::hotkey(&["ctrl", "v"])
             .map_err(|e| format!("Failed to fire Ctrl+V for paste: {e}"));
         if let Some(previous) = previous {
             thread::sleep(Duration::from_millis(250));
-            let _ = Self::set_text(&previous);
+            let _ = Self::set_text_with(&previous, true);
         }
         pasted
+    }
+
+    /// Waits until no program holds the clipboard open and it reads back as `text` (bounded).
+    fn wait_until_free_with(text: &str, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            let free = unsafe {
+                if OpenClipboard(ptr::null_mut()) != 0 {
+                    CloseClipboard();
+                    true
+                } else {
+                    false
+                }
+            };
+            if free && Self::get_text().as_deref() == Ok(text) {
+                // A last moment for listeners that react to the change notification.
+                thread::sleep(Duration::from_millis(30));
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Adds the formats Windows checks before keeping clipboard content in history or syncing it.
+    /// Must be called while the clipboard is open.
+    unsafe fn mark_private() {
+        use windows_sys::Win32::System::DataExchange::RegisterClipboardFormatW;
+        let wide = |name: &str| name.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let dword_zero = || -> *mut core::ffi::c_void {
+            let handle = GlobalAlloc(GMEM_MOVEABLE, 4);
+            if !handle.is_null() {
+                let p = GlobalLock(handle) as *mut u32;
+                if !p.is_null() {
+                    *p = 0;
+                    GlobalUnlock(handle);
+                }
+            }
+            handle
+        };
+        for (name, zero) in [("ExcludeClipboardContentFromMonitorProcessing", false), ("CanIncludeInClipboardHistory", true), ("CanUploadToCloudClipboard", true)] {
+            let format = RegisterClipboardFormatW(wide(name).as_ptr());
+            if format != 0 {
+                let data = if zero { dword_zero() } else { GlobalAlloc(GMEM_MOVEABLE, 1) };
+                if !data.is_null() {
+                    SetClipboardData(format, data);
+                }
+            }
+        }
     }
 }
 

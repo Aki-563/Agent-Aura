@@ -88,9 +88,21 @@ app.innerHTML = `
         <button id="run-confirm-allow" class="button primary" type="button">Yes, allow it</button>
       </div>
     </div>
+    <div id="run-steer" class="run-confirm hidden" role="dialog">
+      <div class="run-confirm-title">Tell the agent what to do differently</div>
+      <textarea id="run-steer-text" rows="3" placeholder="For example: wrong, go back · use the other tab · save it as PDF instead"></textarea>
+      <div class="run-confirm-buttons">
+        <button id="run-steer-cancel" class="button" type="button">Cancel</button>
+        <button id="run-steer-send" class="button primary" type="button">Send and continue</button>
+      </div>
+    </div>
     <img id="run-shot" class="run-shot hidden" alt="Latest screen the agent saw" />
     <div id="run-log" class="run-log"></div>
-    <button id="run-stop" class="button danger run-stop" type="button">Stop (Esc)</button>
+    <div class="run-controls">
+      <button id="run-pause" class="button" type="button">Pause (Pause key)</button>
+      <button id="run-steer-open" class="button" type="button">Steer (Ctrl+Alt+Space)</button>
+      <button id="run-stop" class="button danger run-stop" type="button">Stop (Esc)</button>
+    </div>
   </section>
 
   <main class="shell">
@@ -218,6 +230,17 @@ element<HTMLButtonElement>("stop-task").addEventListener("click", stopAutonomous
 element<HTMLButtonElement>("run-stop").addEventListener("click", stopAutonomousTask);
 element<HTMLButtonElement>("run-confirm-allow").addEventListener("click", () => void answerConfirmation(true));
 element<HTMLButtonElement>("run-confirm-deny").addEventListener("click", () => void answerConfirmation(false));
+element<HTMLButtonElement>("run-pause").addEventListener("click", () => void togglePause());
+element<HTMLButtonElement>("run-steer-open").addEventListener("click", () => void openSteerBox());
+element<HTMLButtonElement>("run-steer-cancel").addEventListener("click", () => void closeSteerBox(false));
+element<HTMLButtonElement>("run-steer-send").addEventListener("click", () => void closeSteerBox(true));
+element<HTMLTextAreaElement>("run-steer-text").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    void closeSteerBox(true);
+  }
+});
+window.setInterval(() => void pollRunControls(), 250);
 
 updateProtocolFields();
 void refreshProviderStatus();
@@ -474,6 +497,61 @@ async function saveReview(input: Record<string, unknown>): Promise<void> {
   } catch (error) {
     log("error", toMessage(error));
     throw error;
+  }
+}
+
+// ---- Pause, resume and steering (the run keeps its progress; nothing restarts from zero) ----
+
+let runPaused = false;
+
+async function togglePause(): Promise<void> {
+  try {
+    await invoke(runPaused ? "resume_autonomous_task" : "pause_autonomous_task");
+  } catch (error) {
+    log("error", toMessage(error));
+  }
+}
+
+async function openSteerBox(): Promise<void> {
+  try {
+    await invoke("set_steer_box_open", { open: true });
+  } catch (error) {
+    log("error", toMessage(error));
+  }
+  element<HTMLElement>("run-steer").classList.remove("hidden");
+  element<HTMLTextAreaElement>("run-steer-text").focus();
+}
+
+async function closeSteerBox(send: boolean): Promise<void> {
+  const box = element<HTMLTextAreaElement>("run-steer-text");
+  const text = box.value.trim();
+  element<HTMLElement>("run-steer").classList.add("hidden");
+  try {
+    await invoke("set_steer_box_open", { open: false });
+    if (send && text) {
+      await invoke("steer_autonomous_task", { text });
+      log("info", `New instruction sent: ${text}`);
+    } else {
+      await invoke("resume_autonomous_task");
+    }
+  } catch (error) {
+    log("error", toMessage(error));
+  }
+  box.value = "";
+}
+
+async function pollRunControls(): Promise<void> {
+  if (!document.body.classList.contains("running")) return;
+  try {
+    const status = await invoke<{ paused: boolean; pauseReason: string; openSteerBox: boolean }>("run_control_status");
+    if (status.paused !== runPaused) {
+      runPaused = status.paused;
+      element<HTMLButtonElement>("run-pause").textContent = runPaused ? "Resume (Pause key)" : "Pause (Pause key)";
+      log("info", runPaused ? `Paused: ${status.pauseReason}` : "Resumed: the agent looks at the screen again.");
+    }
+    if (status.openSteerBox) await openSteerBox();
+  } catch {
+    // The status poll is best effort; a failed poll changes nothing.
   }
 }
 

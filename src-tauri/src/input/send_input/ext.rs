@@ -52,7 +52,7 @@ pub fn precise_sleep(duration: Duration) {
 }
 
 /// Waits `ms`, checking the kill switch every 25 ms so long waits and holds stay interruptible.
-fn sleep_interruptible(ms: u64) -> Result<(), InputError> {
+pub(super) fn sleep_interruptible(ms: u64) -> Result<(), InputError> {
     let deadline = Instant::now() + Duration::from_millis(ms);
     while Instant::now() < deadline {
         InputActuator::check_killswitch()?;

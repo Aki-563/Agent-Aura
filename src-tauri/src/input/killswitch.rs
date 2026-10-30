@@ -63,6 +63,18 @@ unsafe extern "system" fn low_level_keyboard_proc(
 
         if is_emergency_stop(vk, kbd.flags, ctrl_pressed) {
             KILL_SWITCH_TRIGGERED.store(true, Ordering::SeqCst);
+        } else if takeover::is_hardware_event(kbd.flags, takeover::KEYBOARD_INJECTED_MASK) {
+            // Global run controls (work whichever window is in front; injected keys never count).
+            let down = |key: u16| (GetAsyncKeyState(key as i32) as u16 & 0x8000) != 0;
+            if vk == VK_PAUSE && !ctrl_pressed {
+                crate::control::toggle_pause();
+            } else if vk == windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_SPACE
+                && down(VK_CONTROL)
+                && down(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_MENU)
+            {
+                crate::control::pause("the user is writing a new instruction");
+                crate::control::request_steer_box();
+            }
         }
     }
 

@@ -129,6 +129,21 @@ fn usage() -> String {
 #[tokio::main]
 async fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.first().map(String::as_str) == Some("control") {
+        // Talks to a running `aura-cli run` (or the app) through its local control port.
+        let port = std::env::var("AURA_CONTROL_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(47_900u16);
+        let command = raw[1..].join(" ");
+        match agent_aura_lib::control::send_command(port, &command) {
+            Ok(reply) => {
+                println!("{reply}");
+                std::process::exit(if reply.starts_with("ok") { 0 } else { 1 });
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
+    }
     if matches!(raw.first().map(String::as_str), Some("look") | Some("do") | Some("demo") | Some("serve") | Some("pointer-check")) {
         agent_aura_lib::make_process_dpi_aware();
         if let Err(error) = KillSwitch::start_monitoring() {
@@ -224,7 +239,13 @@ It drives the real screen through the default browser; press Esc to stop.
         }
         std::process::exit(if all_passed { 0 } else { 1 });
     }
-    println!("task: {}\nPress Esc to stop.\n", args.task);
+    println!("task: {}\nPress Esc to stop, Pause to pause or resume, Ctrl+Alt+Space to pause for a new instruction.\n", args.task);
+    // Local control port: `aura-cli control stop|pause|resume|status|steer <text>` from another terminal.
+    let control_port = std::env::var("AURA_CONTROL_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(47_900u16);
+    match agent_aura_lib::control::serve_port(control_port).await {
+        Ok(port) => println!("control port: 127.0.0.1:{port} (aura-cli control <stop|pause|resume|status|steer text>)"),
+        Err(error) => eprintln!("warning: no control port: {error}"),
+    }
     let outcome = execute_run(&runtime, &host, args.task.clone(), args.max_steps).await;
     println!("\ntraces: {}", runtime.data_root().join("runs").display());
     match outcome {

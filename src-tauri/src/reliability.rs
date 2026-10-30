@@ -114,7 +114,34 @@ pub struct TaskSession {
     pub no_effect_streak: u8,
     /// Short facts the agent chose to remember (shown in every prompt).
     pub notes: Vec<String>,
+    /// Instructions the user gave during the run, with the step after which each arrived.
+    pub steers: Vec<(u32, String)>,
+    /// What really happened on the computer, step by step (shown so nothing finished is repeated).
+    pub ledger: Vec<LedgerEntry>,
+    /// Interruptions and what changed during them ("paused 12 s; while paused: w4 opened").
+    pub interruptions: Vec<String>,
 }
+
+/// One action that reached the computer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LedgerEntry {
+    pub step: u32,
+    pub what: String,
+    pub status: LedgerStatus,
+    /// Sending, submitting, saving, deleting, paying: never to be repeated without being asked.
+    pub irreversible: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerStatus {
+    Done,
+    /// Cut short by a pause, a stop or the user taking over.
+    HalfDone,
+}
+
+const MAX_STEERS_SHOWN_IN_FULL: usize = 3;
+const MAX_LEDGER_SHOWN: usize = 12;
+const MAX_INTERRUPTIONS_SHOWN: usize = 3;
 
 impl TaskSession {
     pub fn new(run_id: String, task: String) -> Self {
@@ -125,7 +152,71 @@ impl TaskSession {
             consecutive_failures: 0,
             no_effect_streak: 0,
             notes: Vec::new(),
+            steers: Vec::new(),
+            ledger: Vec::new(),
+            interruptions: Vec::new(),
         }
+    }
+
+    pub fn add_steers(&mut self, after_step: u32, messages: Vec<String>) {
+        self.steers.extend(messages.into_iter().map(|m| (after_step, m)));
+    }
+
+    pub fn record_action(&mut self, step: u32, what: String, status: LedgerStatus, irreversible: bool) {
+        self.ledger.push(LedgerEntry { step, what, status, irreversible });
+    }
+
+    pub fn add_interruption(&mut self, text: String) {
+        self.interruptions.push(text);
+    }
+
+    /// The task as it stands now: the original plus every change the user made during the run.
+    /// The completion check judges this, not the original alone.
+    pub fn effective_task(&self) -> String {
+        if self.steers.is_empty() {
+            return self.task.clone();
+        }
+        let changes: Vec<String> = self.steers.iter().map(|(_, m)| format!("- {m}")).collect();
+        format!("{}\nChanges the user made during the run (the newest wins where they disagree):\n{}", self.task, changes.join("\n"))
+    }
+
+    /// Prompt section about the user's instructions, interruptions and what is already done.
+    /// Kept short however long the run gets: the last few instructions in full, older ones
+    /// counted; the last dozen ledger lines.
+    pub fn control_text(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.steers.is_empty() {
+            let older = self.steers.len().saturating_sub(MAX_STEERS_SHOWN_IN_FULL);
+            let mut lines = vec!["USER INSTRUCTIONS GIVEN DURING THE RUN (follow them; they change the ORIGINAL TASK; the newest wins where they disagree):".to_owned()];
+            if older > 0 {
+                let summary: Vec<String> = self.steers[..older].iter().map(|(_, m)| m.chars().take(40).collect::<String>()).collect();
+                lines.push(format!("- (earlier: {})", summary.join("; ")));
+            }
+            for (step, message) in &self.steers[older..] {
+                lines.push(format!("- after step {step}: \"{message}\""));
+            }
+            parts.push(lines.join("\n"));
+        }
+        if !self.interruptions.is_empty() {
+            let shown = &self.interruptions[self.interruptions.len().saturating_sub(MAX_INTERRUPTIONS_SHOWN)..];
+            parts.push(format!("INTERRUPTIONS:\n{}", shown.iter().map(|i| format!("- {i}")).collect::<Vec<_>>().join("\n")));
+        }
+        if !self.ledger.is_empty() {
+            let shown = &self.ledger[self.ledger.len().saturating_sub(MAX_LEDGER_SHOWN)..];
+            let lines: Vec<String> = shown
+                .iter()
+                .map(|entry| {
+                    let status = match entry.status {
+                        LedgerStatus::Done => "done",
+                        LedgerStatus::HalfDone => "CUT SHORT (half done: check the screen before continuing)",
+                    };
+                    let warning = if entry.irreversible && entry.status == LedgerStatus::Done { " - DO NOT REPEAT" } else { "" };
+                    format!("- step {}: {} - {status}{warning}", entry.step, entry.what)
+                })
+                .collect();
+            parts.push(format!("ALREADY DONE ON THE COMPUTER (do not redo finished work):\n{}", lines.join("\n")));
+        }
+        parts.join("\n\n")
     }
 
     pub fn push(&mut self, record: StepRecord) {
@@ -473,6 +564,41 @@ mod tests {
         }
         assert_eq!(session.history.len(), MAX_TRAJECTORY_STEPS);
         assert_eq!(session.history.front().unwrap().step, 4);
+    }
+
+    #[test]
+    fn ten_steers_and_a_long_run_keep_the_prompt_section_short_and_clear() {
+        let mut session = TaskSession::new("r".into(), "write an email".into());
+        for i in 1..=10 {
+            session.add_steers(i, vec![format!("instruction number {i} with some words")]);
+        }
+        for step in 1..=30 {
+            session.record_action(step, format!("action {step}"), LedgerStatus::Done, step == 7);
+        }
+        session.record_action(31, "drag the file".into(), LedgerStatus::HalfDone, false);
+        session.add_interruption("the run was paused for 12 s".into());
+        let text = session.control_text();
+        // The newest three instructions in full, the older ones summarised in one line.
+        assert!(text.contains("after step 10: \"instruction number 10"));
+        assert!(text.contains("after step 8:"));
+        assert!(!text.contains("after step 7:"), "older instructions are not listed one by one");
+        assert!(text.contains("(earlier: instruction number 1"));
+        // Only the latest dozen ledger lines, with the cut-short one flagged.
+        assert!(!text.contains("step 7: action 7"), "old ledger lines are trimmed");
+        assert!(text.contains("step 31: drag the file - CUT SHORT"));
+        assert!(text.lines().count() < 30, "the section stays short: {} lines", text.lines().count());
+        assert!(session.effective_task().contains("instruction number 10"));
+    }
+
+    #[test]
+    fn finished_submits_are_marked_do_not_repeat() {
+        let mut session = TaskSession::new("r".into(), "send it".into());
+        session.record_action(3, "press Enter".into(), LedgerStatus::Done, true);
+        session.record_action(4, "type \"hi\"".into(), LedgerStatus::Done, false);
+        let text = session.control_text();
+        assert!(text.contains("step 3: press Enter - done - DO NOT REPEAT"));
+        assert!(text.contains("step 4: type \"hi\" - done\n") || text.ends_with("step 4: type \"hi\" - done"));
+        assert!(TaskSession::new("r".into(), "t".into()).control_text().is_empty(), "nothing to say on a fresh run");
     }
 
     #[test]

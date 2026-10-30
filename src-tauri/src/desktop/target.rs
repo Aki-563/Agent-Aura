@@ -247,7 +247,9 @@ pub fn window_list_text(active: HWND) -> String {
         return "no other windows are open".to_owned();
     }
     let mut lines = vec![format!("{} open (front to back). Switch with focus_window using the number or the title:", entries.len())];
-    for (index, entry) in entries.iter().take(SHOWN).enumerate() {
+    // Numbers are the window registry's stable ids (w5 stays 5 for as long as the window exists),
+    // so the same number means the same window in this list, the window-state block and later steps.
+    for entry in entries.iter().take(SHOWN) {
         let mut flags = Vec::new();
         if entry.active {
             flags.push("ACTIVE");
@@ -260,7 +262,8 @@ pub fn window_list_text(active: HWND) -> String {
         }
         let title: String = entry.title.chars().take(70).collect();
         let flags = if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join(", ")) };
-        lines.push(format!("{}. \"{}\" ({}){}", index + 1, title, entry.program, flags));
+        let number = crate::desktop::registry::id_of(entry.hwnd as HWND).map(|id| id.trim_start_matches('w').to_owned()).unwrap_or_else(|| "?".into());
+        lines.push(format!("{number}. \"{title}\" ({}){flags}", entry.program));
     }
     if entries.len() > SHOWN {
         lines.push(format!("... and {} more", entries.len() - SHOWN));
@@ -278,6 +281,10 @@ pub fn resolve_window_reference(name: &str) -> Option<HWND> {
         .trim_start_matches('.')
         .trim();
     let number: usize = digits.parse().ok()?;
+    // Stable registry ids first (what the list shows); the old list position as a fallback.
+    if let Some(hwnd) = crate::desktop::registry::resolve(&number.to_string()) {
+        return Some(hwnd);
+    }
     if LISTED.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
         // Nothing has been shown yet (for example a one-off command): number the windows as they are now.
         window_list_text(effective_foreground().unwrap_or(std::ptr::null_mut()));
