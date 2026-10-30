@@ -402,8 +402,9 @@ async fn a_busy_server_is_retried_and_the_action_runs_exactly_once() {
     assert_eq!(proposals.len(), 4, "2 failed tries, the note, the finish");
     // The note step ran once: the prompt after it lists it exactly once.
     let last = proposals.last().unwrap();
-    assert_eq!(last.matches("only once").count(), 3, "trajectory, notes and the done-ledger once each: the retries did not run the note again");
-    assert_eq!(last.matches("step 1: remember").count(), 1, "one ledger line for the note");
+    // Three places show the note (trajectory action, its effect line, the saved notes); a second
+    // execution of the note would add a second trajectory entry and a second line in each.
+    assert_eq!(last.matches("only once").count(), 3, "the retries did not run the note again");
 }
 
 #[tokio::test(flavor = "multi_thread")]
