@@ -1460,6 +1460,34 @@ async fn autonomous_loop(
         if let Some((completed, message)) = terminal_outcome(&planned.actions) {
             if completed {
                 emit_status(window, "checking", step_number, "Checking that the task is really finished");
+                // The task named exact text to type: check the screen for it before believing "done"
+                // (no model involved; small models often type part of it and stop).
+                if let Some(expected) = crate::reliability::expected_typed_text(&session.effective_task()) {
+                    let wanted = expected.to_lowercase();
+                    let on_screen = tokio::task::spawn_blocking(move || {
+                        let focused = crate::perception::focused_element_summary().map(|(text, _)| text).unwrap_or_default();
+                        let visible = visible_text_snapshot().unwrap_or_default().join("\n");
+                        format!("{focused}\n{visible}").to_lowercase()
+                    })
+                    .await
+                    .unwrap_or_default();
+                    if !on_screen.contains(&wanted) && done_rejections < MAX_DONE_REJECTIONS {
+                        done_rejections += 1;
+                        trace.event(step_number, "done_check", json!({"claim": &message, "complete": false, "missing": format!("text '{expected}' not on screen"), "by": "harness"}));
+                        session.push(StepRecord {
+                            step: step_number,
+                            thought: proposal.thought.clone(),
+                            target: proposal.target.clone(),
+                            expected_outcome: proposal.expected_outcome.clone(),
+                            action: canvas_action.clone(),
+                            outcome: StepOutcome::Uncertain,
+                            verification_reason: message.clone(),
+                            window_title: encoded.window.title.clone(),
+                            effect: format!("Your claim that the task is done was REJECTED: the task asks for the exact text '{expected}', and it is not on screen yet. Type exactly what is still missing (do not retype what is already there), then check again."),
+                        });
+                        continue;
+                    }
+                }
                 let verdict = check_done(client, config, &session.effective_task(), &session, &encoded, &message).await;
                 trace.event(step_number, "done_check", json!({"claim": &message, "complete": verdict.as_ref().map(|v| v.complete), "evidence": verdict.as_ref().map(|v| v.evidence.clone()), "missing": verdict.as_ref().map(|v| v.missing.clone())}));
                 if let Some(check) = verdict.filter(|check| !check.complete) {
@@ -2396,7 +2424,7 @@ STUCK WARNING: your last {} actions changed nothing on screen. Do NOT repeat the
         .ok()
         .flatten()
         .unwrap_or_else(|| "not reported by this app".to_owned());
-    let proposal_prompt = build_proposal_prompt(capture.width, capture.height);
+    let proposal_prompt = build_proposal_prompt_for(capture.width, capture.height, &coordinate_scale_for(&config.model));
     let mut control_text = session.control_text();
     if let Some(note) = crate::system_state::accessibility().prompt_note() {
         control_text = format!("{control_text}\n{note}").trim().to_owned();
@@ -2446,7 +2474,7 @@ USER:
     let proposal_text = extract_model_text(&proposal_value, config.protocol)?;
     trace.text(&format!("proposal_raw_{retry_attempt}.txt"), &proposal_text);
     let mut proposal: ActionProposal = model_schema::parse_proposal_with(&proposal_text, &resolve_element)?;
-    let coordinate_scale = crate::settings::get().coordinate_scale;
+    let coordinate_scale = coordinate_scale_for(&config.model);
     proposal.action = from_model_scale(proposal.action.clone(), &coordinate_scale, capture.width, capture.height, &capture.elements)?;
 
     // Grounding modes (HARNESS_COMPLETION_PLAN.md H4). A = the proposal's own coordinates. B = a
@@ -2512,6 +2540,12 @@ USER:
                 };
                 match outcome {
                     Ok(grounded) => {
+                        // The grounding answer uses the same convention as the model's proposals.
+                        let probe = ActionPrimitive::MouseMove { x: grounded.0, y: grounded.1 };
+                        let grounded = match from_model_scale(probe, &coordinate_scale, capture.width, capture.height, &capture.elements) {
+                            Ok(ActionPrimitive::MouseMove { x, y }) => (x, y),
+                            _ => grounded,
+                        };
                         grounding_note = format!("mode B moved the point from {point:?} to {grounded:?}");
                         set_first_point(&mut proposal.action, grounded);
                     }
@@ -3293,8 +3327,20 @@ fn describe_effect(
     text
 }
 
+/// The settings value wins when set; otherwise what `aura-cli calibrate` measured for this model.
+fn coordinate_scale_for(model: &str) -> String {
+    match crate::settings::get().coordinate_scale.as_str() {
+        "pixels" | "" => crate::coords::model_scale(model).unwrap_or_else(|| "pixels".to_owned()),
+        other => other.to_owned(),
+    }
+}
+
 fn build_proposal_prompt(width: u32, height: u32) -> String {
-    let coordinate_line = match crate::settings::get().coordinate_scale.as_str() {
+    build_proposal_prompt_for(width, height, &crate::settings::get().coordinate_scale)
+}
+
+fn build_proposal_prompt_for(width: u32, height: u32, scale: &str) -> String {
+    let coordinate_line = match scale {
         "norm1000" => format!("The screenshot is {width}x{height} pixels. Every x,y you output is on a 0 to 1000 grid over THIS image (0,0 is the top-left corner, 1000,1000 the bottom-right), so x=500 is the middle."),
         _ => format!("The screenshot is exactly {width}x{height} pixels; every x,y you output is a pixel in THIS image, measured from its top-left corner."),
     };
@@ -4625,6 +4671,44 @@ pub mod driver {
 
     pub struct Observation {
         capture: EncodedCapture,
+    }
+
+    /// Asks the configured model to point at each `(label, true centre)` on the unmarked screenshot
+    /// and works out its coordinate convention. Returns a line per target and the verdict.
+    pub async fn calibrate_coordinates(state: &AgentRuntime, observation: &Observation, targets: &[(String, (i32, i32))]) -> Result<Vec<String>, String> {
+        let config = cloned_config(state)?;
+        let capture = &observation.capture;
+        let image = if capture.jpeg.is_empty() { format!("data:image/png;base64,{}", BASE64.encode(&capture.webp)) } else { jpeg_data_url(&capture.jpeg) };
+        let mut answers = Vec::new();
+        let mut lines = Vec::new();
+        for (label, truth) in targets {
+            let prompt = "You point at things on a screenshot. Reply with JSON only: {\"found\": true, \"x\": X, \"y\": Y} for the centre of the named thing, using your usual coordinate convention.";
+            let input = format!("Point at the centre of: {label}");
+            let value = request_plan(&state.client, &config, prompt, &input, &image, model_schema::GROUNDING).await?;
+            let text = extract_model_text(&value, config.protocol)?;
+            let reply: Value = serde_json::from_str(model_schema::extract_json_object(&text).unwrap_or("{}")).unwrap_or_default();
+            let number = |k: &str| reply.get(k).and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())));
+            match (number("x"), number("y")) {
+                (Some(x), Some(y)) => {
+                    lines.push(format!("{label}: model said ({x:.0}, {y:.0}), true centre ({}, {})", truth.0, truth.1));
+                    answers.push(((x, y), *truth));
+                }
+                _ => lines.push(format!("{label}: no usable point in {text:?}")),
+            }
+        }
+        if answers.len() < 2 {
+            return Err(format!("too few usable answers to decide ({} of {})", answers.len(), targets.len()));
+        }
+        let (scale, error) = crate::coords::best_scale(&answers, (capture.width, capture.height));
+        lines.push(format!("verdict: '{}' answers in {scale} (mean miss {error:.0} px on a {}x{} image)", config.model, capture.width, capture.height));
+        crate::coords::save_model_scale(&config.model, scale)?;
+        lines.push(format!("saved: {scale} will be used for '{}' unless harness.json sets coordinate_scale", config.model));
+        Ok(lines)
+    }
+
+    /// The numbered elements as (label, centre in screenshot pixels).
+    pub fn elements(observation: &Observation) -> Vec<(String, (i32, i32))> {
+        observation.capture.elements.iter().map(|e| (e.label.clone(), e.center())).collect()
     }
 
     /// Looks at one window by itself, even when other windows cover it (no raising).

@@ -188,6 +188,49 @@ pub fn refine_point(model: &str, elements: &[Element], size: (u32, u32), x: i32,
     snap(elements, px, py)
 }
 
+fn scale_store() -> Option<std::path::PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|dir| std::path::PathBuf::from(dir).join("AgentAura").join("model_scale.json"))
+}
+
+/// The coordinate convention measured for this model by `aura-cli calibrate` ("pixels",
+/// "norm1000" or "norm1"), if any.
+pub fn model_scale(model: &str) -> Option<String> {
+    let text = std::fs::read_to_string(scale_store()?).ok()?;
+    let map: HashMap<String, String> = serde_json::from_str(&text).ok()?;
+    map.get(model).cloned()
+}
+
+pub fn save_model_scale(model: &str, scale: &str) -> Result<(), String> {
+    let path = scale_store().ok_or("no LOCALAPPDATA")?;
+    let mut map: HashMap<String, String> = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    map.insert(model.to_owned(), scale.to_owned());
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&map).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
+/// Which convention explains the answers best: each answer `(x, y)` against the true centre, in an
+/// image of `size`. Returns the scale name and its mean error in pixels.
+pub fn best_scale(answers: &[((f64, f64), (i32, i32))], size: (u32, u32)) -> (&'static str, f64) {
+    let convert = |scale: &str, (x, y): (f64, f64)| match scale {
+        "norm1000" => (x / 1000.0 * f64::from(size.0), y / 1000.0 * f64::from(size.1)),
+        "norm1" => (x * f64::from(size.0), y * f64::from(size.1)),
+        _ => (x, y),
+    };
+    ["pixels", "norm1000", "norm1"]
+        .into_iter()
+        .map(|scale| {
+            let error = answers.iter().map(|(answer, truth)| {
+                let (x, y) = convert(scale, *answer);
+                (x - f64::from(truth.0)).hypot(y - f64::from(truth.1))
+            }).sum::<f64>() / answers.len().max(1) as f64;
+            (scale, error)
+        })
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or(("pixels", f64::MAX))
+}
+
 /// How sure grounding mode C is that the point is on what the model described.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetFit {
@@ -314,6 +357,17 @@ mod tests {
 
     fn element(id: u32, left: i32, top: i32, right: i32, bottom: i32) -> Element {
         Element { id, label: format!("e{id}"), kind: "Button".into(), left, top, right, bottom }
+    }
+
+    #[test]
+    fn the_coordinate_convention_is_told_from_the_answers() {
+        let truth = [(100, 300), (640, 360), (1100, 650)];
+        let pixels: Vec<_> = truth.iter().map(|t| ((t.0 as f64 + 3.0, t.1 as f64 - 2.0), *t)).collect();
+        assert_eq!(best_scale(&pixels, (1280, 720)).0, "pixels");
+        let grid: Vec<_> = truth.iter().map(|t| ((t.0 as f64 / 1.28, t.1 as f64 / 0.72), *t)).collect();
+        assert_eq!(best_scale(&grid, (1280, 720)).0, "norm1000");
+        let unit: Vec<_> = truth.iter().map(|t| ((t.0 as f64 / 1280.0, t.1 as f64 / 720.0), *t)).collect();
+        assert_eq!(best_scale(&unit, (1280, 720)).0, "norm1");
     }
 
     #[test]

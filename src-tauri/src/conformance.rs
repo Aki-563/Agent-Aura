@@ -2140,6 +2140,20 @@ fn explorer_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
     ]
 }
 
+/// Opens the click test page and returns what the loop sees there, for `aura-cli calibrate`.
+pub fn calibration_view() -> Result<driver::Observation, String> {
+    if !fx::start() {
+        return Err("the test page server could not start (port busy)".into());
+    }
+    open_page("/click", "Click")?;
+    driver::observe("")
+}
+
+/// Closes the calibration page.
+pub fn calibration_done() {
+    close_leftover_fixture_windows();
+}
+
 // ----------------------------------------------------------------------------- orders (brain to body)
 //
 // A scripted model gives orders the way real models write them (element numbers, raw pixels,

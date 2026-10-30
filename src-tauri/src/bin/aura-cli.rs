@@ -58,6 +58,7 @@ enum Command {
     Daemon,
     Parallel,
     Soak,
+    Calibrate,
 }
 
 struct Args {
@@ -87,6 +88,7 @@ fn parse_args() -> Result<Args, String> {
         Some("daemon") => Command::Daemon,
         Some("parallel") => Command::Parallel,
         Some("soak") => Command::Soak,
+        Some("calibrate") => Command::Calibrate,
         _ => return Err(usage()),
     };
     let mut args = Args {
@@ -139,6 +141,7 @@ fn usage() -> String {
     "usage: aura-cli run  --model <id> --task <text> [--url <base url>] [--openai] [--key <api key>] \
      [--max-steps <n>] [--auto-approve]\n       aura-cli parallel --model <id> --window \"Notepad=type hello\" --window \"Calculator=compute 6*7\" [--model-slots <n>]\n       aura-cli conformance [--only <group or name>]
        aura-cli soak --minutes <n> [--browser chrome]
+       aura-cli calibrate --url <base url> --model <id>   (measures the model's coordinate convention)
        aura-cli eval --model <id> [--suite basic|intermediate|all] \
      [--only <task id>] [--repeat <n>] [--url <base url>] [--openai] [--key <api key>]\n       \
      (the key can also come from AURA_API_KEY or OPENAI_API_KEY)"
@@ -261,6 +264,35 @@ It drives the real screen through the default browser; press Esc to stop.
             eprintln!("provider settings rejected: {error}");
             std::process::exit(2);
         }
+    }
+    if args.command == Command::Calibrate {
+        // Which coordinate convention does this model use? Measured on the click test page.
+        agent_aura_lib::conformance::set_browser(args.browser.clone().or_else(|| Some("chrome".to_owned())));
+        let view = match tokio::task::spawn_blocking(agent_aura_lib::conformance::calibration_view).await {
+            Ok(Ok(view)) => view,
+            Ok(Err(e)) => {
+                eprintln!("could not open the calibration page: {e}");
+                std::process::exit(2);
+            }
+            Err(e) => {
+                eprintln!("could not open the calibration page: {e}");
+                std::process::exit(2);
+            }
+        };
+        let targets: Vec<(String, (i32, i32))> = agent_aura_lib::agent::driver::elements(&view)
+            .into_iter()
+            .filter(|(label, _)| ["Alpha", "Beta", "Gamma"].contains(&label.as_str()) || label.starts_with("Press the button"))
+            .collect();
+        let outcome = agent_aura_lib::agent::driver::calibrate_coordinates(&runtime, &view, &targets).await;
+        let _ = tokio::task::spawn_blocking(agent_aura_lib::conformance::calibration_done).await;
+        match outcome {
+            Ok(lines) => lines.iter().for_each(|l| println!("{l}")),
+            Err(error) => {
+                eprintln!("calibration failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
     }
     let host = Host::new(CliHost { auto_answer: args.auto_approve });
     if args.command == Command::Parallel {

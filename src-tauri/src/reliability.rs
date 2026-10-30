@@ -345,6 +345,36 @@ pub fn quick_open_first(task: &str) -> Option<String> {
     quick_open_target(&task[..cut])
 }
 
+/// The exact text a task asks to type, when it names one: "type the sentence hello from aura",
+/// "type 'Q3 report' in the title", "write \"hi\" and press enter". Used to check a "done" claim
+/// against the screen without asking the model.
+pub fn expected_typed_text(task: &str) -> Option<String> {
+    let lower = task.to_lowercase();
+    let verbs = ["type ", "write ", "enter ", "input "];
+    let (start, verb) = verbs.iter().filter_map(|v| lower.find(v).map(|i| (i, *v))).min_by_key(|(i, _)| *i)?;
+    let mut rest = &task[start + verb.len()..];
+    // A quoted text is exact.
+    for (open, close) in [('"', '"'), ('\'', '\''), ('\u{201c}', '\u{201d}'), ('\u{2018}', '\u{2019}')] {
+        if let Some(a) = rest.find(open) {
+            if let Some(b) = rest[a + open.len_utf8()..].find(close) {
+                let text = rest[a + open.len_utf8()..a + open.len_utf8() + b].trim();
+                return (!text.is_empty()).then(|| text.to_owned());
+            }
+        }
+    }
+    let lowered = rest.to_lowercase();
+    for lead in ["the sentence ", "the words ", "the word ", "the text ", "the phrase ", "the line "] {
+        if lowered.starts_with(lead) {
+            rest = &rest[lead.len()..];
+            let lowered = rest.to_lowercase();
+            let end = [" in ", " into ", " and ", " then ", ", ", " on ", " at ", "."].iter().filter_map(|s| lowered.find(s)).min().unwrap_or(rest.len());
+            let text = rest[..end].trim();
+            return (!text.is_empty()).then(|| text.to_owned());
+        }
+    }
+    None
+}
+
 pub fn normalize_intent(task: &str) -> String {
     task.to_lowercase()
         .split(|ch: char| !ch.is_alphanumeric())
@@ -648,6 +678,16 @@ mod tests {
             target_window: None,
         };
         assert_eq!(effective_impact(&proposal), ImpactClass::Destructive);
+    }
+
+    #[test]
+    fn the_text_a_task_asks_to_type_is_found() {
+        assert_eq!(expected_typed_text("open notepad and type the sentence hello from aura").as_deref(), Some("hello from aura"));
+        assert_eq!(expected_typed_text("type 'Q3 report' in the title box").as_deref(), Some("Q3 report"));
+        assert_eq!(expected_typed_text("Write \"hi there\" and press enter").as_deref(), Some("hi there"));
+        assert_eq!(expected_typed_text("type the word banana into the search box").as_deref(), Some("banana"));
+        assert_eq!(expected_typed_text("type something nice"), None, "no exact text named");
+        assert_eq!(expected_typed_text("open calculator"), None);
     }
 
     #[test]
