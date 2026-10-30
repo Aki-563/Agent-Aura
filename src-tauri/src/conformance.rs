@@ -1651,6 +1651,35 @@ fn two_apps_open() -> Result<(), String> {
     ensure_app("calculator", "calculator")
 }
 
+fn windows_a_covered_window_is_captured_by_itself(_lab: &Lab) -> Result<(), String> {
+    two_apps_open()?;
+    let notepad = app_window("notepad").ok_or("no notepad")?;
+    let calculator = app_window("calculator").ok_or("no calculator")?;
+    // Put Calculator exactly over Notepad's position, in front of it.
+    let (l, t, r, b) = desktop_target::visible_bounds(notepad as _).ok_or("no bounds")?;
+    unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MoveWindow, ShowWindow, SW_RESTORE};
+        ShowWindow(calculator as _, SW_RESTORE);
+        MoveWindow(calculator as _, l, t, (r - l).min(500), (b - t).min(700), 1);
+    }
+    desktop_target::bring_to_front(calculator as _);
+    std::thread::sleep(Duration::from_millis(700));
+    let foreground_before = desktop_target::foreground_title();
+    let observation = driver::observe_window("notepad", "")?;
+    let labels: Vec<String> = observation.all_candidates().into_iter().map(|(_, label, _)| label).collect();
+    let foreground_after = desktop_target::foreground_title();
+    if foreground_before != foreground_after {
+        return Err(format!("looking at the window changed the foreground ('{foreground_before}' -> '{foreground_after}')"));
+    }
+    if !labels.iter().any(|l| l.eq_ignore_ascii_case("File") || l.eq_ignore_ascii_case("Edit") || l.to_lowercase().contains("text editor")) {
+        return Err(format!("the covered Notepad was not seen on its own; labels: {:?}", &labels[..labels.len().min(12)]));
+    }
+    if labels.iter().any(|l| l == "Seven" || l == "Clear entry") {
+        return Err("the capture shows Calculator's buttons, not Notepad".into());
+    }
+    Ok(())
+}
+
 fn windows_registry_matches_the_desktop(_lab: &Lab) -> Result<(), String> {
     two_apps_open()?;
     let snapshot = crate::desktop::registry::refresh();
@@ -2211,6 +2240,7 @@ fn safety_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
 fn windows_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
     vec![
         ("windows", "registry matches the desktop, ids are stable", windows_registry_matches_the_desktop),
+        ("windows", "a covered window is captured by itself", windows_a_covered_window_is_captured_by_itself),
         ("windows", "opened and minimized windows are reported", windows_changes_are_reported),
         ("windows", "bring to front 20 times, Notepad and Calculator", windows_bring_to_front_twenty_times),
         ("windows", "a minimized window is restored and gets the text", windows_minimized_window_is_restored_and_receives_text),

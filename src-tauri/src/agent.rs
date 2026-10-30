@@ -3051,6 +3051,12 @@ fn capture_screen() -> Result<EncodedCapture, String> {
             }
         }
     }
+    encode_capture(frame, origin_x, origin_y, monitor_index, window)
+}
+
+/// Turns a captured frame (the whole monitor, or one window) into what the model and the
+/// harness work with. `origin_*` is where the frame's top-left pixel sits on the screen.
+fn encode_capture(frame: crate::capture::dxgi::CapturedFrame, origin_x: i32, origin_y: i32, monitor_index: u32, window: WindowContext) -> Result<EncodedCapture, String> {
     let candidates = collect_candidates(
         &frame.data,
         frame.width,
@@ -3124,6 +3130,34 @@ fn capture_screen() -> Result<EncodedCapture, String> {
         marked_jpeg: None,
         zoom: None,
     })
+}
+
+/// Captures one window by itself with PrintWindow, even when other windows cover it, so a worker
+/// can look at its window without raising it. Falls back to the usual monitor capture (after
+/// raising the window) when the app does not paint that way (some GPU-composited surfaces).
+fn capture_window(hwnd: isize) -> Result<EncodedCapture, String> {
+    let handle = hwnd as windows_sys::Win32::Foundation::HWND;
+    let Some((left, top, right, bottom)) = desktop_target::visible_bounds(handle) else {
+        return Err("the window has no visible area".to_owned());
+    };
+    let (width, height) = ((right - left).max(0) as u32, (bottom - top).max(0) as u32);
+    if width < 16 || height < 16 {
+        return Err("the window is too small to look at".to_owned());
+    }
+    let mut window = foreground_window_context();
+    window.title = desktop_target::title_of(handle);
+    window.hwnd = hwnd;
+    window.process_id = desktop_target::process_of(handle);
+    window.left = left;
+    window.top = top;
+    window.right = right;
+    window.bottom = bottom;
+    let frame = crate::capture::gdi::print_window(handle, width, height)?;
+    if crate::system_state::frame_is_black(&frame.data) {
+        return Err("the window painted nothing (black)".to_owned());
+    }
+    let monitor_index = 0;
+    encode_capture(frame, left, top, monitor_index, window)
 }
 
 /// The model asked to look closer: the same frame, cropped to `region` (physical x, y, w, h) and
@@ -3473,8 +3507,23 @@ impl crate::workers::WorkerBackend for DesktopWorkers {
 
     fn observe(&self, worker: usize) -> crate::workers::Fut<'_, Result<EncodedCapture, String>> {
         Box::pin(async move {
-            self.take_window(worker).await?;
-            let mut encoded = tokio::task::spawn_blocking(capture_screen).await.map_err(|e| e.to_string())??;
+            // Look at the worker's own window without raising it (PrintWindow works under other
+            // windows). Only an app that does not paint that way makes this raise the window and
+            // grab the monitor instead.
+            let name = self.jobs[worker].window_name.clone();
+            let own = tokio::task::spawn_blocking(move || {
+                let hwnd = desktop_target::find_window_by_name(&name).ok_or_else(|| format!("No window matching '{name}' is open."))?;
+                capture_window(hwnd as isize)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            let mut encoded = match own {
+                Ok(capture) => capture,
+                Err(_) => {
+                    self.take_window(worker).await?;
+                    tokio::task::spawn_blocking(capture_screen).await.map_err(|e| e.to_string())??
+                }
+            };
             attach_marks(&mut encoded, &self.jobs[worker].task);
             Ok(encoded)
         })
@@ -3560,6 +3609,9 @@ impl crate::workers::WorkerBackend for DesktopWorkers {
             let _ = self.host.emit("agent-voice", json!({"text": &sentence, "step": step}));
             let baseline_window_id = desktop_target::effective_foreground().map_or(0, |hwnd| hwnd as isize);
             let windows_before = desktop_target::window_titles();
+            // The settle baseline is the whole monitor as it is just before the action (the
+            // observation itself may be a single window).
+            let before = tokio::task::spawn_blocking(capture_screen).await.map_err(|e| e.to_string())??;
             let typed = matches!(action, ActionPrimitive::TypeText { .. } | ActionPrimitive::TypeWith { .. });
             let to_run = actions.clone();
             let ran = tokio::task::spawn_blocking(move || execute_actions(&to_run)).await.map_err(|e| e.to_string())?;
@@ -3572,7 +3624,7 @@ impl crate::workers::WorkerBackend for DesktopWorkers {
                 return Ok(Turn::Continue);
             }
             session.record_action(step, describe_action_text(&plan.canvas), crate::reliability::LedgerStatus::Done, is_irreversible(&plan.canvas, &plan.proposal.impact));
-            let (monitor, profile, baseline) = (obs.monitor_index, SettleProfile::for_action(&action), Arc::clone(&obs.rgba));
+            let (monitor, profile, baseline) = (before.monitor_index, SettleProfile::for_action(&action), Arc::clone(&before.rgba));
             let report = tokio::task::spawn_blocking(move || wait_for_effect_on_monitor(monitor, &baseline, profile, baseline_window_id)).await.ok().and_then(Result::ok);
             let post = tokio::task::spawn_blocking(capture_screen).await.map_err(|e| e.to_string())??;
             step_trace.bytes("post.png", &post.webp);
@@ -4546,6 +4598,14 @@ pub mod driver {
 
     pub struct Observation {
         capture: EncodedCapture,
+    }
+
+    /// Looks at one window by itself, even when other windows cover it (no raising).
+    pub fn observe_window(name: &str, task: &str) -> Result<Observation, String> {
+        let hwnd = desktop_target::find_window_by_name(name).ok_or_else(|| format!("No window matching '{name}' is open."))?;
+        let mut capture = capture_window(hwnd as isize)?;
+        attach_marks(&mut capture, task);
+        Ok(Observation { capture })
     }
 
     pub fn observe(task: &str) -> Result<Observation, String> {
