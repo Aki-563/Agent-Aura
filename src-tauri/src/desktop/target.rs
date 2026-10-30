@@ -612,3 +612,44 @@ mod tests {
         assert_eq!(process_is_elevated(u32::MAX - 3), None);
     }
 }
+
+/// The text caret of the window's thread, in screen pixels (left, top, right, bottom).
+pub fn caret_rect(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
+    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetGUIThreadInfo, GUITHREADINFO};
+    unsafe {
+        let thread = GetWindowThreadProcessId(hwnd, std::ptr::null_mut());
+        let mut info: GUITHREADINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+        if GetGUIThreadInfo(thread, &mut info) == 0 || info.hwndCaret.is_null() {
+            return None;
+        }
+        let r = info.rcCaret;
+        if r.right <= r.left && r.bottom <= r.top {
+            return None;
+        }
+        let mut top_left = POINT { x: r.left, y: r.top };
+        let mut bottom_right = POINT { x: r.right.max(r.left + 1), y: r.bottom };
+        ClientToScreen(info.hwndCaret, &mut top_left);
+        ClientToScreen(info.hwndCaret, &mut bottom_right);
+        Some((top_left.x, top_left.y, bottom_right.x, bottom_right.y))
+    }
+}
+
+/// Total CPU time (kernel + user, ms) a process has used so far.
+pub fn process_cpu_ms(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let zero = || FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let (mut created, mut exited, mut kernel, mut user) = (zero(), zero(), zero(), zero());
+        let ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) != 0;
+        CloseHandle(handle);
+        let ticks = |t: FILETIME| ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
+        ok.then(|| (ticks(kernel) + ticks(user)) / 10_000)
+    }
+}

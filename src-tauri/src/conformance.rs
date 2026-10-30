@@ -1548,6 +1548,68 @@ fn drag_with_waypoints_keeps_its_corners(_lab: &Lab) -> Result<(), String> {
     Ok(())
 }
 
+// ----------------------------------------------------------------------------- loading (§H4)
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// Clicks "Load data" through the agent's own path (observe, act, settle) and checks that the
+/// wait did not end before the content appeared: the next screenshot must show the loaded page.
+fn load_and_check(delay_ms: u64, kind: &str) -> Result<(), String> {
+    open_page(&format!("/load?delay={delay_ms}&kind={kind}"), "Load")?;
+    let effect = go(Order::Click("Load data"))?;
+    let returned_at = now_epoch_ms();
+    let ready = fx::state("ready").and_then(|v| v.parse::<u64>().ok());
+    match ready {
+        Some(ready_at) => {
+            crate::testlog::record("load", kind, serde_json::json!({"delayMs": delay_ms, "waitedPastReadyMs": returned_at.saturating_sub(ready_at), "effect": effect}));
+            Ok(())
+        }
+        None => Err(format!("acted too early: the wait ended while the page was still loading ({kind}, {delay_ms} ms). Effect: {effect}")),
+    }
+}
+
+fn load_one_second_spinner(_lab: &Lab) -> Result<(), String> {
+    load_and_check(1_000, "spinner")
+}
+
+fn load_three_second_progress_bar(_lab: &Lab) -> Result<(), String> {
+    load_and_check(3_000, "progress")
+}
+
+fn load_six_second_spinner(_lab: &Lab) -> Result<(), String> {
+    load_and_check(6_000, "spinner")
+}
+
+fn load_seven_second_skeleton(_lab: &Lab) -> Result<(), String> {
+    load_and_check(7_000, "skeleton")
+}
+
+fn endless_spinner_times_out_with_a_clear_report(_lab: &Lab) -> Result<(), String> {
+    open_page("/load?kind=infinite", "Load")?;
+    let started = Instant::now();
+    let effect = go(Order::Click("Load data"))?;
+    let took = started.elapsed();
+    if took > Duration::from_secs(25) {
+        return Err(format!("the wait took {took:?}; it must give up at the loading ceiling"));
+    }
+    if !effect.contains("STILL LOADING") {
+        return Err(format!("the model would not be told the page is still loading: {effect}"));
+    }
+    Ok(())
+}
+
+fn load_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
+    vec![
+        ("load", "1 s spinner: no early action", load_one_second_spinner),
+        ("load", "3 s progress bar: no early action", load_three_second_progress_bar),
+        ("load", "6 s spinner (past the normal ceiling)", load_six_second_spinner),
+        ("load", "7 s skeleton shimmer", load_seven_second_skeleton),
+        ("load", "endless spinner ends with STILL LOADING", endless_spinner_times_out_with_a_clear_report),
+    ]
+}
+
 fn draw_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
     vec![
         ("draw", "circle within 1 px of the ideal", draw_a_circle_within_one_pixel),
@@ -1891,7 +1953,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
         None => true,
     };
     let lab_cases: Vec<_> = cases().into_iter().filter(|(g, n, _)| selected(g, n)).collect();
-    let driver_selected: Vec<_> = driver_cases().into_iter().chain(draw_cases()).filter(|(g, n, _)| selected(g, n)).collect();
+    let driver_selected: Vec<_> = driver_cases().into_iter().chain(draw_cases()).chain(load_cases()).filter(|(g, n, _)| selected(g, n)).collect();
     let app_cases: Vec<_> = driver_selected.into_iter().chain(body_cases().into_iter().filter(|(g, n, _)| selected(g, n))).chain(native_cases().into_iter().filter(|(g, n, _)| selected(g, n))).collect();
     if lab_cases.is_empty() && app_cases.is_empty() {
         return Err("no case matches that filter".into());
@@ -1908,7 +1970,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
     let mut results = Vec::new();
     let mut lab_open = !lab_cases.is_empty();
     for (group, name, case) in lab_cases.into_iter().chain(app_cases) {
-        if group != "native" && group != "driver" && group != "body" && group != "draw" {
+        if group != "native" && group != "driver" && group != "body" && group != "draw" && group != "load" {
             // lab case: nothing to close
         } else if lab_open {
             // Close the lab tab before the real-application cases.
@@ -1922,8 +1984,8 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
             trail.clear();
         }
         let started = Instant::now();
-        let outcome = if group == "native" || group == "driver" || group == "body" || group == "draw" { case(&lab) } else { lab.reset().and_then(|_| case(&lab)) };
-        if group == "driver" || group == "body" || group == "draw" {
+        let outcome = if group == "native" || group == "driver" || group == "body" || group == "draw" || group == "load" { case(&lab) } else { lab.reset().and_then(|_| case(&lab)) };
+        if group == "driver" || group == "body" || group == "draw" || group == "load" {
             let _ = press("escape");
             close_fixture_tab();
         }
@@ -1935,7 +1997,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
             millis: started.elapsed().as_millis(),
             detail: outcome
                 .err()
-                .map(|e| if group == "driver" || group == "body" || group == "draw" { format!("{e} [orders: {}]", trail_text()) } else { e })
+                .map(|e| if group == "driver" || group == "body" || group == "draw" || group == "load" { format!("{e} [orders: {}]", trail_text()) } else { e })
                 .unwrap_or_default(),
         };
         progress(&result);

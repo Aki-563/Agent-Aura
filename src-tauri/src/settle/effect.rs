@@ -47,6 +47,84 @@ pub struct SettleProfile {
     pub stable_ms: u64,
     /// Hard ceiling for the whole wait.
     pub max_ms: u64,
+    /// Longer ceiling while the screen shows a loading signal (spinner, progress bar, busy
+    /// cursor, a hung window, the app busy on the CPU): acting on a half-loaded screen is worse
+    /// than waiting. 0 = never extend.
+    pub loading_max_ms: u64,
+}
+
+/// Default ceiling while something is visibly loading.
+pub const LOADING_MAX_MS: u64 = 15_000;
+
+impl SettleProfile {
+    /// The same profile with its waiting times stretched for a slow or busy computer (factor 1..4).
+    /// The stability window stays short: it measures quiet, not lag.
+    pub fn scaled(self, factor: f32) -> Self {
+        let f = factor.clamp(1.0, 4.0) as f64;
+        let stretch = |ms: u64| (ms as f64 * f).round() as u64;
+        Self {
+            change_timeout_ms: stretch(self.change_timeout_ms),
+            max_ms: stretch(self.max_ms),
+            loading_max_ms: if self.loading_max_ms == 0 { 0 } else { stretch(self.loading_max_ms).max(stretch(self.max_ms)) },
+            ..self
+        }
+    }
+}
+
+// ---- Adaptive timing: how slow is this computer right now? -----------------------------
+
+static LAG_FACTOR_MILLI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000);
+static FIRST_CHANGE_EMA_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Current waiting-time multiplier (1.0 on an idle machine, up to 4.0 when it stutters).
+pub fn lag_factor() -> f32 {
+    LAG_FACTOR_MILLI.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0
+}
+
+/// Pure rule: the factor from total CPU use (0..1) and the smoothed time an action took to show
+/// its first visible change (ms).
+pub fn lag_factor_from(cpu_busy: f32, first_change_ema_ms: u32) -> f32 {
+    let cpu: f32 = if cpu_busy > 0.9 { 2.5 } else if cpu_busy > 0.75 { 1.6 } else { 1.0 };
+    // A click normally shows its first change within ~250 ms; slower than that means lag.
+    let latency = (first_change_ema_ms as f32 / 250.0).clamp(1.0, 3.0);
+    cpu.max(latency).clamp(1.0, 4.0)
+}
+
+/// Total CPU use since the previous call (0..1), from `GetSystemTimes`.
+fn cpu_busy_since_last_call() -> f32 {
+    use std::sync::Mutex;
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetSystemTimes;
+    static LAST: Mutex<Option<(u64, u64, u64)>> = Mutex::new(None);
+    let as_u64 = |t: FILETIME| ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
+    let (mut idle, mut kernel, mut user) = (FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }, FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }, FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 });
+    if unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) } == 0 {
+        return 0.0;
+    }
+    let now = (as_u64(idle), as_u64(kernel), as_u64(user));
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let busy = match *last {
+        Some((i0, k0, u0)) => {
+            let (di, dk, du) = (now.0.saturating_sub(i0), now.1.saturating_sub(k0), now.2.saturating_sub(u0));
+            let total = dk + du; // kernel time includes idle time
+            if total == 0 { 0.0 } else { 1.0 - di as f32 / total as f32 }
+        }
+        None => 0.0,
+    };
+    *last = Some(now);
+    busy.clamp(0.0, 1.0)
+}
+
+/// Updates the lag factor after a settle (called by `wait_for_effect`).
+fn update_lag(first_change_ms: Option<u64>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if let Some(ms) = first_change_ms {
+        let previous = FIRST_CHANGE_EMA_MS.load(Relaxed);
+        let ema = if previous == 0 { ms as u32 } else { (previous as f32 * 0.8 + ms as f32 * 0.2) as u32 };
+        FIRST_CHANGE_EMA_MS.store(ema, Relaxed);
+    }
+    let factor = lag_factor_from(cpu_busy_since_last_call(), FIRST_CHANGE_EMA_MS.load(Relaxed));
+    LAG_FACTOR_MILLI.store((factor * 1000.0) as u32, Relaxed);
 }
 
 impl SettleProfile {
@@ -74,7 +152,9 @@ impl SettleProfile {
             ActionPrimitive::Zoom { .. } | ActionPrimitive::Observe {} | ActionPrimitive::ClipboardRead {} | ActionPrimitive::ClipboardWrite { .. } => (0, 0, 0),
         };
         let min_changed = if is_text_input(action) { TEXT_MIN_CHANGED_SAMPLES } else { MIN_CHANGED_SAMPLES };
-        Self { min_changed, change_timeout_ms, stable_ms, max_ms }
+        // Actions that can start a load (a click, Enter, opening a page) may wait for it to finish.
+        let loading_max_ms = if max_ms == 0 || matches!(action, ActionPrimitive::WaitSettle { .. }) { 0 } else { LOADING_MAX_MS.max(max_ms) };
+        Self { min_changed, change_timeout_ms, stable_ms, max_ms, loading_max_ms }.scaled(lag_factor())
     }
 }
 
@@ -95,11 +175,12 @@ pub struct SettleMachine {
     profile: SettleProfile,
     saw_change: bool,
     last_motion_ms: u64,
+    last_loading_ms: Option<u64>,
 }
 
 impl SettleMachine {
     pub fn new(profile: SettleProfile) -> Self {
-        Self { profile, saw_change: false, last_motion_ms: 0 }
+        Self { profile, saw_change: false, last_motion_ms: 0, last_loading_ms: None }
     }
 
     pub fn saw_change(&self) -> bool {
@@ -114,23 +195,48 @@ impl SettleMachine {
         changed_vs_previous: u32,
         cursor_busy: bool,
     ) -> Option<SettleOutcome> {
+        self.on_frame_ext(t_ms, changed_vs_baseline, changed_vs_previous, cursor_busy, false)
+    }
+
+    /// Like `on_frame`, with a loading signal (a spinner or progress bar keeps moving, the window
+    /// is hung, the app is busy). While it lasts the wait may run past `max_ms`, up to
+    /// `loading_max_ms`, so the next screenshot is not taken of a half-loaded screen.
+    pub fn on_frame_ext(
+        &mut self,
+        t_ms: u64,
+        changed_vs_baseline: u32,
+        changed_vs_previous: u32,
+        cursor_busy: bool,
+        loading: bool,
+    ) -> Option<SettleOutcome> {
         if changed_vs_baseline >= self.profile.min_changed {
             self.saw_change = true;
         }
-        if changed_vs_previous >= self.profile.min_changed || cursor_busy {
+        if changed_vs_previous >= self.profile.min_changed || cursor_busy || loading {
             self.last_motion_ms = t_ms;
         }
+        if loading {
+            self.last_loading_ms = Some(t_ms);
+        }
 
-        if self.saw_change && t_ms.saturating_sub(self.last_motion_ms) >= self.profile.stable_ms && !cursor_busy {
+        if self.saw_change && t_ms.saturating_sub(self.last_motion_ms) >= self.profile.stable_ms && !cursor_busy && !loading {
             return Some(SettleOutcome::Settled);
         }
-        if !self.saw_change && !cursor_busy && t_ms >= self.profile.change_timeout_ms {
+        if !self.saw_change && !cursor_busy && !loading && t_ms >= self.profile.change_timeout_ms {
             return Some(SettleOutcome::NoEffect);
         }
-        if t_ms >= self.profile.max_ms {
-            return Some(if self.saw_change { SettleOutcome::Unstable } else { SettleOutcome::NoEffect });
+        // Still loading recently: the ceiling is the loading ceiling, not the normal one.
+        let loading_recently = self.last_loading_ms.is_some_and(|at| t_ms.saturating_sub(at) <= self.profile.stable_ms.max(300));
+        let ceiling = if loading_recently && self.profile.loading_max_ms > 0 { self.profile.loading_max_ms.max(self.profile.max_ms) } else { self.profile.max_ms };
+        if t_ms >= ceiling {
+            return Some(if self.saw_change || loading_recently { SettleOutcome::Unstable } else { SettleOutcome::NoEffect });
         }
         None
+    }
+
+    /// Whether a loading signal was seen during this wait.
+    pub fn saw_loading(&self) -> bool {
+        self.last_loading_ms.is_some()
     }
 }
 
@@ -150,6 +256,64 @@ pub struct Focus {
     /// active window changed, which is itself a visible effect.
     pub window_id: isize,
     pub roi: Roi,
+    /// The blinking text caret (frame pixels): never counted as motion.
+    pub caret: Option<Roi>,
+    /// The window stopped responding (`IsHungAppWindow`): it is busy, not finished.
+    pub hung: bool,
+    /// The app is busy on the CPU right now (a loading signal when the screen is not moving).
+    pub app_busy: bool,
+}
+
+/// Counts changed samples like `count_changed_samples_in`, skipping `masks`, and returns the
+/// bounding box of the changes (to tell a small spinner from a page that redraws).
+pub fn count_changes_masked(a: &[u8], b: &[u8], width: u32, height: u32, roi: Option<Roi>, masks: &[Roi]) -> (u32, u32, Option<Roi>) {
+    count_changes_masked_delta(a, b, width, height, roi, masks, PIXEL_DELTA)
+}
+
+/// Like `count_changes_masked` with an explicit luma threshold. A low one (0.025) sees the faint
+/// gradient of a skeleton loader that the normal threshold ignores.
+pub fn count_changes_masked_delta(a: &[u8], b: &[u8], width: u32, height: u32, roi: Option<Roi>, masks: &[Roi], delta: f32) -> (u32, u32, Option<Roi>) {
+    let (w, h) = (width as usize, height as usize);
+    if a.len() != b.len() || a.len() < w * h * 4 {
+        return (u32::MAX, 1, None);
+    }
+    let (x0, y0, x1, y1) = match roi {
+        Some(r) => (r.left.max(0) as usize, r.top.max(0) as usize, (r.right.max(0) as usize).min(w), (r.bottom.max(0) as usize).min(h)),
+        None => (0, 0, w, h),
+    };
+    let luma = |frame: &[u8], o: usize| (0.299 * frame[o] as f32 + 0.587 * frame[o + 1] as f32 + 0.114 * frame[o + 2] as f32) / 255.0;
+    let masked = |x: usize, y: usize| masks.iter().any(|m| (x as i32) >= m.left && (x as i32) < m.right && (y as i32) >= m.top && (y as i32) < m.bottom);
+    let (mut changed, mut total) = (0u32, 0u32);
+    let mut bbox: Option<Roi> = None;
+    for y in (y0..y1).step_by(SAMPLE_STRIDE) {
+        let row = y * w * 4;
+        for x in (x0..x1).step_by(SAMPLE_STRIDE) {
+            if masked(x, y) {
+                continue;
+            }
+            total += 1;
+            let o = row + x * 4;
+            if (luma(a, o) - luma(b, o)).abs() > delta {
+                changed += 1;
+                let (xi, yi) = (x as i32, y as i32);
+                bbox = Some(match bbox {
+                    None => Roi { left: xi, top: yi, right: xi + 1, bottom: yi + 1 },
+                    Some(r) => Roi { left: r.left.min(xi), top: r.top.min(yi), right: r.right.max(xi + 1), bottom: r.bottom.max(yi + 1) },
+                });
+            }
+        }
+    }
+    (changed, total, bbox)
+}
+
+/// Motion confined to a small area of the window (a spinner, a progress bar, a shimmering
+/// skeleton row) as opposed to a page that is redrawing: the classic "still loading" look.
+pub fn is_small_persistent_motion(motion_box: Option<Roi>, window: Option<Roi>) -> bool {
+    let (Some(m), Some(w)) = (motion_box, window) else { return false };
+    let area = |r: Roi| ((r.right - r.left).max(0) as i64) * ((r.bottom - r.top).max(0) as i64);
+    let window_area = area(w).max(1);
+    // Up to a quarter of the window: spinners, bars and skeleton blocks; whole-page redraws are larger.
+    area(m) * 4 <= window_area && area(m) > 0
 }
 
 /// Counts sampled pixels whose luma differs noticeably between two same-sized RGBA frames.
@@ -214,6 +378,10 @@ pub struct EffectReport {
     pub peak_changed_percent: f32,
     pub frames_compared: u32,
     pub cursor_was_busy: bool,
+    /// Why the wait took as long as it did ("a small animation kept moving", "busy cursor", ...).
+    pub wait_reason: String,
+    /// The screen still showed a loading signal when the wait ended (it hit the loading ceiling).
+    pub still_loading: bool,
 }
 
 impl EffectReport {
@@ -224,9 +392,18 @@ impl EffectReport {
                 "no visible change within {} ms; the typed text or key may not have registered (small text changes are hard to detect, so check the screenshot)",
                 self.elapsed_ms
             ),
+            SettleOutcome::Settled if !self.wait_reason.is_empty() => format!(
+                "the screen changed ({:.1}% of it) and settled after {} ms (waited because {})",
+                self.peak_changed_percent, self.elapsed_ms, self.wait_reason
+            ),
             SettleOutcome::Settled => format!(
                 "the screen changed ({:.1}% of it) and settled after {} ms",
                 self.peak_changed_percent, self.elapsed_ms
+            ),
+            SettleOutcome::Unstable if self.still_loading => format!(
+                "STILL LOADING after {:.1} s ({}): the page or app has not finished; wait (wait action) or check the screenshot before acting, and do not repeat the action",
+                self.elapsed_ms as f64 / 1000.0,
+                if self.wait_reason.is_empty() { "a loading animation kept moving" } else { &self.wait_reason }
             ),
             SettleOutcome::NoEffect => format!(
                 "NO VISIBLE EFFECT: the screen did not change within {} ms, so the action probably missed its target or was ignored",
@@ -244,7 +421,11 @@ impl EffectReport {
 ///
 /// `baseline` must be the full-resolution RGBA frame captured *before* the action, of the same
 /// monitor that `capture` duplicates. `baseline_window` is the active window before the action
-/// (0 if unknown) and `focus_probe` reports the active window and its bounds right now.
+/// (0 if unknown) and `focus_probe` reports the active window, its bounds, caret and busy state.
+///
+/// Loading signals (a small animation that keeps moving, the busy cursor, a hung window, the app
+/// busy on the CPU) extend the wait past `max_ms` up to `loading_max_ms`, so the next screenshot
+/// is not of a half-loaded screen. The blinking caret is masked out. The wait reason is reported.
 pub fn wait_for_effect(
     capture: &mut DxgiCapture,
     baseline: &[u8],
@@ -259,6 +440,8 @@ pub fn wait_for_effect(
             peak_changed_percent: 0.0,
             frames_compared: 0,
             cursor_was_busy: false,
+            wait_reason: String::new(),
+            still_loading: false,
         });
     }
     let (width, height) = (capture.width(), capture.height());
@@ -270,6 +453,16 @@ pub fn wait_for_effect(
     let mut peak_percent = 0.0f32;
     let mut frames = 0u32;
     let mut cursor_was_busy = false;
+    let mut first_change_ms: Option<u64> = None;
+    let mut small_motion_frames = 0u32;
+    let mut last_spinner_ms: Option<u64> = None;
+    let mut faint_reference: (Vec<u8>, u64) = (baseline.to_vec(), 0);
+    let mut reasons: Vec<&'static str> = Vec::new();
+    let mut note = |reason: &'static str, reasons: &mut Vec<&'static str>| {
+        if !reasons.contains(&reason) {
+            reasons.push(reason);
+        }
+    };
     thread::sleep(Duration::from_millis(INPUT_INGESTION_MS));
 
     loop {
@@ -284,23 +477,64 @@ pub fn wait_for_effect(
             // Judge the window the user is working in; ignore unrelated movement elsewhere.
             let focus = focus_probe();
             let roi = focus.map(|f| f.roi);
-            let (mut vs_baseline, total) = count_changed_samples_in(baseline, &frame.data, width, height, roi);
-            let (vs_previous, _) = count_changed_samples_in(&previous, &frame.data, width, height, roi);
+            let masks: Vec<Roi> = focus.and_then(|f| f.caret).map(|c| Roi { left: c.left - 2, top: c.top - 2, right: c.right + 2, bottom: c.bottom + 2 }).into_iter().collect();
+            let (mut vs_baseline, total, _) = count_changes_masked(baseline, &frame.data, width, height, roi, &masks);
+            let (vs_previous, _, motion_box) = count_changes_masked(&previous, &frame.data, width, height, roi, &masks);
             // A different active window than before the action is a visible effect by itself.
             if baseline_window != 0 && focus.is_some_and(|f| f.window_id != baseline_window) {
                 vs_baseline = vs_baseline.max(profile.min_changed);
             }
+            if first_change_ms.is_none() && vs_baseline >= profile.min_changed {
+                first_change_ms = Some(t_ms);
+            }
             frames += 1;
             let busy = CursorMonitor::is_system_busy();
             cursor_was_busy |= busy;
+            if busy {
+                note("the busy cursor was showing", &mut reasons);
+            }
+            // A small area that keeps moving frame after frame: a spinner, progress bar or skeleton.
+            // Judged with a more sensitive threshold: a skeleton shimmer changes luma by under 0.07.
+            // Against a reference frame up to 200 ms old, so slow drifts add up to something visible.
+            let (faint, _, faint_box) = count_changes_masked_delta(&faint_reference.0, &frame.data, width, height, roi, &masks, 0.02);
+            if t_ms.saturating_sub(faint_reference.1) >= 200 {
+                faint_reference = (frame.data.clone(), t_ms);
+            }
+            if faint >= profile.min_changed && is_small_persistent_motion(faint_box, roi) {
+                small_motion_frames += 1;
+            } else if faint < profile.min_changed {
+                small_motion_frames = 0;
+            }
+            if small_motion_frames >= 4 {
+                last_spinner_ms = Some(t_ms);
+            }
+            // Held for 800 ms after the last loading motion, so the gap between two shimmer
+            // sweeps (or a spinner's slow phase) does not count as "finished".
+            let spinner = last_spinner_ms.is_some_and(|at| t_ms.saturating_sub(at) < 800);
+            if spinner {
+                note("a loading animation (spinner or progress bar) kept moving", &mut reasons);
+            }
+            let hung = focus.is_some_and(|f| f.hung);
+            if hung {
+                note("the window was not responding", &mut reasons);
+            }
+            let app_busy = focus.is_some_and(|f| f.app_busy) && machine.saw_change();
+            if app_busy {
+                note("the app was busy on the CPU", &mut reasons);
+            }
+            let loading = spinner || hung || app_busy;
             peak_percent = peak_percent.max(vs_baseline.min(total) as f32 * 100.0 / total.max(1) as f32);
-            if let Some(outcome) = machine.on_frame(t_ms, vs_baseline, vs_previous, busy) {
+            if let Some(outcome) = machine.on_frame_ext(t_ms, vs_baseline, vs_previous, busy, loading) {
+                update_lag(first_change_ms);
+                let waited_long = t_ms > profile.stable_ms + 1_500 || machine.saw_loading();
                 return Ok(EffectReport {
                     outcome,
                     elapsed_ms: t_ms,
                     peak_changed_percent: peak_percent,
                     frames_compared: frames,
                     cursor_was_busy,
+                    wait_reason: if waited_long { reasons.join(", ") } else { String::new() },
+                    still_loading: outcome == SettleOutcome::Unstable && loading,
                 });
             }
             previous = frame.data;
@@ -320,9 +554,90 @@ mod tests {
     use super::*;
 
     const PROFILE: SettleProfile =
-        SettleProfile { min_changed: MIN_CHANGED_SAMPLES, change_timeout_ms: 700, stable_ms: 250, max_ms: 4_000 };
+        SettleProfile { min_changed: MIN_CHANGED_SAMPLES, change_timeout_ms: 700, stable_ms: 250, max_ms: 4_000, loading_max_ms: 0 };
     const BIG: u32 = 500;
     const NONE: u32 = 0;
+
+    const LOADING_PROFILE: SettleProfile =
+        SettleProfile { min_changed: MIN_CHANGED_SAMPLES, change_timeout_ms: 700, stable_ms: 250, max_ms: 4_000, loading_max_ms: 15_000 };
+
+    /// Frames every 40 ms: (until_ms, changed vs baseline, changed vs previous, loading).
+    fn run_loading(phases: &[(u64, u32, u32, bool)]) -> (Option<SettleOutcome>, u64) {
+        let mut machine = SettleMachine::new(LOADING_PROFILE);
+        let mut t = 40;
+        for &(until, base, prev, loading) in phases {
+            while t <= until {
+                if let Some(outcome) = machine.on_frame_ext(t, base, prev, false, loading) {
+                    return (Some(outcome), t);
+                }
+                t += 40;
+            }
+        }
+        (None, t)
+    }
+
+    #[test]
+    fn a_spinner_keeps_the_wait_going_until_the_content_arrives() {
+        // Click -> spinner for 9 s (past the 4 s ceiling) -> content appears and stays still.
+        let (outcome, at) = run_loading(&[(9_000, BIG, 40, true), (12_000, BIG, NONE, false)]);
+        assert_eq!(outcome, Some(SettleOutcome::Settled));
+        assert!(at > 9_000 && at < 9_600, "settled {at} ms after the click, right after the load");
+    }
+
+    #[test]
+    fn an_endless_spinner_stops_at_the_loading_ceiling() {
+        let (outcome, at) = run_loading(&[(40_000, BIG, 40, true)]);
+        assert_eq!(outcome, Some(SettleOutcome::Unstable));
+        assert!((15_000..15_100).contains(&at), "gave up at {at} ms");
+    }
+
+    #[test]
+    fn without_a_loading_signal_the_normal_ceiling_still_applies() {
+        let (outcome, at) = run_loading(&[(40_000, BIG, BIG, false)]);
+        assert_eq!(outcome, Some(SettleOutcome::Unstable));
+        assert!((4_000..4_100).contains(&at));
+        // And a click that changed nothing is still "no effect" quickly, spinner or not elsewhere.
+        let (outcome, at) = run_loading(&[(5_000, NONE, NONE, false)]);
+        assert_eq!(outcome, Some(SettleOutcome::NoEffect));
+        assert!(at <= 760);
+    }
+
+    #[test]
+    fn small_local_motion_is_loading_but_a_page_redraw_is_not() {
+        let window = Some(Roi { left: 0, top: 0, right: 1000, bottom: 800 });
+        assert!(is_small_persistent_motion(Some(Roi { left: 480, top: 380, right: 520, bottom: 420 }), window), "a 40 px spinner");
+        assert!(is_small_persistent_motion(Some(Roi { left: 100, top: 500, right: 900, bottom: 520 }), window), "a progress bar");
+        assert!(!is_small_persistent_motion(Some(Roi { left: 0, top: 0, right: 1000, bottom: 700 }), window), "a whole page redraw");
+        assert!(!is_small_persistent_motion(None, window));
+    }
+
+    #[test]
+    fn the_caret_is_masked_out_of_the_change_count() {
+        let (w, h) = (100u32, 60u32);
+        let a = vec![255u8; (w * h * 4) as usize];
+        let mut b = a.clone();
+        for y in 10..30 {
+            for x in 50..52 {
+                let o = ((y * w + x) * 4) as usize;
+                b[o..o + 3].copy_from_slice(&[0, 0, 0]);
+            }
+        }
+        let (changed, _, bbox) = count_changes_masked(&a, &b, w, h, None, &[]);
+        assert!(changed > 0 && bbox.is_some());
+        let caret = Roi { left: 49, top: 9, right: 53, bottom: 31 };
+        let (masked, _, none) = count_changes_masked(&a, &b, w, h, None, &[caret]);
+        assert_eq!((masked, none), (0, None), "a blinking caret is not a change");
+    }
+
+    #[test]
+    fn a_busy_or_slow_computer_stretches_the_waits() {
+        assert_eq!(lag_factor_from(0.2, 150), 1.0);
+        assert_eq!(lag_factor_from(0.95, 150), 2.5);
+        assert!((lag_factor_from(0.2, 600) - 2.4).abs() < 0.01);
+        assert_eq!(lag_factor_from(0.95, 5_000), 3.0_f32.max(2.5));
+        let scaled = LOADING_PROFILE.scaled(2.0);
+        assert_eq!((scaled.change_timeout_ms, scaled.max_ms, scaled.loading_max_ms, scaled.stable_ms), (1_400, 8_000, 30_000, 250));
+    }
 
     fn run(frames: &[(u64, u32, u32, bool)]) -> Option<SettleOutcome> {
         let mut machine = SettleMachine::new(PROFILE);

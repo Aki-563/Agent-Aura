@@ -316,6 +316,35 @@ cv.addEventListener('pointerup',function(e){if(!down)return;down=false;add(e);st
 var seq=0;setInterval(function(){fetch('/cmd').then(function(r){return r.text()}).then(function(t){var p=t.indexOf('|');var n=parseInt(t.substring(0,p));if(n>seq){seq=n;if(t.substring(p+1)=='clear'){g.clearRect(0,0,cv.width,cv.height)}st('ack',n)}})},200);
 </script>"##;
 
+/// Slow-loading page (Phase 9, §H0/§H4): `/load?delay=<ms>&kind=spinner|progress|skeleton|infinite`.
+/// "Load data" shows the loading UI, then the content after `delay` ms (never for `infinite`).
+/// The page reports `ready` = the time the content appeared, so a test can tell whether the
+/// harness's wait ended before the content was there (an early action).
+const LOAD_BODY: &str = r##"<style>
+#spin{width:40px;height:40px;border:6px solid #ccc;border-top-color:#36c;border-radius:50%;animation:r .8s linear infinite;display:none;margin:20px}
+@keyframes r{to{transform:rotate(360deg)}}
+#bar{width:400px;height:14px;background:#eee;display:none;margin:20px}#fill{height:100%;width:0;background:#36c}
+.sk{width:420px;height:18px;margin:8px 20px;background:linear-gradient(90deg,#eee 25%,#ddd 50%,#eee 75%);background-size:200% 100%;animation:sh 1s linear infinite;display:none}
+@keyframes sh{to{background-position:-200% 0}}
+#content{display:none;font-size:22px;margin:20px}
+</style>
+<h1 id=title>Load test</h1>
+<button id=go style="font-size:18px">Load data</button>
+<div id=spin></div><div id=bar><div id=fill></div></div><div class=sk></div><div class=sk></div><div class=sk></div>
+<div id=content><button id=done onclick="ev('click:done')">Data ready</button></div>
+<script>
+function st(k,v){fetch('/state',{method:'POST',body:k+'='+encodeURIComponent(v)})}
+var q=new URLSearchParams(location.search),delay=+(q.get('delay')||1000),kind=q.get('kind')||'spinner';
+document.getElementById('go').onclick=function(){var t0=performance.now();st('ready','');ev('loading');
+ if(kind=='spinner'||kind=='infinite')document.getElementById('spin').style.display='block';
+ if(kind=='progress'){document.getElementById('bar').style.display='block';var f=document.getElementById('fill');var iv=setInterval(function(){var p=Math.min(100,(performance.now()-t0)/delay*100);f.style.width=p+'%';if(p>=100)clearInterval(iv)},50)}
+ if(kind=='skeleton')document.querySelectorAll('.sk').forEach(function(e){e.style.display='block'});
+ if(kind=='infinite')return;
+ setTimeout(function(){document.getElementById('spin').style.display='none';document.getElementById('bar').style.display='none';
+  document.querySelectorAll('.sk').forEach(function(e){e.style.display='none'});document.getElementById('content').style.display='block';
+  st('ready',String(Date.now()));ev('ready')},delay)};
+</script>"##;
+
 fn page(path: &str) -> Option<String> {
     Some(match path {
         "/click" => shell(
@@ -373,6 +402,7 @@ if(e.clientX>r.left&&e.clientX<r.right&&e.clientY>r.top&&e.clientY<r.bottom)ev('
             "<h1>Layout shift</h1><div id=spacer style='height:0'></div><button onclick=\"ev('click:target')\">Target</button><script>document.addEventListener('keydown',function(e){if(e.key=='F9'){document.getElementById('spacer').style.height='160px';ev('shifted')}})</script>",
         ),
         "/canvas" => shell("Canvas", CANVAS_BODY),
+        "/load" => shell("Load", LOAD_BODY),
         "/links/pricing" => shell("Pricing", "<h1>Pricing</h1><script>ev('visit:pricing')</script><p>The plan costs 5 dollars.</p>"),
         "/links/about" => shell("About", "<h1>About us</h1><script>ev('visit:about')</script>"),
         "/links/contact" => shell("Contact", "<h1>Contact</h1><script>ev('visit:contact')</script>"),

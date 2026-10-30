@@ -2788,9 +2788,28 @@ fn wait_for_effect_on_monitor(
     let (width, height) = (capture.width() as i32, capture.height() as i32);
     // Popup menus and drop-downs can extend past the window frame, so the region gets a margin.
     const MARGIN: i32 = 160;
+    // CPU time of the app in front at the previous probe, to tell "busy working" from "idle".
+    let cpu_sample: std::cell::RefCell<Option<(u32, u64, Instant)>> = std::cell::RefCell::new(None);
     let probe = move || {
         let hwnd = desktop_target::effective_foreground()?;
         let (left, top, right, bottom) = desktop_target::visible_bounds(hwnd)?;
+        let pid = desktop_target::process_of(hwnd);
+        let app_busy = match (desktop_target::process_cpu_ms(pid), cpu_sample.borrow_mut().as_mut()) {
+            (Some(now_ms), Some((last_pid, last_ms, at))) if *last_pid == pid => {
+                let wall = at.elapsed().as_millis().max(1) as u64;
+                let busy = now_ms.saturating_sub(*last_ms) * 100 / wall >= 60; // 60% of a core
+                (*last_ms, *at) = (now_ms, Instant::now());
+                busy
+            }
+            _ => false,
+        };
+        if let Some(now_ms) = desktop_target::process_cpu_ms(pid) {
+            let mut sample = cpu_sample.borrow_mut();
+            if sample.map(|(p, _, _)| p) != Some(pid) {
+                *sample = Some((pid, now_ms, Instant::now()));
+            }
+        }
+        let caret = desktop_target::caret_rect(hwnd).map(|(l, t, r, b)| Roi { left: l - origin_x, top: t - origin_y, right: r - origin_x, bottom: b - origin_y });
         Some(Focus {
             window_id: hwnd as isize,
             roi: Roi {
@@ -2799,6 +2818,9 @@ fn wait_for_effect_on_monitor(
                 right: (right - origin_x + MARGIN).min(width),
                 bottom: (bottom - origin_y + MARGIN).min(height),
             },
+            caret,
+            hung: unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsHungAppWindow(hwnd) } != 0,
+            app_busy,
         })
     };
     wait_for_effect(&mut capture, baseline, profile, baseline_window, &probe)
