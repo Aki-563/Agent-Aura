@@ -1600,6 +1600,180 @@ fn endless_spinner_times_out_with_a_clear_report(_lab: &Lab) -> Result<(), Strin
     Ok(())
 }
 
+// ----------------------------------------------------------------------------- many windows (§H3)
+
+fn registry_window(title_part: &str) -> Option<crate::desktop::registry::WindowInfo> {
+    crate::desktop::registry::refresh().windows.into_iter().find(|w| w.title.to_lowercase().contains(&title_part.to_lowercase()))
+}
+
+fn two_apps_open() -> Result<(), String> {
+    ensure_app("notepad", "notepad")?;
+    ensure_app("calculator", "calculator")
+}
+
+fn windows_registry_matches_the_desktop(_lab: &Lab) -> Result<(), String> {
+    two_apps_open()?;
+    let snapshot = crate::desktop::registry::refresh();
+    let listed: Vec<isize> = desktop_target::window_titles().into_iter().map(|(h, _)| h).collect();
+    let mut registry: Vec<isize> = snapshot.windows.iter().map(|w| w.hwnd).collect();
+    let mut expected = listed.clone();
+    registry.sort();
+    expected.sort();
+    if registry != expected {
+        return Err(format!("the registry has {} windows, Windows lists {}", registry.len(), expected.len()));
+    }
+    // Ids stay the same across refreshes.
+    let before: Vec<(String, isize)> = snapshot.windows.iter().map(|w| (w.id.clone(), w.hwnd)).collect();
+    let after = crate::desktop::registry::refresh();
+    for (id, hwnd) in before {
+        if after.windows.iter().find(|w| w.hwnd == hwnd).map(|w| &w.id) != Some(&id) {
+            return Err(format!("the window {hwnd} lost its id {id}"));
+        }
+    }
+    if snapshot.active().is_none() || snapshot.windows.iter().filter(|w| w.is_active).count() != 1 {
+        return Err("exactly one window must be active".into());
+    }
+    let block = crate::desktop::registry::state_block(&snapshot, &crate::desktop::registry::ScreenshotScope { scope: "full_screen".into(), monitor: 1, width: 1280, height: 720, scale: 0.6667, offset: [0, 0] });
+    if block["window_count"].as_u64() != Some(snapshot.windows.len() as u64) {
+        return Err("the window-state block disagrees with the registry".into());
+    }
+    Ok(())
+}
+
+fn windows_changes_are_reported(_lab: &Lab) -> Result<(), String> {
+    ensure_app("notepad", "notepad")?;
+    crate::desktop::registry::refresh();
+    let calc_before = registry_window("calculator").is_some();
+    ensure_app("calculator", "calculator")?;
+    let opened = crate::desktop::registry::refresh();
+    if !calc_before && !opened.changes.iter().any(|c| c.contains("opened")) {
+        return Err(format!("no 'opened' change reported: {:?}", opened.changes));
+    }
+    let calc = app_window("calculator").ok_or("no calculator")?;
+    minimize(calc as _);
+    std::thread::sleep(Duration::from_millis(500));
+    let minimized = crate::desktop::registry::refresh();
+    if !minimized.changes.iter().any(|c| c.contains("minimized")) || minimized.minimized_count() == 0 {
+        return Err(format!("minimizing not reported: {:?}", minimized.changes));
+    }
+    Ok(())
+}
+
+fn windows_bring_to_front_twenty_times(_lab: &Lab) -> Result<(), String> {
+    two_apps_open()?;
+    let mut failures = Vec::new();
+    for round in 1..=20 {
+        let (name, part) = if round % 2 == 0 { ("notepad", "notepad") } else { ("calculator", "calculator") };
+        // Put the other one in front first, so the switch is real.
+        let other = if round % 2 == 0 { "calculator" } else { "notepad" };
+        if let Some(window) = desktop_target::find_window_by_name(other) {
+            desktop_target::bring_to_front(window);
+        }
+        if let Err(error) = act(A::FocusWindow { name: name.into() }) {
+            failures.push(format!("round {round}: {error}"));
+        } else if !desktop_target::foreground_title().to_lowercase().contains(part) {
+            failures.push(format!("round {round}: '{}' is in front, wanted {part}", desktop_target::foreground_title()));
+        }
+    }
+    crate::testlog::record("windows", "bring_to_front_20", serde_json::json!({"failures": failures.len()}));
+    if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) }
+}
+
+fn windows_minimized_window_is_restored_and_receives_text(_lab: &Lab) -> Result<(), String> {
+    fresh_notepad_tab()?;
+    ensure_app("calculator", "calculator")?;
+    let notepad = app_window("notepad").ok_or("no notepad")?;
+    minimize(notepad as _);
+    std::thread::sleep(Duration::from_millis(500));
+    act(A::FocusWindow { name: "notepad".into() })?;
+    if !desktop_target::foreground_title().to_lowercase().contains("notepad") {
+        return Err("the minimized Notepad was not brought to the front".into());
+    }
+    type_text("restored and typed")?;
+    expect_on_screen("restored and typed")
+}
+
+fn windows_text_goes_only_to_the_window_in_front(_lab: &Lab) -> Result<(), String> {
+    // Notepad holds a marker; Calculator is in front when text is sent: the text must not land in Notepad.
+    fresh_notepad_tab()?;
+    type_text("marker-one")?;
+    ensure_app("calculator", "calculator")?;
+    press("escape")?;
+    type_text("7*6=")?;
+    expect_on_screen("42").or_else(|_| expect_on_screen("display is 42"))?;
+    ensure_app("notepad", "notepad")?;
+    let text = crate::agent::visible_text_snapshot()?.join(" ");
+    if text.contains("7*6") || text.contains("marker-one7") {
+        return Err("text meant for Calculator reached Notepad".into());
+    }
+    Ok(())
+}
+
+fn windows_move_resize_snap_with_readback(_lab: &Lab) -> Result<(), String> {
+    use crate::desktop::windowops::perform;
+    use crate::input::WindowCommand as C;
+    ensure_app("calculator", "calculator")?;
+    perform(C::Restore, Some("calculator"), None, None, None, None, None)?;
+    let window = app_window("calculator").ok_or("no calculator")? as windows_sys::Win32::Foundation::HWND;
+    perform(C::Move, Some("calculator"), Some(120), Some(90), None, None, None)?;
+    let (l, t, _, _) = desktop_target::visible_bounds(window).ok_or("no bounds")?;
+    if (l - 120).abs() > 1 || (t - 90).abs() > 1 {
+        return Err(format!("moved to ({l}, {t}), asked (120, 90)"));
+    }
+    perform(C::Snap, Some("calculator"), None, None, None, None, Some("left"))?;
+    let area = crate::desktop::layout::work_area_of(window).ok_or("no work area")?;
+    let (l, t, _, b) = desktop_target::visible_bounds(window).ok_or("no bounds")?;
+    if (l - area.0).abs() > 1 || (t - area.1).abs() > 1 || (b - area.3).abs() > 2 {
+        return Err(format!("snap left left the window at ({l},{t})-({b}), work area {area:?}"));
+    }
+    Ok(())
+}
+
+fn windows_two_window_tiling_is_exact(_lab: &Lab) -> Result<(), String> {
+    two_apps_open()?;
+    let handles: Vec<windows_sys::Win32::Foundation::HWND> = ["notepad", "calculator"].iter().filter_map(|n| app_window(n)).map(|h| h as _).collect();
+    if handles.len() != 2 {
+        return Err("need both windows".into());
+    }
+    let placements = crate::desktop::layout::apply(&handles, "columns", 4)?;
+    for (i, placed) in placements.iter().enumerate() {
+        // Calculator has a minimum size and may refuse a narrow tile: that must be reported, not hidden.
+        if !placed.exact(2) && !placed.refused_size() {
+            return Err(format!("window {i}: wanted {:?}, got {:?}", placed.wanted, placed.got));
+        }
+    }
+    crate::testlog::record("windows", "tile2", serde_json::json!({"placements": placements.iter().map(|p| format!("{:?}->{:?}", p.wanted, p.got)).collect::<Vec<_>>()}));
+    Ok(())
+}
+
+fn windows_closed_window_is_refused_before_any_input(_lab: &Lab) -> Result<(), String> {
+    ensure_app("calculator", "calculator")?;
+    let id = registry_window("calculator").ok_or("calculator not in registry")?.id;
+    let calc = app_window("calculator").ok_or("no calculator")?;
+    desktop_target::close_window(calc);
+    if !wait_until(4000, || app_window("calculator").is_none()) {
+        return Err("the test Calculator did not close".into());
+    }
+    let snapshot = crate::desktop::registry::refresh();
+    match crate::desktop::registry::check_target(&snapshot, &id) {
+        Err(reason) if reason.contains("no longer exists") => Ok(()),
+        other => Err(format!("an action aimed at the closed window {id} was not refused: {other:?}")),
+    }
+}
+
+fn windows_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
+    vec![
+        ("windows", "registry matches the desktop, ids are stable", windows_registry_matches_the_desktop),
+        ("windows", "opened and minimized windows are reported", windows_changes_are_reported),
+        ("windows", "bring to front 20 times, Notepad and Calculator", windows_bring_to_front_twenty_times),
+        ("windows", "a minimized window is restored and gets the text", windows_minimized_window_is_restored_and_receives_text),
+        ("windows", "text goes only to the window in front", windows_text_goes_only_to_the_window_in_front),
+        ("windows", "move, resize and snap are read back", windows_move_resize_snap_with_readback),
+        ("windows", "two windows tile side by side", windows_two_window_tiling_is_exact),
+        ("windows", "a closed window is refused before input", windows_closed_window_is_refused_before_any_input),
+    ]
+}
+
 fn load_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
     vec![
         ("load", "1 s spinner: no early action", load_one_second_spinner),
@@ -1953,7 +2127,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
         None => true,
     };
     let lab_cases: Vec<_> = cases().into_iter().filter(|(g, n, _)| selected(g, n)).collect();
-    let driver_selected: Vec<_> = driver_cases().into_iter().chain(draw_cases()).chain(load_cases()).filter(|(g, n, _)| selected(g, n)).collect();
+    let driver_selected: Vec<_> = driver_cases().into_iter().chain(draw_cases()).chain(load_cases()).chain(windows_cases()).filter(|(g, n, _)| selected(g, n)).collect();
     let app_cases: Vec<_> = driver_selected.into_iter().chain(body_cases().into_iter().filter(|(g, n, _)| selected(g, n))).chain(native_cases().into_iter().filter(|(g, n, _)| selected(g, n))).collect();
     if lab_cases.is_empty() && app_cases.is_empty() {
         return Err("no case matches that filter".into());
@@ -1970,7 +2144,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
     let mut results = Vec::new();
     let mut lab_open = !lab_cases.is_empty();
     for (group, name, case) in lab_cases.into_iter().chain(app_cases) {
-        if group != "native" && group != "driver" && group != "body" && group != "draw" && group != "load" {
+        if group != "native" && group != "driver" && group != "body" && group != "draw" && group != "load" && group != "windows" {
             // lab case: nothing to close
         } else if lab_open {
             // Close the lab tab before the real-application cases.
@@ -1984,8 +2158,8 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
             trail.clear();
         }
         let started = Instant::now();
-        let outcome = if group == "native" || group == "driver" || group == "body" || group == "draw" || group == "load" { case(&lab) } else { lab.reset().and_then(|_| case(&lab)) };
-        if group == "driver" || group == "body" || group == "draw" || group == "load" {
+        let outcome = if group == "native" || group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" { case(&lab) } else { lab.reset().and_then(|_| case(&lab)) };
+        if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" {
             let _ = press("escape");
             close_fixture_tab();
         }
@@ -1997,7 +2171,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
             millis: started.elapsed().as_millis(),
             detail: outcome
                 .err()
-                .map(|e| if group == "driver" || group == "body" || group == "draw" || group == "load" { format!("{e} [orders: {}]", trail_text()) } else { e })
+                .map(|e| if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" { format!("{e} [orders: {}]", trail_text()) } else { e })
                 .unwrap_or_default(),
         };
         progress(&result);
