@@ -592,6 +592,18 @@ fn drag_right_to_left(lab: &Lab) -> Result<(), String> {
     let (x, y) = lab.center("thumb")?;
     act(A::DragAndDrop { from_x: x, from_y: y, to_x: x + (200.0 * lab.dpr) as i32, to_y: y, duration_ms: 300, hold_keys: vec![] })?;
     expect_number("slider", "about 200", |v| v >= 170.0)?;
+    // The page reports positions every 250 ms: wait until the reported thumb is where the slider
+    // value says, or the second drag presses on the thumb's old place and moves nothing.
+    let thumb_reported_at_value = || {
+        let value = fx::state("slider").and_then(|v| v.parse::<f64>().ok());
+        match (fx::rect("thumb"), fx::rect("track"), value) {
+            (Some(thumb), Some(track), Some(value)) => ((thumb[0] - track[0]) - value).abs() <= 2.0,
+            _ => false,
+        }
+    };
+    if !wait_until(2000, thumb_reported_at_value) {
+        return Err("the page never reported the thumb's new position".into());
+    }
     let (x2, y2) = lab.center("thumb")?;
     act(A::DragAndDrop { from_x: x2, from_y: y2, to_x: x2 - (120.0 * lab.dpr) as i32, to_y: y2, duration_ms: 300, hold_keys: vec![] })?;
     expect_number("slider", "about 80", |v| (60.0..=100.0).contains(&v)).map(|_| ())
