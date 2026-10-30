@@ -477,9 +477,9 @@ mod tests {
             store.add("slow", When::Every { seconds: 1 }, overlap, Missed::Skip, false, now_ms(), 0).unwrap();
             let store = Arc::new(Mutex::new(store));
             let changed = Arc::new(tokio::sync::Notify::new());
-            // Each run takes 2.2 s against a 1 s interval; watch for 4.3 s.
+            // Each run takes 2.2 s against a 1 s interval; watch for 6 s: Skip runs at 1 s and 4 s (2), QueueOne also at 3.2 s and 5.4 s (3).
             let task = tokio::spawn(run_forever(dir.clone(), store, changed, counting_runner(Arc::clone(&counter), 2200), Arc::new(|| None)));
-            tokio::time::sleep(Duration::from_millis(4300)).await;
+            tokio::time::sleep(Duration::from_millis(6000)).await;
             let runs = counter.load(std::sync::atomic::Ordering::SeqCst);
             assert_eq!(runs, expected, "{overlap:?}");
             task.abort();

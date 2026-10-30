@@ -55,6 +55,7 @@ enum Command {
     Run,
     Eval,
     Conformance,
+    Daemon,
 }
 
 struct Args {
@@ -78,6 +79,7 @@ fn parse_args() -> Result<Args, String> {
         Some("run") => Command::Run,
         Some("eval") => Command::Eval,
         Some("conformance") => Command::Conformance,
+        Some("daemon") => Command::Daemon,
         _ => return Err(usage()),
     };
     let mut args = Args {
@@ -129,6 +131,9 @@ fn usage() -> String {
 #[tokio::main]
 async fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.first().map(String::as_str) == Some("schedule") {
+        std::process::exit(agent_aura_lib::schedule_cli::schedule_command(&raw[1..]));
+    }
     if raw.first().map(String::as_str) == Some("control") {
         // Talks to a running `aura-cli run` (or the app) through its local control port.
         let port = std::env::var("AURA_CONTROL_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(47_900u16);
@@ -212,6 +217,10 @@ It drives the real screen through the default browser; press Esc to stop.
         }
     }
     let host = Host::new(CliHost { auto_answer: args.auto_approve });
+    if args.command == Command::Daemon {
+        agent_aura_lib::schedule_cli::run_daemon(runtime, host).await;
+        return;
+    }
     if args.command == Command::Eval {
         println!("suite: {} (tasks open and close real windows; press Esc to stop)\n", args.suite);
         let rounds = args.repeat.max(1);

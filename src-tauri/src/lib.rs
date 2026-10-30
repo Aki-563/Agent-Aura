@@ -23,6 +23,8 @@ pub mod recipe;
 pub mod reliability;
 pub mod settle;
 pub mod settings;
+pub mod schedule;
+pub mod schedule_cli;
 pub mod sound;
 pub mod testlog;
 pub mod trace;
