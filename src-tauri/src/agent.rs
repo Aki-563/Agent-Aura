@@ -3872,7 +3872,8 @@ fn check_targets_unchanged(targets: &[ExpectedTarget], window: &WindowContext) -
             eprintln!("guard: target {target:?}; {} elements now; same label: {same:?}", now.len());
         }
     }
-    for target in targets {
+    // The taskbar is not part of the window: its buttons are checked by the pointer guard only.
+    for target in targets.iter().filter(|t| !t.label.starts_with("taskbar ")) {
         match target_moved(target, &now) {
             TargetState::Fine => {}
             TargetState::MovedTo(x, y) => {
@@ -4019,7 +4020,12 @@ fn body_feedback(windows_before: &[(isize, String)], typed_text: bool, scroll: O
     if let Some(change) = desktop_target::describe_window_changes(windows_before) {
         parts.push(change);
     }
-    if let Some((focus, takes_text)) = crate::perception::focused_element_summary() {
+    // UI Automation sometimes has no answer right after a focus change: ask once more.
+    let focus = crate::perception::focused_element_summary().or_else(|| {
+        std::thread::sleep(Duration::from_millis(150));
+        crate::perception::focused_element_summary()
+    });
+    if let Some((focus, takes_text)) = focus {
         parts.push(focus);
         if typed_text && !takes_text {
             parts.push("WARNING: the keyboard focus is not on a text field, so the typed text probably went nowhere or triggered shortcuts; click the field first".to_owned());

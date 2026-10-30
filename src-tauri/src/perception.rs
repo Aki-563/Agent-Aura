@@ -334,7 +334,7 @@ fn taskbar_candidates(active: isize, origin_x: i32, origin_y: i32, width: u32, h
     for candidate in &mut found {
         candidate.label = format!("taskbar {}", candidate.label.trim());
     }
-    found.truncate(24);
+    found.truncate(10);
     found
 }
 

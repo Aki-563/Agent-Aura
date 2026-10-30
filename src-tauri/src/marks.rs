@@ -112,6 +112,8 @@ pub fn select_elements(
                 return None;
             }
             let priority = match c.source {
+                // The taskbar is offered, but never at the cost of the app's own controls.
+                _ if c.label.starts_with("taskbar ") => 3,
                 _ if is_chrome(&c.label, c.control_type.as_deref()) => 3,
                 CandidateSource::VisualAnchor => 0,
                 CandidateSource::UiAutomation if is_interactive(c.control_type.as_deref()) => 0,
