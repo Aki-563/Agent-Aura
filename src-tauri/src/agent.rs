@@ -726,6 +726,50 @@ impl HostBackend for UnattendedBackend {
     }
 }
 
+/// The app's real host (panel, events to the page) that also writes every event to a log file.
+/// Used by the self-test: `AURA_SELFTEST_TASK="open notepad" agent-aura.exe` runs that task
+/// through exactly the path the Run button uses and logs to `%LOCALAPPDATA%\AgentAura\selftest.log`.
+struct LoggingBackend(TauriBackend, std::path::PathBuf);
+
+impl HostBackend for LoggingBackend {
+    fn emit_value(&self, event: &str, payload: Value) {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&self.1) {
+            let mut text = payload.to_string();
+            if text.len() > 300 {
+                text = text.chars().take(300).collect();
+            }
+            let _ = writeln!(file, "{} {event} {text}", crate::schedule::now_ms());
+        }
+        self.0.emit_value(event, payload);
+    }
+    fn enter_run_mode(&self) {
+        self.log("enter_run_mode begin");
+        self.0.enter_run_mode();
+        self.log("enter_run_mode end");
+    }
+    fn leave_run_mode(&self) {
+        self.0.leave_run_mode();
+        self.log("leave_run_mode");
+    }
+    fn move_panel_away(&self, points: &[(i32, i32)]) -> bool {
+        self.0.move_panel_away(points)
+    }
+}
+
+impl LoggingBackend {
+    fn log(&self, line: &str) {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&self.1) {
+            let _ = writeln!(file, "{} {line}", crate::schedule::now_ms());
+        }
+    }
+}
+
+pub fn selftest_host(window: WebviewWindow, log: std::path::PathBuf) -> Host {
+    Host::new(LoggingBackend(TauriBackend { window, saved_layout: Mutex::new(None) }, log))
+}
+
 pub fn unattended_host(window: WebviewWindow) -> Host {
     Host::new(UnattendedBackend(TauriBackend { window, saved_layout: Mutex::new(None) }))
 }
@@ -1826,6 +1870,8 @@ async fn request_confirmation(
         Err(_) => return false,
     }
     let _ = window.emit("agent-confirm", json!({"id": id, "message": question, "kind": kind}));
+    // The run is waiting for the person: say so out loud so a collapsed player cannot hide it.
+    crate::voice::announce(if kind == "help" { "I need your help to continue." } else { "I need your approval to continue." });
     let answer = tokio::select! {
         reply = receiver => reply.unwrap_or(false),
         _ = wait_for_kill() => false,
@@ -2421,7 +2467,9 @@ USER:
     let impact = effective_impact(&proposal);
     // A consequential action the task did not clearly ask for is not rejected outright: the user
     // is asked, because the model may well be right.
-    let confirm = (!explicit_impact_authorized(task, &impact)).then(|| {
+    // Actions that send no input (wait, note, look closer) cannot cause an effect, whatever
+    // impact a small model labels them with, so they never need approval.
+    let confirm = (!proposal.action.sends_no_input() && !matches!(proposal.action, ActionPrimitive::Done { .. } | ActionPrimitive::Fail { .. } | ActionPrimitive::WaitSettle { .. }) && !explicit_impact_authorized(task, &impact)).then(|| {
         format!(
             "The agent wants to {}. Why: {}. This looks like a {:?} action that your task did not clearly ask for.",
             describe_action_text(&proposal.action),

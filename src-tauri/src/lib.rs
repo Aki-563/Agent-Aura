@@ -123,6 +123,46 @@ pub fn run() {
             // Saved schedules run while the app is open (idle between runs: nothing captured).
             schedule_app::start(app.handle().clone());
 
+            // Self-test: run one task through the same path as the Run button and log what happens.
+            if let Ok(task) = std::env::var("AURA_SELFTEST_TASK") {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let log = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir).join("AgentAura").join("selftest.log");
+                    let _ = std::fs::write(&log, "");
+                    let Some(window) = handle.get_webview_window("main") else { return };
+                    let state = handle.state::<agent::AgentRuntime>();
+                    // Where are Aura's own windows (panel, glow overlay) while the run is going?
+                    let dump_log = log.clone();
+                    std::thread::spawn(move || {
+                        use std::io::Write;
+                        std::thread::sleep(std::time::Duration::from_secs(8));
+                        unsafe extern "system" fn each(hwnd: windows_sys::Win32::Foundation::HWND, lparam: isize) -> i32 {
+                            use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible};
+                            let mut pid = 0u32;
+                            GetWindowThreadProcessId(hwnd, &mut pid);
+                            if pid == std::process::id() {
+                                let mut class = [0u16; 80];
+                                let n = GetClassNameW(hwnd, class.as_mut_ptr(), 80) as usize;
+                                let mut r = std::mem::zeroed();
+                                GetWindowRect(hwnd, &mut r);
+                                let lines = &mut *(lparam as *mut Vec<String>);
+                                lines.push(format!("window class={} visible={} rect=({},{} {}x{})", String::from_utf16_lossy(&class[..n]), IsWindowVisible(hwnd), r.left, r.top, r.right - r.left, r.bottom - r.top));
+                            }
+                            1
+                        }
+                        let mut lines: Vec<String> = Vec::new();
+                        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::EnumWindows(Some(each), &mut lines as *mut _ as isize) };
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&dump_log) {
+                            for l in lines { let _ = writeln!(f, "OWN {l}"); }
+                        }
+                    });
+                    let host = agent::selftest_host(window, log.clone());
+                    let outcome = agent::execute_run(&state, &host, task, 6).await;
+                    let _ = std::fs::write(log.with_extension("result"), format!("{outcome:?}"));
+                });
+            }
+
             Ok(())
         })
         .run(tauri::generate_context!())

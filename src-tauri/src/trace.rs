@@ -49,8 +49,11 @@ pub fn mask_secrets(text: &str) -> String {
         index += piece.len() + 1;
         let has_digit = piece.chars().any(|c| c.is_ascii_digit());
         let has_alpha = piece.chars().any(|c| c.is_ascii_alphabetic());
+        // Real keys mix upper and lower case with digits; model names ("gui-owl-1.5-2b-instruct-mlx")
+        // and file names are lower case and must stay readable in a trace.
+        let mixed_case = piece.chars().any(|c| c.is_ascii_uppercase()) && piece.chars().any(|c| c.is_ascii_lowercase());
         let known = piece.starts_with("sk-") || piece.starts_with("ghp_") || piece.starts_with("xox") || piece.starts_with("eyJ") || piece.starts_with("AKIA");
-        if piece.len() >= 24 && has_digit && has_alpha || (known && piece.len() >= 12) {
+        if piece.len() >= 24 && has_digit && has_alpha && (mixed_case || piece.len() >= 40) || (known && piece.len() >= 12) {
             if let Some(range) = hidden.get_mut(start..start + piece.len()) {
                 range.iter_mut().for_each(|f| *f = true);
             }
@@ -227,6 +230,7 @@ mod tests {
         let long_token = mask_secrets("key=AbCdEfGhIjKlMnOpQrStUvWx12345 end");
         assert!(!long_token.contains("AbCdEf") && long_token.ends_with(" end"), "{long_token}");
         assert_eq!(mask_secrets("a window title with ünïcode 日本語"), "a window title with ünïcode 日本語");
+        assert_eq!(mask_secrets(r#"{"model":"gui-owl-1.5-2b-instruct-mlx"}"#), r#"{"model":"gui-owl-1.5-2b-instruct-mlx"}"#);
     }
 
     #[test]
