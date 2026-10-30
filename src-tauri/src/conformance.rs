@@ -1591,6 +1591,13 @@ fn now_epoch_ms() -> u64 {
 /// wait did not end before the content appeared: the next screenshot must show the loaded page.
 fn load_and_check(delay_ms: u64, kind: &str) -> Result<(), String> {
     open_page(&format!("/load?delay={delay_ms}&kind={kind}"), "Load")?;
+    // Under load (or when another program grabs the focus) the page may not be in front.
+    if !desktop_target::foreground_title().contains("Aura Fixture") {
+        if let Some(window) = desktop_target::find_window_by_name("Aura Fixture") {
+            desktop_target::bring_to_front(window);
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
     let effect = go(Order::Click("Load data"))?;
     let returned_at = now_epoch_ms();
     let ready = fx::state("ready").and_then(|v| v.parse::<u64>().ok());

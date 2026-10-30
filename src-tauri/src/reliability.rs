@@ -367,6 +367,20 @@ pub fn explicit_impact_authorized(task: &str, impact: &ImpactClass) -> bool {
 }
 
 pub fn effective_impact(proposal: &ActionProposal) -> ImpactClass {
+    // Editing and navigation keys, pointer moves and waiting cannot delete files, pay or send
+    // anything, whatever a small model labels them: a "Destructive" backspace would only ask the
+    // person to approve correcting a typo.
+    let harmless = match &proposal.action {
+        ActionPrimitive::KeyPress { key } => matches!(
+            key.trim().to_lowercase().as_str(),
+            "backspace" | "left" | "right" | "up" | "down" | "home" | "end" | "pageup" | "pagedown" | "tab" | "escape" | "esc" | "shift" | "ctrl" | "alt" | "capslock"
+        ),
+        ActionPrimitive::MouseMove { .. } | ActionPrimitive::Hover { .. } | ActionPrimitive::Scroll { .. } | ActionPrimitive::ScrollFine { .. } | ActionPrimitive::WaitSettle { .. } => true,
+        _ => false,
+    };
+    if harmless {
+        return ImpactClass::Routine;
+    }
     if proposal.impact != ImpactClass::Routine {
         return proposal.impact.clone();
     }
@@ -626,5 +640,27 @@ mod tests {
             target_window: None,
         };
         assert_eq!(effective_impact(&proposal), ImpactClass::Destructive);
+    }
+
+    #[test]
+    fn a_model_cannot_make_a_backspace_or_a_scroll_a_risky_action() {
+        let mut proposal = ActionProposal {
+            step_id: 1,
+            previous_outcome: crate::reliability::StepOutcome::NotApplicable,
+            reflection: String::new(),
+            thought: "Delete the extra character".into(),
+            target: TargetDescriptor::default(),
+            expected_outcome: String::new(),
+            action: ActionPrimitive::KeyPress { key: "Backspace".into() },
+            confidence: 1.0,
+            impact: ImpactClass::Destructive,
+            voice_command: None,
+            target_window: None,
+        };
+        assert_eq!(effective_impact(&proposal), ImpactClass::Routine);
+        proposal.action = ActionPrimitive::KeyPress { key: "delete".into() };
+        assert_eq!(effective_impact(&proposal), ImpactClass::Destructive, "the Delete key can remove files");
+        proposal.action = ActionPrimitive::Scroll { clicks: 3, x: None, y: None, horizontal: false };
+        assert_eq!(effective_impact(&proposal), ImpactClass::Routine);
     }
 }
