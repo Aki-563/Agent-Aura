@@ -1576,7 +1576,7 @@ async fn autonomous_loop(
         set_hud(state, HudState::Settling);
         emit_status(window, "settling", step_number, "Waiting for the screen to react");
         let settle_monitor = encoded.monitor_index;
-        let settle_profile = SettleProfile::for_action(&final_action);
+        let settle_profile = SettleProfile::for_action(&final_action).scaled(crate::profiles::settle_factor(&encoded.process_name(), &encoded.window.title));
         let baseline = Arc::clone(&encoded.rgba);
         let settle_started = Instant::now();
         let effect_report: Option<EffectReport> = match tokio::task::spawn_blocking(move || {
@@ -2270,6 +2270,10 @@ STUCK WARNING: your last {} actions changed nothing on screen. Do NOT repeat the
     if let Some(note) = crate::system_state::accessibility().prompt_note() {
         control_text = format!("{control_text}\n{note}").trim().to_owned();
     }
+    let app_tips = crate::profiles::prompt_tips(&capture.process_name(), &capture.window.title);
+    if !app_tips.is_empty() {
+        control_text = format!("{control_text}\n{app_tips}").trim().to_owned();
+    }
     let control_section = if control_text.is_empty() { String::new() } else { format!("\n\n{control_text}") };
     // The window-state block goes with every screenshot (HARNESS_COMPLETION_PLAN.md §H3): the
     // model always knows how many windows exist, which is active, and what the image covers.
@@ -2803,6 +2807,14 @@ struct EncodedCapture {
 
 impl EncodedCapture {
     /// Physical (width, height, left, top) the image maps onto: the zoom region, or the monitor.
+    /// Lower-case executable name of the window this capture is about (empty when unknown).
+    fn process_name(&self) -> String {
+        if self.window.hwnd == 0 {
+            return String::new();
+        }
+        desktop_target::process_name_of(self.window.hwnd as _)
+    }
+
     fn map_target(&self) -> (u32, u32, i32, i32) {
         match self.zoom {
             Some((x, y, w, h)) => (w, h, x, y),

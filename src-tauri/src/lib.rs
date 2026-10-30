@@ -18,6 +18,7 @@ mod loop_tests;
 pub mod model_schema;
 pub mod overlay;
 pub mod perception;
+pub mod profiles;
 pub mod radar;
 pub mod recipe;
 pub mod reliability;
