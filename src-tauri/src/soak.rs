@@ -69,8 +69,17 @@ pub fn run(minutes: u64) -> i32 {
     let mut samples = vec![sample()];
     let (mut cycles, mut failed_cases, mut total_cases) = (0u32, 0u32, 0u32);
     let mut first_failures: Vec<String> = Vec::new();
+    let mut locked_seconds = 0u64;
     while Instant::now() < deadline && !crate::input::killswitch::is_killed() {
+        // A locked PC (or a UAC prompt) cannot be driven: wait for it instead of counting the
+        // refusals as failures, and say how long it was.
+        if crate::system_state::secure_desktop_active() {
+            std::thread::sleep(Duration::from_secs(5));
+            locked_seconds += 5;
+            continue;
+        }
         cycles += 1;
+        let failed_before = (failed_cases, first_failures.len());
         match crate::conformance::run(Some("group:click,type,key,scroll"), |_| {}) {
             Ok(results) => {
                 total_cases += results.len() as u32;
@@ -89,6 +98,13 @@ pub fn run(minutes: u64) -> i32 {
                 std::thread::sleep(Duration::from_secs(10));
             }
         }
+        if crate::system_state::secure_desktop_active() {
+            // The PC locked during this cycle: its failures say nothing about the harness.
+            failed_cases = failed_before.0;
+            first_failures.truncate(failed_before.1);
+            cycles -= 1;
+            continue;
+        }
         let now = sample();
         crate::testlog::record("soak", "cycle", json!({"cycle": cycles, "working_set_mb": now.working_set_mb, "handles": now.handles, "gdi": now.gdi_objects, "user": now.user_objects, "failed_total": failed_cases}));
         samples.push(now);
@@ -99,7 +115,7 @@ pub fn run(minutes: u64) -> i32 {
     }
     match (&leak, failed_cases) {
         (None, 0) => {
-            println!("SOAK PASSED: {cycles} cycles, {total_cases} cases, no failures, no leak ({:.0} MB, {} handles at the end)", samples.last().map_or(0.0, |s| s.working_set_mb), samples.last().map_or(0, |s| s.handles));
+            println!("SOAK PASSED: {cycles} cycles, {total_cases} cases, no failures, no leak ({:.0} MB, {} handles at the end; PC locked for {locked_seconds} s)", samples.last().map_or(0.0, |s| s.working_set_mb), samples.last().map_or(0, |s| s.handles));
             0
         }
         _ => {

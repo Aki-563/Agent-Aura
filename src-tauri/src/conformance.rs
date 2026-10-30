@@ -1077,6 +1077,21 @@ fn native_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
 }
 
 /// Closes windows opened during the native cases, clearing text first so no test text lingers.
+/// Closes test-page windows left over from an earlier run or an earlier soak cycle. Only windows
+/// whose title is "Aura Fixture ..." in a browser are touched (the test pages are the only ones
+/// with that title), so a stale, scrolled or moved page can never be mistaken for the new one.
+fn close_leftover_fixture_windows() {
+    for window in desktop_target::list_candidate_windows() {
+        let hwnd = window as windows_sys::Win32::Foundation::HWND;
+        let title = desktop_target::title_of(hwnd);
+        let program = desktop_target::process_name_of(hwnd);
+        if title.starts_with("Aura Fixture") && ["chrome.exe", "msedge.exe"].contains(&program.as_str()) {
+            desktop_target::close_window(window);
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+}
+
 fn close_new_windows(before: &[isize]) {
     // Only windows the tests themselves open are closed: Notepad, Calculator and the test pages. A
     // browser window or anything else that appeared is never touched.
@@ -2545,6 +2560,7 @@ fn setup() -> Result<Lab, String> {
     }
     fx::clear();
     fx::clear_rects();
+    close_leftover_fixture_windows();
     match BROWSER.lock().ok().and_then(|b| b.clone()) {
         Some(program) => open_in_new_browser_window(&program, LAB_URL)?,
         None => act(A::OpenUrl { url: LAB_URL.into() })?,
@@ -2681,6 +2697,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
         let _ = hotkey(&["ctrl", "w"]);
     }
     close_new_windows(&windows_before);
+    close_leftover_fixture_windows();
     Ok(results)
 }
 
