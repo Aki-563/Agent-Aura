@@ -1,0 +1,13 @@
+# Agent Aura — Cursor Rules
+
+You are working on Agent Aura, a high-performance, human-like desktop computer-use agent.
+
+CRITICAL INSTRUCTIONS:
+- You MUST read the specification suite in `docs/` before generating code:
+  1. `docs/PROGRESS_TRACKER.md` (Check active phase/milestone)
+  2. `docs/CORE.md` (Architecture, coordinates, actuation)
+  3. `docs/FEATURES.md` (Speed & Human-like features)
+  4. `docs/IMPLEMENTATION_PLAN.md` (Phased implementation roadmap)
+- Tech Stack: 100% Rust backend + Tauri v2 host (Windows x64).
+- Never use Python exec() or blind macros.
+- Keep `docs/PROGRESS_TRACKER.md` updated as you complete tasks.

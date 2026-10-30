@@ -1,0 +1,20 @@
+# Build output
+/src-tauri/target/
+/src-tauri/target-llvm/
+/.target-test/
+/dist/
+/ui/dist/
+
+# Dependencies
+node_modules/
+
+# Third-party reference checkout (its own git repository)
+/reference/
+
+# Binaries and leftovers from the old GNU toolchain workaround
+*.exe
+*.lib
+*.a
+*.log
+agent-aura-crash.log
+__pycache__/

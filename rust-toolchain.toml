@@ -1,0 +1,4 @@
+# Tauri on Windows is built with the MSVC toolchain (needs VS 2022 Build Tools:
+# "Desktop development with C++" workload incl. a Windows 11 SDK).
+[toolchain]
+channel = "stable-x86_64-pc-windows-msvc"
