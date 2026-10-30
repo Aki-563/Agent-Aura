@@ -30,6 +30,7 @@ pub mod testlog;
 pub mod trace;
 pub mod vault;
 pub mod voice;
+pub mod workers;
 
 /// Per-monitor DPI awareness must be set before any window is created or any screen metric is
 /// read. Otherwise Windows reports virtualized (scaled-down) sizes, so the HUD overlay covered only

@@ -56,6 +56,7 @@ enum Command {
     Eval,
     Conformance,
     Daemon,
+    Parallel,
 }
 
 struct Args {
@@ -71,6 +72,8 @@ struct Args {
     task: String,
     max_steps: u32,
     auto_approve: bool,
+    windows: Vec<String>,
+    model_slots: usize,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -80,6 +83,7 @@ fn parse_args() -> Result<Args, String> {
         Some("eval") => Command::Eval,
         Some("conformance") => Command::Conformance,
         Some("daemon") => Command::Daemon,
+        Some("parallel") => Command::Parallel,
         _ => return Err(usage()),
     };
     let mut args = Args {
@@ -95,6 +99,8 @@ fn parse_args() -> Result<Args, String> {
         task: String::new(),
         max_steps: 20,
         auto_approve: false,
+        windows: Vec::new(),
+        model_slots: 2,
     };
     while let Some(flag) = raw.next() {
         let mut value = || raw.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -108,10 +114,15 @@ fn parse_args() -> Result<Args, String> {
             "--browser" => args.browser = Some(value()?),
             "--repeat" => args.repeat = value()?.parse().map_err(|_| "--repeat must be a number".to_owned())?,
             "--max-steps" => args.max_steps = value()?.parse().map_err(|_| "--max-steps must be a number".to_owned())?,
+            "--window" => args.windows.push(value()?),
+            "--model-slots" => args.model_slots = value()?.parse().map_err(|_| "--model-slots must be a number".to_owned())?,
             "--openai" => args.openai = true,
             "--auto-approve" => args.auto_approve = true,
             other => return Err(format!("unknown option {other}\n{}", usage())),
         }
+    }
+    if args.command == Command::Parallel && args.windows.is_empty() {
+        return Err(format!("parallel needs one or more --window \"name=task\"\n{}", usage()));
     }
     if args.command != Command::Conformance && (args.model.is_empty() || (args.command == Command::Run && args.task.is_empty())) {
         return Err(format!("--model is required (and --task for `run`)\n{}", usage()));
@@ -121,7 +132,7 @@ fn parse_args() -> Result<Args, String> {
 
 fn usage() -> String {
     "usage: aura-cli run  --model <id> --task <text> [--url <base url>] [--openai] [--key <api key>] \
-     [--max-steps <n>] [--auto-approve]\n       aura-cli conformance [--only <group or name>]
+     [--max-steps <n>] [--auto-approve]\n       aura-cli parallel --model <id> --window \"Notepad=type hello\" --window \"Calculator=compute 6*7\" [--model-slots <n>]\n       aura-cli conformance [--only <group or name>]
        aura-cli eval --model <id> [--suite basic|intermediate|all] \
      [--only <task id>] [--repeat <n>] [--url <base url>] [--openai] [--key <api key>]\n       \
      (the key can also come from AURA_API_KEY or OPENAI_API_KEY)"
@@ -217,6 +228,32 @@ It drives the real screen through the default browser; press Esc to stop.
         }
     }
     let host = Host::new(CliHost { auto_answer: args.auto_approve });
+    if args.command == Command::Parallel {
+        let mut jobs = Vec::new();
+        for spec in &args.windows {
+            match spec.split_once('=') {
+                Some((window, task)) if !window.trim().is_empty() && !task.trim().is_empty() => jobs.push((window.trim().to_owned(), task.trim().to_owned())),
+                _ => {
+                    eprintln!("--window needs the form \"window name=task\" (got '{spec}')");
+                    std::process::exit(2);
+                }
+            }
+        }
+        println!("{} worker(s); model calls overlap, mouse and keyboard take turns. Press Esc to stop.", jobs.len());
+        match agent_aura_lib::agent::run_window_workers(&runtime, std::sync::Arc::new(host), jobs, args.max_steps, args.model_slots).await {
+            Ok(report) => {
+                for r in &report.results {
+                    println!("worker {}: {} after {} step(s): {}", r.worker + 1, if r.completed { "COMPLETED" } else { "NOT COMPLETED" }, r.steps, r.message);
+                }
+                println!("input overlaps: {}, input turns: {}, waited {} ms, model requests: {}, peak concurrent: {}", report.input_overlaps, report.input_turns, report.input_wait_ms, report.model_requests, report.model_peak_concurrency);
+                std::process::exit(if report.results.iter().all(|r| r.completed) { 0 } else { 1 });
+            }
+            Err(error) => {
+                eprintln!("FAILED: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if args.command == Command::Daemon {
         agent_aura_lib::schedule_cli::run_daemon(runtime, host).await;
         return;

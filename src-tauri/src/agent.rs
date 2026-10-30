@@ -3217,6 +3217,222 @@ fn action_points(actions: &[ActionPrimitive]) -> Vec<(i32, i32)> {
     points
 }
 
+// ---- Parallel window workers (desktop backend for workers.rs) -------------------------------
+
+struct WindowJob {
+    window_name: String,
+    task: String,
+    session: tokio::sync::Mutex<TaskSession>,
+    trace: TraceWriter,
+    step: std::sync::atomic::AtomicU32,
+}
+
+struct DesktopWorkers {
+    client: reqwest::Client,
+    config: ProviderConfig,
+    host: Arc<Host>,
+    jobs: Vec<WindowJob>,
+}
+
+impl DesktopWorkers {
+    /// Points the global target at this worker's window and brings it to the front. Only called
+    /// while holding the input arbiter.
+    async fn take_window(&self, worker: usize) -> Result<(), String> {
+        let name = self.jobs[worker].window_name.clone();
+        tokio::task::spawn_blocking(move || {
+            let hwnd = desktop_target::find_window_by_name(&name).ok_or_else(|| format!("No window matching '{name}' is open."))?;
+            desktop_target::set_target(Some(hwnd));
+            desktop_target::ensure_foreground_ok()
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    fn push_record(&self, session: &mut TaskSession, step: u32, plan: &PlannedAction, obs: &EncodedCapture, outcome: StepOutcome, effect: String) {
+        session.push(StepRecord {
+            step,
+            thought: plan.proposal.thought.clone(),
+            target: plan.proposal.target.clone(),
+            expected_outcome: plan.proposal.expected_outcome.clone(),
+            action: plan.canvas.clone(),
+            outcome,
+            verification_reason: plan.verification.reason.clone(),
+            window_title: obs.window.title.clone(),
+            effect,
+        });
+    }
+}
+
+impl crate::workers::WorkerBackend for DesktopWorkers {
+    type Obs = EncodedCapture;
+    type Plan = PlannedAction;
+
+    fn observe(&self, worker: usize) -> crate::workers::Fut<'_, Result<EncodedCapture, String>> {
+        Box::pin(async move {
+            self.take_window(worker).await?;
+            let mut encoded = tokio::task::spawn_blocking(capture_screen).await.map_err(|e| e.to_string())??;
+            attach_marks(&mut encoded, &self.jobs[worker].task);
+            Ok(encoded)
+        })
+    }
+
+    fn think<'a>(&'a self, worker: usize, obs: &'a EncodedCapture) -> crate::workers::Fut<'a, Result<PlannedAction, String>> {
+        Box::pin(async move {
+            let job = &self.jobs[worker];
+            let step = job.step.load(Ordering::SeqCst) + 1;
+            let step_trace = job.trace.step(step);
+            step_trace.bytes("obs.png", &obs.webp);
+            let session = job.session.lock().await;
+            let mut last_error: Option<String> = None;
+            for attempt in 0..=MAX_FAILED_RETRIES {
+                match propose_and_verify(&self.client, &self.config, &job.task, &session, obs, None, attempt, last_error.as_deref(), &step_trace).await {
+                    Ok(plan) => return Ok(plan),
+                    Err(error) if attempt < MAX_FAILED_RETRIES && !crate::input::killswitch::is_killed() => last_error = Some(error),
+                    Err(error) => return Err(error),
+                }
+            }
+            Err("no plan".to_owned())
+        })
+    }
+
+    fn act(&self, worker: usize, obs: EncodedCapture, plan: PlannedAction) -> crate::workers::Fut<'_, Result<crate::workers::Turn, String>> {
+        Box::pin(async move {
+            use crate::workers::Turn;
+            let job = &self.jobs[worker];
+            let step = job.step.fetch_add(1, Ordering::SeqCst) + 1;
+            let step_trace = job.trace.step(step);
+            step_trace.json("proposal.json", &plan.proposal);
+            step_trace.json("action.json", &plan.physical);
+            let tag = format!("[{}]", job.window_name);
+            emit_status(&self.host, "proposing", step, &format!("{tag} {}", plan.proposal.thought));
+            let mut session = job.session.lock().await;
+            session.apply_previous_outcome(plan.proposal.previous_outcome.clone(), &plan.proposal.reflection);
+            let action = plan.physical.clone();
+            match &action {
+                ActionPrimitive::Note { text } => {
+                    session.add_note(text);
+                    self.push_record(&mut session, step, &plan, &obs, StepOutcome::Succeeded, format!("Note saved: {text}"));
+                    return Ok(Turn::Continue);
+                }
+                ActionPrimitive::AskUser { question } => {
+                    return Ok(Turn::Finished { completed: false, message: format!("needs you: {question}") });
+                }
+                _ => {}
+            }
+            if let Some((completed, message)) = terminal_outcome(std::slice::from_ref(&action)) {
+                if completed {
+                    self.take_window(worker).await?;
+                    let fresh = tokio::task::spawn_blocking(capture_screen).await.map_err(|e| e.to_string())??;
+                    let verdict = check_done(&self.client, &self.config, &session.effective_task(), &session, &fresh, &message).await;
+                    if let Some(check) = verdict.filter(|c| !c.complete) {
+                        self.push_record(&mut session, step, &plan, &obs, StepOutcome::Uncertain, format!("Your claim of being done was REJECTED. Missing: {}.", check.missing));
+                        return Ok(Turn::Continue);
+                    }
+                }
+                return Ok(Turn::Finished { completed, message });
+            }
+            // Back to this worker's window (another worker may have changed what is in front since
+            // this one looked), then the usual guard before any input.
+            self.take_window(worker).await?;
+            let actions = vec![action.clone()];
+            let targets = expected_targets(std::slice::from_ref(&plan.canvas), &actions, &obs.elements);
+            match run_input_guard(&actions, Some(obs.window.clone()), targets).await? {
+                InputGuard::Ready => {}
+                InputGuard::Stale(reason) => {
+                    self.push_record(&mut session, step, &plan, &obs, StepOutcome::Failed, format!("NOT EXECUTED: {reason}. Nothing was clicked or typed. Decide again from the new screenshot."));
+                    return Ok(Turn::Continue);
+                }
+                InputGuard::Covered(_) => {
+                    self.push_record(&mut session, step, &plan, &obs, StepOutcome::Failed, "NOT EXECUTED: another window covers the target. Decide again from the new screenshot.".to_owned());
+                    return Ok(Turn::Continue);
+                }
+            }
+            if matches!(action, ActionPrimitive::TypeText { .. } | ActionPrimitive::TypeWith { .. })
+                && tokio::task::spawn_blocking(crate::perception::focused_is_password).await.unwrap_or(false)
+            {
+                return Ok(Turn::Finished { completed: false, message: "needs you: a password field is focused, type it yourself".to_owned() });
+            }
+            let sentence = crate::voice::sentence(plan.proposal.voice_command.as_deref(), &plan.canvas, &plan.proposal.target.description, None);
+            let _ = self.host.emit("agent-voice", json!({"text": &sentence, "step": step}));
+            let baseline_window_id = desktop_target::effective_foreground().map_or(0, |hwnd| hwnd as isize);
+            let windows_before = desktop_target::window_titles();
+            let typed = matches!(action, ActionPrimitive::TypeText { .. } | ActionPrimitive::TypeWith { .. });
+            let to_run = actions.clone();
+            if let Err(error) = tokio::task::spawn_blocking(move || execute_actions(&to_run)).await.map_err(|e| e.to_string())? {
+                if crate::input::killswitch::is_killed() {
+                    return Ok(Turn::Finished { completed: false, message: "stopped".to_owned() });
+                }
+                self.push_record(&mut session, step, &plan, &obs, StepOutcome::Failed, format!("FAILED: the computer refused this action: {error}."));
+                return Ok(Turn::Continue);
+            }
+            session.record_action(step, describe_action_text(&plan.canvas), crate::reliability::LedgerStatus::Done, is_irreversible(&plan.canvas, &plan.proposal.impact));
+            let (monitor, profile, baseline) = (obs.monitor_index, SettleProfile::for_action(&action), Arc::clone(&obs.rgba));
+            let report = tokio::task::spawn_blocking(move || wait_for_effect_on_monitor(monitor, &baseline, profile, baseline_window_id)).await.ok().and_then(Result::ok);
+            let post = tokio::task::spawn_blocking(capture_screen).await.map_err(|e| e.to_string())??;
+            step_trace.bytes("post.png", &post.webp);
+            let effect = describe_effect(report.as_ref(), crate::settle::effect::is_text_input(&action), &obs.window.title, &post.window.title);
+            let feedback = tokio::task::spawn_blocking(move || body_feedback(&windows_before, typed, None)).await.unwrap_or_default();
+            let effect = format!("{effect}{feedback}");
+            emit_status(&self.host, "result", step, &format!("{tag} {effect}"));
+            self.push_record(&mut session, step, &plan, &obs, StepOutcome::Uncertain, effect);
+            Ok(Turn::Continue)
+        })
+    }
+}
+
+/// Runs one worker per window, each with its own task, at the same time. The model calls overlap;
+/// mouse and keyboard take turns (workers.rs). `jobs` is `(window name, task)`.
+pub async fn run_window_workers(
+    state: &AgentRuntime,
+    host: Arc<Host>,
+    jobs: Vec<(String, String)>,
+    max_steps: u32,
+    max_concurrent_model_calls: usize,
+) -> Result<crate::workers::WorkersReport, String> {
+    if jobs.is_empty() {
+        return Err("Give at least one window and task.".to_owned());
+    }
+    if state.running.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return Err("An autonomous task is already running.".to_owned());
+    }
+    let config = match cloned_config(state) {
+        Ok(config) => config,
+        Err(error) => {
+            state.running.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+    };
+    crate::input::killswitch::KillSwitch::reset();
+    crate::control::begin_run();
+    crate::overlay::cursor::show_working_cursor();
+    set_hud(state, HudState::Working);
+    let run_id = generate_run_id();
+    let built: Vec<WindowJob> = jobs
+        .iter()
+        .enumerate()
+        .map(|(i, (name, task))| {
+            let id = format!("{run_id}-w{}", i + 1);
+            WindowJob {
+                window_name: name.clone(),
+                task: format!("{task}\n\n(You work only inside the window '{name}'. Other windows are handled by other workers; do not touch them.)"),
+                session: tokio::sync::Mutex::new(TaskSession::new(id.clone(), task.clone())),
+                trace: TraceWriter::start(&state.data_root, &id, task, json!({"window": name, "model": &config.model, "workers": jobs.len()})),
+                step: std::sync::atomic::AtomicU32::new(0),
+            }
+        })
+        .collect();
+    let backend = Arc::new(DesktopWorkers { client: state.client.clone(), config, host: Arc::clone(&host), jobs: built });
+    let stop: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(crate::input::killswitch::is_killed);
+    let report = crate::workers::run_workers(backend, jobs.len(), max_steps.clamp(1, 100), max_concurrent_model_calls, stop).await;
+    crate::control::end_run();
+    crate::overlay::cursor::restore();
+    InputActuator::release_all();
+    set_hud(state, HudState::Inactive);
+    state.running.store(false, Ordering::SeqCst);
+    crate::testlog::record("workers", "run", serde_json::to_value(&report).unwrap_or_default());
+    Ok(report)
+}
+
 enum InputGuard {
     Ready,
     Covered(Vec<(i32, i32)>),
