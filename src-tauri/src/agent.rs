@@ -2042,6 +2042,7 @@ async fn request_model(
     let sent_epoch = crate::control::epoch();
     let request = async {
         let mut use_schema = true;
+        let mut transient_attempts = 0usize;
         loop {
             let (url, body) = build_request(
                 config,
@@ -2052,13 +2053,26 @@ async fn request_model(
                 use_schema.then_some(schema),
             );
             MODEL_CALLS.fetch_add(1, Ordering::SeqCst);
-            let response = client
-                .post(&url)
-                .headers(auth_headers(config)?)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|error| format!("Model request failed: {}", explain_request_error(&error)))?;
+            let sent = client.post(&url).headers(auth_headers(config)?).json(&body).send().await;
+            let response = match sent {
+                Ok(response) => response,
+                Err(error) => {
+                    // A dropped connection or a timeout is retried with a growing pause. Only this
+                    // model call is repeated: nothing has been done on the computer yet, so no
+                    // click or keystroke can be doubled.
+                    let allowed = if error.is_timeout() { 1 } else { BACKOFF_MS.len() };
+                    if transient_attempts < allowed {
+                        backoff(transient_attempts).await;
+                        transient_attempts += 1;
+                        continue;
+                    }
+                    return Err(format!(
+                        "Model request failed after {} attempt(s): {}",
+                        transient_attempts + 1,
+                        explain_request_error(&error)
+                    ));
+                }
+            };
             let status = response.status();
             let text = response
                 .text()
@@ -2072,9 +2086,15 @@ async fn request_model(
                 use_schema = false;
                 continue;
             }
+            if is_transient_status(status.as_u16()) && transient_attempts < BACKOFF_MS.len() {
+                backoff(transient_attempts).await;
+                transient_attempts += 1;
+                continue;
+            }
             return Err(format!(
-                "Model server returned HTTP {}: {}",
+                "Model server returned HTTP {}{}: {}",
                 status.as_u16(),
+                if transient_attempts > 0 { format!(" (after {} attempts)", transient_attempts + 1) } else { String::new() },
                 truncate(&text, MAX_ERROR_BODY)
             ));
         }
@@ -2085,6 +2105,25 @@ async fn request_model(
         // A pause or steer abandons the request at once; the loop looks at the screen again.
         _ = crate::control::wait_for_interrupt(sent_epoch) => Err(INTERRUPTED_BY_USER.to_owned()),
     }
+}
+
+/// Pauses before retrying a failed model request: 0.5 s, 1.5 s, 4 s.
+const BACKOFF_MS: [u64; 3] = [500, 1_500, 4_000];
+
+/// HTTP statuses that mean "try again shortly" (the server is busy or restarting), not "your
+/// request is wrong".
+fn is_transient_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// The pause before retry number `attempt` (tests shrink it with AURA_BACKOFF_SCALE).
+fn backoff_delay(attempt: usize) -> Duration {
+    let scale = std::env::var("AURA_BACKOFF_SCALE").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0);
+    Duration::from_millis((BACKOFF_MS[attempt.min(BACKOFF_MS.len() - 1)] as f64 * scale) as u64)
+}
+
+async fn backoff(attempt: usize) {
+    tokio::time::sleep(backoff_delay(attempt)).await;
 }
 
 const INTERRUPTED_BY_USER: &str = "INTERRUPTED: the user paused or steered the run while the model was answering";

@@ -374,3 +374,78 @@ async fn a_stop_racing_the_model_answer_never_lets_the_answer_run() {
         assert_eq!(outcome.response.steps_executed, 0, "stop at {after_ms} ms: the answer must not run");
     }
 }
+
+// ---------------------------------------------------------------- API failures (§H6)
+
+fn quick_backoff() {
+    std::env::set_var("AURA_BACKOFF_SCALE", "0.02");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_busy_server_is_retried_and_the_action_runs_exactly_once() {
+    quick_backoff();
+    let (outcome, _) = run_with_control(
+        "remember then finish",
+        5,
+        vec![
+            ("aura_proposal", "@status:503|".to_owned()),
+            ("aura_proposal", "@status:503|".to_owned()),
+            ("aura_proposal", replies::proposal(note("only once"), "note")),
+            ("aura_proposal", replies::proposal(done("done"), "finish")),
+            ("aura_done_check", replies::done_check(true, "")),
+        ],
+        vec![],
+    )
+    .await;
+    assert!(outcome.response.completed, "{}", outcome.response.message);
+    let proposals = outcome.server.requests_of("aura_proposal");
+    assert_eq!(proposals.len(), 4, "2 failed tries, the note, the finish");
+    // The note step ran once: the prompt after it lists it exactly once.
+    let last = proposals.last().unwrap();
+    assert_eq!(last.matches("only once").count(), 3, "trajectory, notes and the done-ledger once each: the retries did not run the note again");
+    assert_eq!(last.matches("step 1: remember").count(), 1, "one ledger line for the note");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_connection_is_retried() {
+    quick_backoff();
+    let (outcome, _) = run_with_control(
+        "finish",
+        3,
+        vec![
+            ("aura_proposal", "@drop".to_owned()),
+            ("aura_proposal", replies::proposal(done("done"), "finish")),
+            ("aura_done_check", replies::done_check(true, "")),
+        ],
+        vec![],
+    )
+    .await;
+    assert!(outcome.response.completed, "{}", outcome.response.message);
+    assert_eq!(outcome.server.requests_of("aura_proposal").len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wrong_request_is_not_retried_as_if_the_server_were_busy() {
+    quick_backoff();
+    let (outcome, _) = run_with_control("x", 2, vec![("aura_proposal", "@status:400|".to_owned())], vec![]).await;
+    assert!(!outcome.response.completed);
+    let tries = outcome.server.requests_of("aura_proposal").len();
+    assert!(tries <= 4, "a 400 gets the normal feedback retries only, not 4x4 transient ones: {tries}");
+    assert!(outcome.response.message.contains("400") || outcome.response.message.to_lowercase().contains("stopped"), "{}", outcome.response.message);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_during_a_backoff_pause_ends_the_run_at_once() {
+    std::env::set_var("AURA_BACKOFF_SCALE", "1.0");
+    let (outcome, fired) = run_with_control(
+        "x",
+        3,
+        vec![("aura_proposal", "@status:503|".to_owned())],
+        vec![ControlEvent { kind: "aura_proposal", nth: 1, after_ms: 150, act: crate::control::stop }],
+    )
+    .await;
+    let after = fired.expect("stop fired").elapsed();
+    assert!(outcome.response.stopped, "{}", outcome.response.message);
+    assert!(after < std::time::Duration::from_millis(500), "stopped {after:?} after the press, during the 0.5 s backoff");
+    assert_eq!(outcome.server.requests_of("aura_proposal").len(), 1, "no further request after the stop");
+}
