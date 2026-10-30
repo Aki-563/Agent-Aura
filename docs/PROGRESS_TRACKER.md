@@ -25,7 +25,7 @@
 | **Phase 6** | 3-Way Review Modal & Step Scrubber UI | 🟢 COMPLETE | 100% |
 | **Phase 7** | Integration, Qualification & Standalone `.exe` | 🟢 COMPLETE | 100% |
 | **Phase 8** | Reliability & Intelligence Overhaul ([plan](./RELIABILITY_PLAN.md)) | 🔵 ACTIVE | harness ~90%, model results pending |
-| **Phase 9** | Harness completion, testing & hardening ([plan](./HARNESS_COMPLETION_PLAN.md)) | ⚪ PLANNED | 0% (awaiting approval of the plan and its open questions) |
+| **Phase 9** | Harness completion, testing & hardening ([plan](./HARNESS_COMPLETION_PLAN.md)) | 🔵 ACTIVE | ~65%: H0-H4 (settle part), H6, H7, H8, H10 done; grounding modes A/B/C, parallel workers/layout, remaining H9 inputs open |
 
 ---
 
@@ -140,6 +140,22 @@
 - [x] **Real-website check in Chrome** (2026-10-30, driven as the model): Wikipedia, Google, GitHub, Hacker News, YouTube, Amazon, BBC, a login form.
 - [ ] **Still open:** Gemma / other model pass rates (`aura-cli eval --repeat`), untested situations (CAPTCHA and 2FA sites, File Explorer actions, Electron apps, Firefox, UAC, mixed display scaling), unattended screen tests, up-front planner, recipe replay, CORE.md / FEATURES.md refresh, README build note.
 - [x] **M7 (suite + runner built; model results pending)** Qualification: eval suites (basic, web, intermediate, all) with independent checkers and `--repeat` pass rates; docs refreshed 2026-10-30; release build in `dist/`. Model pass rates are the next milestone.
+
+
+### Phase 9: Harness completion (details: [`HARNESS_COMPLETION_PLAN.md`](./HARNESS_COMPLETION_PLAN.md)), status 2026-10-30
+- [x] **H0** test infrastructure: fixture pages (canvas, load, login), measurements to `testlogs`, scripted-model failure directives, `test-all.ps1`.
+- [x] **H1** stop / pause / steer: epoch-based control bus, stale answers dropped, held inputs released within 100 ms, ledger with DO NOT REPEAT, hotkeys, control port, mini-player controls.
+- [x] **H2** mouse precision: exact SendInput mapping (old formula missed 10 of 3000 px), closed-loop 0 px, draw_path shapes within 1 px, pen and touch.
+- [x] **H3 (core)** window registry with stable ids, state block in every prompt, window actions with read-back, tiling, registry validation. Open: UAC handoff, virtual desktops, per-app tips.
+- [x] **H4 (settle)** loading-aware settle (spinner, progress, faint skeleton), caret mask, adaptive lag, STILL LOADING report. **Open:** grounding modes A/B/C and their metrics, `zoom` end to end with a model.
+- [ ] **H5** window layout (done: tiling math and read-back) and parallel workers / input arbiter / model scheduler (not started).
+- [x] **H6** model JSON validation and fuzzing, retry with backoff, password and CAPTCHA handoffs, time and call budgets. Open: secret masking in traces.
+- [x] **H7** scheduler (drift-free, overlap and missed policies, persistence, idle timer, `schedule` CLI and daemon). Open: UI for schedules, sleep/lock detection, 24 h soak.
+- [x] **H8** offline voice (SAPI) with fallback phrases and no backlog; **open:** audible smoke test.
+- [ ] **H9** remaining inputs (done: Caps Lock was already correct, touch, pen, clipboard actions; open: Tamil/emoji read-back checks, accessibility settings, black-frame fallback).
+- [x] **H10** README sections and the single test command.
+- [x] Also done: mini player, iOS-style HUD, working cursor, saved provider settings with DPAPI-encrypted key.
+- Verified: 192 unit tests, 116 desktop conformance cases, all passing.
 
 ---
 

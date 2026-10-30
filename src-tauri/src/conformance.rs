@@ -2160,7 +2160,14 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
         }
         Lab { off_x: 0.0, off_y: 0.0, dpr: 1.0 }
     } else {
-        setup()?
+        match setup() {
+            Ok(lab) => lab,
+            Err(error) => {
+                // A failed setup must not leave its test windows behind.
+                close_new_windows(&windows_before);
+                return Err(error);
+            }
+        }
     };
     let mut results = Vec::new();
     let mut lab_open = !lab_cases.is_empty();
