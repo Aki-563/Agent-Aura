@@ -969,6 +969,8 @@ async fn autonomous_loop(
                     action: action.clone(),
                     confidence: 1.0,
                     impact: ImpactClass::Routine,
+                    voice_command: Some(format!("Opening {app}")),
+                    target_window: None,
                 },
                 verification: VerifiedAction {
                     verdict: VerificationVerdict::Accept,
@@ -1350,7 +1352,15 @@ async fn autonomous_loop(
             _ => None,
         };
         let feedback = tokio::task::spawn_blocking(move || body_feedback(&windows_before, typed, scroll)).await.unwrap_or_default();
-        let effect_text = format!("{effect_text}{feedback}");
+        // What the action itself reported (clipboard contents, a window's new size, a held key).
+        let action_report = crate::input::take_report().map(|r| format!(" Result: {r}.")).unwrap_or_default();
+        let zoom_note = match &final_action {
+            ActionPrimitive::Zoom { x, y, width, height } => format!(
+                " The next screenshot shows only the region ({x}, {y}) {width}x{height} enlarged; x and y you give refer to that zoomed image."
+            ),
+            _ => String::new(),
+        };
+        let effect_text = format!("{effect_text}{feedback}{action_report}{zoom_note}");
         step_trace.json("effect.json", &json!({"report": &effect_report, "text": &effect_text}));
         emit_status(window, "result", step_number, &format!("Result: {effect_text}"));
         trace.event(
@@ -1362,7 +1372,16 @@ async fn autonomous_loop(
                 "expected": &proposal.expected_outcome,
             }),
         );
-        settled_capture = Some(post_capture);
+        settled_capture = Some(match &final_action {
+            ActionPrimitive::Zoom { x, y, width, height } => match zoom_capture(&post_capture, (*x, *y, *width, *height)) {
+                Ok(zoomed) => zoomed,
+                Err(error) => {
+                    trace.event(step_number, "zoom_failed", json!({"error": error}));
+                    post_capture
+                }
+            },
+            _ => post_capture,
+        });
 
         let record = StepRecord {
             step: step_number,
@@ -2051,10 +2070,10 @@ USER:
         canvas_action.clone(),
         capture.width,
         capture.height,
-        capture.screen_width,
-        capture.screen_height,
-        capture.origin_x,
-        capture.origin_y,
+        capture.map_target().0,
+        capture.map_target().1,
+        capture.map_target().2,
+        capture.map_target().3,
     )?;
     validate_action_in_capture(&physical_action, capture)?;
     Ok(PlannedAction { proposal, verification, physical: physical_action, canvas: canvas_action, confirm })
@@ -2091,6 +2110,27 @@ fn describe_action_text(action: &ActionPrimitive) -> String {
         ActionPrimitive::AskUser { question } => format!("ask you: {question}"),
         ActionPrimitive::Done { summary } => format!("finish the task ({summary})"),
         ActionPrimitive::Fail { reason } => format!("give up ({reason})"),
+        ActionPrimitive::MouseDown { x, y, button } => format!("press and hold the {} button at ({x}, {y})", format!("{button:?}").to_lowercase()),
+        ActionPrimitive::MouseUp { button, .. } => format!("release the {} button", format!("{button:?}").to_lowercase()),
+        ActionPrimitive::Hover { x, y, dwell_ms } => format!("hover at ({x}, {y}) for {dwell_ms} ms"),
+        ActionPrimitive::DrawPath { points, pointer, .. } => format!(
+            "draw a {}stroke through {} points from {:?} to {:?}",
+            match pointer { crate::input::PointerKind::Pen => "pen ", crate::input::PointerKind::Touch => "touch ", _ => "" },
+            points.len(), points.first().unwrap_or(&(0, 0)), points.last().unwrap_or(&(0, 0))
+        ),
+        ActionPrimitive::ScrollFine { delta, hold_keys, .. } => format!("scroll {} by {} wheel units{}", if *delta > 0 { "up" } else { "down" }, delta.abs(), if hold_keys.is_empty() { String::new() } else { format!(" holding {}", hold_keys.join("+")) }),
+        ActionPrimitive::TypeWith { text, press_enter, method, .. } => format!("type \"{}\" ({}){}", text.chars().take(80).collect::<String>(), format!("{method:?}").to_lowercase(), if *press_enter { " and press Enter" } else { "" }),
+        ActionPrimitive::KeyDown { key } => format!("hold {key} down"),
+        ActionPrimitive::KeyUp { key } => format!("release {key}"),
+        ActionPrimitive::HoldKey { key, hold_ms } => format!("hold {key} for {hold_ms} ms"),
+        ActionPrimitive::Zoom { x, y, width, height } => format!("zoom into ({x}, {y}) {width}x{height}"),
+        ActionPrimitive::Observe {} => "look at the screen again".to_owned(),
+        ActionPrimitive::ClipboardRead {} => "read the clipboard".to_owned(),
+        ActionPrimitive::ClipboardWrite { text } => format!("put \"{}\" on the clipboard", text.chars().take(60).collect::<String>()),
+        ActionPrimitive::WindowAction { command, window, .. } => format!("{} window {}", format!("{command:?}").to_lowercase(), window.as_deref().unwrap_or("in front")),
+        ActionPrimitive::SwitchDesktop { direction } => format!("switch to the {direction} virtual desktop"),
+        ActionPrimitive::Touch { gesture, x, y, .. } => format!("touch {} at ({x}, {y})", format!("{gesture:?}").to_lowercase()),
+        ActionPrimitive::LayoutWindows { layout, windows } => format!("arrange {} windows as {layout}", windows.len()),
     }
 }
 
@@ -2171,7 +2211,8 @@ fn validate_action_in_capture(action: &ActionPrimitive, capture: &EncodedCapture
             validate(*to_x, *to_y)
         }
         ActionPrimitive::Scroll { x: Some(x), y: Some(y), .. } => validate(*x, *y),
-        _ => Ok(()),
+        // Actions added later: every point they use must be inside the captured monitor.
+        other => other.points().into_iter().try_for_each(|(x, y)| validate(x, y)),
     }
 }
 
@@ -2310,6 +2351,19 @@ struct EncodedCapture {
     marked_png: Option<Vec<u8>>,
     /// The marked screenshot as JPEG (sent to the model).
     marked_jpeg: Option<Vec<u8>>,
+    /// When this observation is a `zoom` crop: the physical region (x, y, w, h) the image shows.
+    /// `rgba`, `screen_width` and `screen_height` still describe the whole monitor frame.
+    zoom: Option<(i32, i32, u32, u32)>,
+}
+
+impl EncodedCapture {
+    /// Physical (width, height, left, top) the image maps onto: the zoom region, or the monitor.
+    fn map_target(&self) -> (u32, u32, i32, i32) {
+        match self.zoom {
+            Some((x, y, w, h)) => (w, h, x, y),
+            None => (self.screen_width, self.screen_height, self.origin_x, self.origin_y),
+        }
+    }
 }
 
 fn encode_jpeg(image: &RgbaImage) -> Vec<u8> {
@@ -2338,8 +2392,8 @@ fn encode_png(image: &RgbaImage) -> Result<Vec<u8>, String> {
 fn attach_marks(capture: &mut EncodedCapture, task: &str) {
     capture.elements = select_elements(
         &capture.candidates,
-        (capture.origin_x, capture.origin_y),
-        (capture.screen_width, capture.screen_height),
+        (capture.map_target().2, capture.map_target().3),
+        (capture.map_target().0, capture.map_target().1),
         (capture.width, capture.height),
         MAX_MARKS,
         task,
@@ -2471,6 +2525,47 @@ fn capture_screen() -> Result<EncodedCapture, String> {
         elements: Vec::new(),
         marked_png: None,
         marked_jpeg: None,
+        zoom: None,
+    })
+}
+
+/// The model asked to look closer: the same frame, cropped to `region` (physical x, y, w, h) and
+/// enlarged to the usual image size. Coordinates the model gives on it map back exactly through
+/// `map_target`, so a click on the zoomed image lands on the right physical pixel.
+fn zoom_capture(base: &EncodedCapture, region: (i32, i32, i32, i32)) -> Result<EncodedCapture, String> {
+    let (fw, fh) = (base.screen_width as i32, base.screen_height as i32);
+    let left = (region.0 - base.origin_x).clamp(0, fw - 1);
+    let top = (region.1 - base.origin_y).clamp(0, fh - 1);
+    let width = region.2.clamp(8, fw - left);
+    let height = region.3.clamp(8, fh - top);
+    let frame = RgbaImage::from_raw(base.screen_width, base.screen_height, (*base.rgba).clone()).ok_or("the frame to zoom into is invalid")?;
+    let crop = image::imageops::crop_imm(&frame, left as u32, top as u32, width as u32, height as u32).to_image();
+    // Enlarge so the long edge is the usual image size (at most 8x, which is plenty to read 6 px text).
+    let factor = (1280.0 / width.max(height) as f64).min(8.0).max(1.0);
+    let (iw, ih) = (((width as f64) * factor).round() as u32, ((height as f64) * factor).round() as u32);
+    let rgba = DynamicImage::ImageRgba8(crop).resize_exact(iw, ih, FilterType::CatmullRom).to_rgba8();
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png).write_image(rgba.as_raw(), iw, ih, ExtendedColorType::Rgba8).map_err(|e| format!("Failed to encode the zoomed screenshot: {e}"))?;
+    Ok(EncodedCapture {
+        jpeg: encode_jpeg(&rgba),
+        webp: png,
+        focused_webp: None,
+        width: iw,
+        height: ih,
+        screen_width: base.screen_width,
+        screen_height: base.screen_height,
+        capture_duration_us: base.capture_duration_us,
+        origin_x: base.origin_x,
+        origin_y: base.origin_y,
+        window: base.window.clone(),
+        candidates: base.candidates.clone(),
+        rgba: Arc::clone(&base.rgba),
+        monitor_index: base.monitor_index,
+        resized: Arc::new(rgba),
+        elements: Vec::new(),
+        marked_png: None,
+        marked_jpeg: None,
+        zoom: Some((base.origin_x + left, base.origin_y + top, width as u32, height as u32)),
     })
 }
 
@@ -2533,8 +2628,9 @@ How to work:\n\
 7. Use note to remember a short fact you will need later (for example text to paste into another app); your notes are shown to you every step. Use ask_user, with a clear question, only when you truly need a human: a password, a CAPTCHA, a decision the task does not cover, or a click you cannot make.
 \n8. Mark risky actions with the right impact class (destructive, financial, credential, communication). Otherwise routine.\n\
 \n\
-Reply with ONE JSON object and nothing else, with these keys: stepId (integer), previousOutcome, reflection, thought (short plan), target ({{description, visibleText, controlType}}), expectedOutcome (what should visibly change), action, confidence (0 to 1), impact.\n\
-action is an object with a `type` of: click, double_click, mouse_move, drag_and_drop, type_text, hotkey, key_press, open_app, focus_window, open_url, note, ask_user, scroll, wait_settle (optionally with seconds), done, fail, plus its fields. Examples: {{\"type\":\"open_app\",\"name\":\"notepad\"}}, {{\"type\":\"click\",\"element\":7}}, {{\"type\":\"click\",\"x\":640,\"y\":360}}, {{\"type\":\"type_text\",\"text\":\"hello\"}}, {{\"type\":\"hotkey\",\"keys\":[\"ctrl\",\"s\"]}}, {{\"type\":\"scroll\",\"clicks\":-3,\"x\":640,\"y\":400}}, {{\"type\":\"done\",\"summary\":\"saved the file\"}}.\n\
+Reply with ONE JSON object and nothing else, with these keys: stepId (integer), previousOutcome, reflection, thought (short plan), target ({{description, visibleText, controlType}}), expectedOutcome (what should visibly change), action, confidence (0 to 1), impact, voice_command.\n\
+voice_command is one short sentence said aloud before the action runs, naming what you are about to do, for example \"Clicking the Save button\", \"Typing the email address\" or \"Scrolling down\".\n\
+action is an object with a `type` of: click, double_click, mouse_move, drag_and_drop, type_text, hotkey, key_press, open_app, focus_window, open_url, note, ask_user, scroll, wait_settle (optionally with seconds), done, fail, plus its fields. Also available: triple_click; mouse_down and mouse_up (press and hold, release in a later step); draw_path (points [[x,y],...] or a shape such as {{\"kind\":\"circle\",\"cx\":400,\"cy\":300,\"r\":80}}, pointer mouse or pen); key_down and key_up; wait (seconds); zoom (x, y, width, height: the next screenshot shows that region enlarged, to read small text or hit a tiny target); observe (look again without acting); clipboard_read; clipboard_write; minimize_window, maximize_window, restore_window, close_window, move_window, resize_window, snap_window, layout_windows; switch_desktop; touch (tap, swipe, pinch). Pointer and typing actions may name the window they are meant for with window (an id from the window list, for example \"w3\"). Examples: {{\"type\":\"open_app\",\"name\":\"notepad\"}}, {{\"type\":\"click\",\"element\":7}}, {{\"type\":\"click\",\"x\":640,\"y\":360}}, {{\"type\":\"type_text\",\"text\":\"hello\"}}, {{\"type\":\"hotkey\",\"keys\":[\"ctrl\",\"s\"]}}, {{\"type\":\"scroll\",\"clicks\":-3,\"x\":640,\"y\":400}}, {{\"type\":\"done\",\"summary\":\"saved the file\"}}.\n\
 No markdown, no commentary."
     )
 }
@@ -2602,7 +2698,9 @@ fn scale_action_checked(
             y: y.map(sy).transpose()?,
             horizontal,
         },
-        other => other,
+        // Actions added later carry their points through `map_points`, which is exhaustive, so no
+        // pointer action can reach the screen with unscaled screenshot coordinates.
+        other => other.map_points(&|x, y| Ok((sx(x)?, sy(y)?)))?,
     })
 }
 
@@ -2651,7 +2749,7 @@ fn action_points(actions: &[ActionPrimitive]) -> Vec<(i32, i32)> {
                 points.push((*to_x, *to_y));
             }
             ActionPrimitive::Scroll { x: Some(x), y: Some(y), .. } => points.push((*x, *y)),
-            _ => {}
+            other => points.extend(other.points()),
         }
     }
     points
@@ -2824,7 +2922,7 @@ fn check_observation_fresh(actions: &[ActionPrimitive], observed: &WindowContext
                 | ActionPrimitive::TypeText { .. }
                 | ActionPrimitive::Hotkey { .. }
                 | ActionPrimitive::KeyPress { .. }
-        )
+        ) || (!action.sends_no_input() && !matches!(action, ActionPrimitive::OpenApp { .. } | ActionPrimitive::FocusWindow { .. } | ActionPrimitive::OpenUrl { .. } | ActionPrimitive::WaitSettle { .. } | ActionPrimitive::SwitchDesktop { .. } | ActionPrimitive::LayoutWindows { .. } | ActionPrimitive::WindowAction { .. }))
     });
     if !sends_to_window {
         return Ok(());
@@ -3040,6 +3138,8 @@ mod tests {
             action,
             confidence: 0.9,
             impact: ImpactClass::Routine,
+            voice_command: None,
+            target_window: None,
         }
     }
 
@@ -3661,10 +3761,10 @@ pub mod driver {
             canvas.clone(),
             capture.width,
             capture.height,
-            capture.screen_width,
-            capture.screen_height,
-            capture.origin_x,
-            capture.origin_y,
+            capture.map_target().0,
+            capture.map_target().1,
+            capture.map_target().2,
+            capture.map_target().3,
         )?;
         validate_action_in_capture(&physical, capture)?;
         let aimed_at = match &physical {

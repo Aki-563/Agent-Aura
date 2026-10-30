@@ -14,7 +14,7 @@ use crate::reliability::{
     ActionProposal, ImpactClass, StepOutcome, TargetDescriptor, VerificationVerdict, VerifiedAction,
 };
 
-const ACTION_TYPES: [&str; 16] = [
+const ACTION_TYPES: &[&str] = &[
     "click",
     "double_click",
     "mouse_move",
@@ -31,6 +31,28 @@ const ACTION_TYPES: [&str; 16] = [
     "wait_settle",
     "done",
     "fail",
+    // Added in Phase 9 (HARNESS_COMPLETION_PLAN.md §4).
+    "triple_click",
+    "mouse_down",
+    "mouse_up",
+    "draw_path",
+    "key_down",
+    "key_up",
+    "wait",
+    "zoom",
+    "observe",
+    "clipboard_read",
+    "clipboard_write",
+    "minimize_window",
+    "maximize_window",
+    "restore_window",
+    "close_window",
+    "move_window",
+    "resize_window",
+    "snap_window",
+    "switch_desktop",
+    "touch",
+    "layout_windows",
 ];
 
 /// One action variant: a closed set of fields (`additionalProperties: false`, so a constrained
@@ -69,6 +91,9 @@ fn action_schema(max_element: u32) -> Value {
     // An element number is only offered when elements were detected, and is bounded to the real
     // range so a constrained decoder cannot invent one.
     let element = json!({"type": "integer", "minimum": 1, "maximum": max_element});
+    // Window id from the window list ("w3"): optional on pointer and typing actions.
+    let window = json!({"type": "string", "maxLength": 12});
+    let points = json!({"type": "array", "items": {"type": "array", "items": {"type": "integer"}}});
 
     // Cheap, robust actions first (small models lean toward the first option): application and
     // keyboard actions, then pointer actions, then bookkeeping and the finishing actions.
@@ -81,24 +106,71 @@ fn action_schema(max_element: u32) -> Value {
         action_variant("type_text", json!({
             "text": {"type": "string"},
             "press_enter": {"type": "boolean"},
-            "overwrite": {"type": "boolean"}
+            "overwrite": {"type": "boolean"},
+            "method": {"type": "string", "enum": ["auto", "keys", "unicode", "paste"]},
+            "chars_per_second": {"type": "number"},
+            "window": window.clone()
         }), &["text"]),
-        action_variant("click", with(&with(&with(&point, button.clone()), json!({"clicks": {"type": "integer"}})), hold.clone()), &["x", "y"]),
-        action_variant("double_click", with(&point, button.clone()), &["x", "y"]),
-        action_variant("mouse_move", point.clone(), &["x", "y"]),
+        action_variant("click", with(&with(&with(&with(&point, button.clone()), json!({"clicks": {"type": "integer"}})), hold.clone()), json!({"window": window.clone()})), &["x", "y"]),
+        action_variant("double_click", with(&with(&point, button.clone()), json!({"window": window.clone()})), &["x", "y"]),
+        action_variant("mouse_move", with(&point, json!({"dwell_ms": {"type": "integer"}, "window": window.clone()})), &["x", "y"]),
         action_variant("drag_and_drop", json!({
             "from_x": {"type": "integer"}, "from_y": {"type": "integer"},
             "to_x": {"type": "integer"}, "to_y": {"type": "integer"},
             "duration_ms": {"type": "integer"},
-            "hold_keys": {"type": "array", "items": {"type": "string"}}
+            "hold_keys": {"type": "array", "items": {"type": "string"}},
+            "waypoints": points.clone(),
+            "button": {"type": "string", "enum": ["left", "right", "middle"]},
+            "speed": {"type": "string", "enum": ["slow", "normal", "fast"]},
+            "window": window.clone()
         }), &["from_x", "from_y", "to_x", "to_y"]),
         action_variant("scroll", with(&point, json!({
             "clicks": {"type": "integer"},
-            "horizontal": {"type": "boolean"}
+            "horizontal": {"type": "boolean"},
+            "hold_keys": {"type": "array", "items": {"type": "string"}},
+            "delta": {"type": "integer"},
+            "window": window.clone()
         })), &["clicks"]),
         action_variant("wait_settle", json!({"max_timeout_ms": {"type": "integer"}, "seconds": {"type": "number"}}), &[]),
         action_variant("note", json!({"text": {"type": "string", "maxLength": 300}}), &["text"]),
         action_variant("ask_user", json!({"question": {"type": "string", "maxLength": 240}}), &["question"]),
+        // Added in Phase 9 (HARNESS_COMPLETION_PLAN.md §4).
+        action_variant("triple_click", with(&with(&point, button.clone()), json!({"window": window.clone()})), &["x", "y"]),
+        action_variant("mouse_down", with(&point, button.clone()), &["x", "y"]),
+        action_variant("mouse_up", with(&point, button.clone()), &[]),
+        action_variant("draw_path", json!({
+            "points": points.clone(),
+            "shape": {"type": "object"},
+            "closed": {"type": "boolean"},
+            "duration_ms": {"type": "integer"},
+            "hold_keys": {"type": "array", "items": {"type": "string"}},
+            "button": {"type": "string", "enum": ["left", "right", "middle"]},
+            "pointer": {"type": "string", "enum": ["mouse", "pen", "touch"]},
+            "pressure": {"type": "number"},
+            "tilt_x": {"type": "integer"},
+            "tilt_y": {"type": "integer"}
+        }), &[]),
+        action_variant("key_down", json!({"key": {"type": "string"}}), &["key"]),
+        action_variant("key_up", json!({"key": {"type": "string"}}), &["key"]),
+        action_variant("wait", json!({"seconds": {"type": "number"}}), &["seconds"]),
+        action_variant("zoom", with(&point, json!({"width": {"type": "integer"}, "height": {"type": "integer"}})), &["x", "y", "width", "height"]),
+        action_variant("observe", json!({}), &[]),
+        action_variant("clipboard_read", json!({}), &[]),
+        action_variant("clipboard_write", json!({"text": {"type": "string"}}), &["text"]),
+        action_variant("minimize_window", json!({"window": window.clone()}), &[]),
+        action_variant("maximize_window", json!({"window": window.clone()}), &[]),
+        action_variant("restore_window", json!({"window": window.clone()}), &[]),
+        action_variant("close_window", json!({"window": window.clone()}), &[]),
+        action_variant("move_window", with(&point, json!({"window": window.clone()})), &["x", "y"]),
+        action_variant("resize_window", json!({"window": window.clone(), "width": {"type": "integer"}, "height": {"type": "integer"}}), &["width", "height"]),
+        action_variant("snap_window", json!({"window": window.clone(), "side": {"type": "string", "enum": ["left", "right", "top", "bottom", "top_left", "top_right", "bottom_left", "bottom_right"]}}), &["side"]),
+        action_variant("layout_windows", json!({"layout": {"type": "string", "enum": ["grid", "columns", "rows"]}, "windows": {"type": "array", "items": {"type": "string"}}}), &["windows"]),
+        action_variant("switch_desktop", json!({"direction": {"type": "string", "enum": ["left", "right"]}}), &["direction"]),
+        action_variant("touch", with(&point, json!({
+            "gesture": {"type": "string", "enum": ["tap", "double_tap", "long_press", "swipe", "pinch", "rotate"]},
+            "to_x": {"type": "integer"}, "to_y": {"type": "integer"},
+            "scale": {"type": "number"}, "angle": {"type": "number"}, "duration_ms": {"type": "integer"}
+        })), &["gesture", "x", "y"]),
         action_variant("done", json!({"summary": {"type": "string"}}), &["summary"]),
         action_variant("fail", json!({"reason": {"type": "string"}}), &["reason"]),
     ];
@@ -142,9 +214,12 @@ pub fn proposal_schema(max_element: u32) -> Value {
             "expectedOutcome": {"type": "string", "maxLength": 160},
             "action": action_schema(max_element),
             "confidence": {"type": "number"},
-            "impact": {"type": "string", "enum": ["routine", "destructive", "financial", "credential", "communication"]}
+            "impact": {"type": "string", "enum": ["routine", "destructive", "financial", "credential", "communication"]},
+            "voice_command": {"type": "string", "maxLength": 80}
         },
-        "required": ["previousOutcome", "reflection", "thought", "target", "expectedOutcome", "action", "impact"],
+        // voice_command is required here so constrained decoders always produce it; the parser
+        // still accepts a reply without it (backward compatible, HARNESS_COMPLETION_PLAN.md D9.1).
+        "required": ["previousOutcome", "reflection", "thought", "target", "expectedOutcome", "action", "impact", "voice_command"],
         "additionalProperties": false
     })
 }
@@ -282,8 +357,91 @@ pub fn parse_lenient<T: for<'de> Deserialize<'de>>(raw: &str, label: &str) -> Re
             format!("Your {label} did not contain a JSON object. Reply with one JSON object only.")
         }
     })?;
-    serde_json::from_str(json_text)
-        .map_err(|error| format!("Your {label} JSON had the wrong shape: {error}"))
+    let mut value: Value = serde_json::from_str(json_text).map_err(|error| format!("Your {label} JSON had the wrong shape: {error}"))?;
+    coerce_scalars(&mut value);
+    serde_json::from_value(value).map_err(|error| format!("Your {label} JSON had the wrong shape: {error}"))
+}
+
+/// Keys that hold numbers and booleans in every model schema. Small models sometimes quote them
+/// (`"x": "640"`, `"press_enter": "true"`); those are converted before typed parsing. Only these
+/// keys are touched, so text fields are never changed. A window id given as a number becomes text.
+const NUMBER_KEYS: &[&str] = &[
+    "x", "y", "clicks", "from_x", "from_y", "to_x", "to_y", "duration_ms", "seconds", "element", "from_element", "to_element",
+    "max_timeout_ms", "dwell_ms", "hold_ms", "delta", "chars_per_second", "pressure", "tilt_x", "tilt_y", "width", "height",
+    "scale", "angle", "confidence", "stepId", "subgoal_index",
+];
+const BOOL_KEYS: &[&str] = &["press_enter", "overwrite", "horizontal", "closed", "complete", "completed"];
+
+pub fn coerce_scalars(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                match item {
+                    Value::String(text) if NUMBER_KEYS.contains(&key.as_str()) => {
+                        if let Some(number) = text.trim().parse::<f64>().ok().and_then(serde_json::Number::from_f64) {
+                            *item = Value::Number(number);
+                        }
+                    }
+                    Value::String(text) if BOOL_KEYS.contains(&key.as_str()) => match text.trim().to_lowercase().as_str() {
+                        "true" | "yes" | "1" => *item = Value::Bool(true),
+                        "false" | "no" | "0" => *item = Value::Bool(false),
+                        _ => {}
+                    },
+                    Value::Number(number) if key == "window" => *item = Value::String(format!("w{number}")),
+                    Value::Array(list) if key == "windows" => {
+                        for entry in list.iter_mut() {
+                            if let Value::Number(number) = entry {
+                                *entry = Value::String(format!("w{number}"));
+                            }
+                        }
+                    }
+                    _ => coerce_scalars(item),
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(coerce_scalars),
+        _ => {}
+    }
+}
+
+/// `[[x, y], ...]` from loose JSON (numbers may be quoted), at least `min` points.
+fn point_list(value: &Value, what: &str, min: usize) -> Result<Vec<(i32, i32)>, String> {
+    let points: Option<Vec<(i32, i32)>> = value.as_array().map(|items| {
+        items
+            .iter()
+            .filter_map(|p| {
+                let (x, y) = match p {
+                    Value::Array(pair) => (pair.first()?, pair.get(1)?),
+                    Value::Object(map) => (map.get("x")?, map.get("y")?),
+                    _ => return None,
+                };
+                Some((to_i32(crate::input::shapes::lenient_number(x)?), to_i32(crate::input::shapes::lenient_number(y)?)))
+            })
+            .collect()
+    });
+    match points {
+        Some(points) if points.len() >= min && Some(points.len()) == value.as_array().map(Vec::len) => Ok(points),
+        _ => Err(format!("{what} must be a list of at least {min} [x, y] points in screenshot pixels.")),
+    }
+}
+
+/// Closest allowed action name, for the "unknown action" feedback.
+fn nearest_action_name(name: &str) -> Option<&'static str> {
+    fn distance(a: &str, b: &str) -> usize {
+        let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+        let mut row: Vec<usize> = (0..=b.len()).collect();
+        for i in 1..=a.len() {
+            let mut previous = row[0];
+            row[0] = i;
+            for j in 1..=b.len() {
+                let current = row[j];
+                row[j] = (row[j] + 1).min(row[j - 1] + 1).min(previous + usize::from(a[i - 1] != b[j - 1]));
+                previous = current;
+            }
+        }
+        row[b.len()]
+    }
+    ACTION_TYPES.iter().map(|candidate| (distance(name, candidate), *candidate)).filter(|(d, c)| *d <= 3.max(c.len() / 3)).min().map(|(_, c)| c)
 }
 
 /// Action as models actually emit it: every field optional, numbers may be floats.
@@ -318,6 +476,32 @@ pub struct LooseAction {
     pub max_timeout_ms: Option<f64>,
     pub summary: Option<String>,
     pub reason: Option<String>,
+    // Optional fields added in Phase 9 (HARNESS_COMPLETION_PLAN.md §4).
+    pub dwell_ms: Option<f64>,
+    pub hold_ms: Option<f64>,
+    pub delta: Option<f64>,
+    pub method: Option<String>,
+    pub chars_per_second: Option<f64>,
+    pub waypoints: Option<Value>,
+    pub points: Option<Value>,
+    pub shape: Option<Value>,
+    pub closed: Option<bool>,
+    pub pointer: Option<String>,
+    pub pressure: Option<f64>,
+    pub tilt_x: Option<f64>,
+    pub tilt_y: Option<f64>,
+    pub width: Option<f64>,
+    pub height: Option<f64>,
+    pub window: Option<String>,
+    pub side: Option<String>,
+    pub command: Option<String>,
+    pub direction: Option<String>,
+    pub gesture: Option<String>,
+    pub scale: Option<f64>,
+    pub angle: Option<f64>,
+    pub layout: Option<String>,
+    pub windows: Option<Vec<String>>,
+    pub speed: Option<String>,
 }
 
 fn to_i32(value: f64) -> i32 {
@@ -367,20 +551,155 @@ impl LooseAction {
         };
         let hold_keys = self.hold_keys.clone().unwrap_or_default();
 
+        // Optional fields on an existing action name turn into the richer variant (Phase 9).
+        let dwell_ms = self.dwell_ms.map(|d| d.round().clamp(0.0, 10_000.0) as u64);
+        let duration_from_speed = match self.speed.as_deref().map(|s| s.trim().to_lowercase()) {
+            Some(s) if s == "slow" => Some(1200),
+            Some(s) if s == "fast" => Some(150),
+            _ => None,
+        };
         match kind.as_str() {
-            "click" | "left_click" | "right_click" | "middle_click" => {
+            "click" | "left_click" | "right_click" | "middle_click" | "triple_click" => {
                 let (x, y) = need_point(self.x, self.y, "click")?;
                 let button = match kind.as_str() {
                     "right_click" => MouseButton::Right,
                     "middle_click" => MouseButton::Middle,
                     _ => button,
                 };
-                let clicks = self.clicks.map(|c| c.round().clamp(1.0, 3.0) as u32).unwrap_or(1);
+                let clicks = if kind == "triple_click" { 3 } else { self.clicks.map(|c| c.round().clamp(1.0, 3.0) as u32).unwrap_or(1) };
                 Ok(ActionPrimitive::Click { x, y, button, clicks, hold_keys })
             }
             "mouse_move" | "move" | "hover" | "move_mouse" | "mouse_hover" => {
                 let (x, y) = need_point(self.x, self.y, "mouse_move")?;
-                Ok(ActionPrimitive::MouseMove { x, y })
+                Ok(match dwell_ms {
+                    Some(dwell_ms) => ActionPrimitive::Hover { x, y, dwell_ms },
+                    None => ActionPrimitive::MouseMove { x, y },
+                })
+            }
+            "mouse_down" | "press_mouse" | "mouse_press" => {
+                let (x, y) = need_point(self.x, self.y, "mouse_down")?;
+                Ok(ActionPrimitive::MouseDown { x, y, button })
+            }
+            "mouse_up" | "release_mouse" | "mouse_release" => {
+                let (x, y) = match (self.x, self.y) {
+                    (Some(x), Some(y)) => (Some(to_i32(x)), Some(to_i32(y))),
+                    _ => (None, None),
+                };
+                Ok(ActionPrimitive::MouseUp { x, y, button })
+            }
+            "draw_path" | "draw" | "stroke" | "draw_shape" => {
+                let mut points = match (&self.points, &self.shape) {
+                    (Some(points), _) => point_list(points, "draw_path points", 1)?,
+                    (None, Some(shape)) => {
+                        let shape = crate::input::shapes::Shape::from_json(shape)?;
+                        let mut points = crate::input::shapes::to_pixels(&shape.outline());
+                        if shape.is_closed() && points.first() != points.last() {
+                            points.push(points[0]);
+                        }
+                        points
+                    }
+                    (None, None) => return Err("draw_path needs 'points' [[x,y],...] or a 'shape' {kind: circle|ellipse|spiral|bezier|polyline|line|sine, ...}.".into()),
+                };
+                if self.closed.unwrap_or(false) && points.len() > 2 && points.first() != points.last() {
+                    points.push(points[0]);
+                }
+                let pointer = match self.pointer.as_deref().map(|p| p.trim().to_lowercase()) {
+                    None => crate::input::PointerKind::Mouse,
+                    Some(p) if p == "mouse" || p.is_empty() => crate::input::PointerKind::Mouse,
+                    Some(p) if p == "pen" || p == "stylus" => crate::input::PointerKind::Pen,
+                    Some(p) if p == "touch" || p == "finger" => crate::input::PointerKind::Touch,
+                    Some(other) => return Err(format!("Unknown pointer '{other}'. Use mouse, pen or touch.")),
+                };
+                Ok(ActionPrimitive::DrawPath {
+                    points,
+                    button,
+                    duration_ms: self.duration_ms.or(duration_from_speed.map(f64::from)).map(|d| d.round().clamp(0.0, 60_000.0) as u64).unwrap_or(0),
+                    hold_keys,
+                    pointer,
+                    pressure: self.pressure.map(|p| p.clamp(0.0, 1.0) as f32),
+                    tilt_x: self.tilt_x.map(to_i32),
+                    tilt_y: self.tilt_y.map(to_i32),
+                })
+            }
+            "key_down" | "hold_key_down" | "press_key_down" => {
+                let key = self.key.or_else(|| self.keys.and_then(|k| k.into_iter().next())).filter(|k| !k.trim().is_empty()).ok_or("key_down requires a 'key'.")?;
+                Ok(ActionPrimitive::KeyDown { key })
+            }
+            "key_up" | "release_key" => {
+                let key = self.key.or_else(|| self.keys.and_then(|k| k.into_iter().next())).filter(|k| !k.trim().is_empty()).ok_or("key_up requires a 'key'.")?;
+                Ok(ActionPrimitive::KeyUp { key })
+            }
+            "zoom" | "zoom_in" | "look_closer" => {
+                let (x, y) = need_point(self.x, self.y, "zoom")?;
+                let (width, height) = match (self.width, self.height) {
+                    (Some(w), Some(h)) if w >= 8.0 && h >= 8.0 => (to_i32(w), to_i32(h)),
+                    _ => return Err("zoom requires x, y (top-left of the region) and width, height (at least 8 pixels each).".into()),
+                };
+                Ok(ActionPrimitive::Zoom { x, y, width, height })
+            }
+            "observe" | "look" | "screenshot" | "refresh" => Ok(ActionPrimitive::Observe {}),
+            "clipboard_read" | "read_clipboard" | "get_clipboard" => Ok(ActionPrimitive::ClipboardRead {}),
+            "clipboard_write" | "set_clipboard" | "write_clipboard" | "copy_text" => {
+                let text = self.text.ok_or("clipboard_write requires the 'text' to put on the clipboard.")?;
+                Ok(ActionPrimitive::ClipboardWrite { text })
+            }
+            "window_action" | "minimize_window" | "maximize_window" | "restore_window" | "close_window" | "move_window" | "resize_window" | "snap_window" | "minimize" | "maximize" => {
+                use crate::input::WindowCommand as C;
+                let command_name = if kind == "window_action" { self.command.clone().unwrap_or_default().trim().to_lowercase() } else { kind.trim_end_matches("_window").to_owned() };
+                let command = match command_name.as_str() {
+                    "minimize" => C::Minimize,
+                    "maximize" => C::Maximize,
+                    "restore" => C::Restore,
+                    "close" => C::Close,
+                    "move" => C::Move,
+                    "resize" => C::Resize,
+                    "snap" => C::Snap,
+                    other => return Err(format!("Unknown window command '{other}'. Use minimize, maximize, restore, close, move, resize or snap.")),
+                };
+                Ok(ActionPrimitive::WindowAction {
+                    command,
+                    window: self.window.or(self.name).filter(|w| !w.trim().is_empty()),
+                    x: self.x.map(to_i32),
+                    y: self.y.map(to_i32),
+                    width: self.width.map(to_i32),
+                    height: self.height.map(to_i32),
+                    side: self.side.or(self.direction),
+                })
+            }
+            "switch_desktop" | "virtual_desktop" => {
+                let direction = self.direction.or(self.side).filter(|d| !d.trim().is_empty()).ok_or("switch_desktop requires a 'direction': left or right.")?;
+                Ok(ActionPrimitive::SwitchDesktop { direction })
+            }
+            "touch" | "tap" | "double_tap" | "long_press" | "swipe" | "pinch" | "rotate" => {
+                use crate::input::TouchGesture as G;
+                let gesture_name = if kind == "touch" { self.gesture.clone().unwrap_or_else(|| "tap".into()).trim().to_lowercase().replace([' ', '-'], "_") } else { kind.clone() };
+                let gesture = match gesture_name.as_str() {
+                    "tap" => G::Tap,
+                    "double_tap" => G::DoubleTap,
+                    "long_press" | "press_and_hold" => G::LongPress,
+                    "swipe" => G::Swipe,
+                    "pinch" | "zoom" => G::Pinch,
+                    "rotate" => G::Rotate,
+                    other => return Err(format!("Unknown touch gesture '{other}'. Use tap, double_tap, long_press, swipe, pinch or rotate.")),
+                };
+                let (x, y) = need_point(self.x, self.y, "touch")?;
+                if gesture == G::Swipe && (self.to_x.is_none() || self.to_y.is_none()) {
+                    return Err("a swipe requires to_x and to_y.".into());
+                }
+                Ok(ActionPrimitive::Touch {
+                    gesture,
+                    x,
+                    y,
+                    to_x: self.to_x.map(to_i32),
+                    to_y: self.to_y.map(to_i32),
+                    scale: self.scale.map(|s| s as f32),
+                    angle: self.angle.map(|a| a as f32),
+                    duration_ms: self.duration_ms.map(|d| d.round().clamp(0.0, 10_000.0) as u64).unwrap_or(0),
+                })
+            }
+            "layout_windows" | "tile_windows" | "arrange_windows" => {
+                let windows = self.windows.filter(|w| !w.is_empty()).ok_or("layout_windows requires 'windows': a list of window ids such as [\"w1\", \"w3\"].")?;
+                Ok(ActionPrimitive::LayoutWindows { layout: self.layout.unwrap_or_else(|| "grid".into()), windows })
             }
             "double_click" | "doubleclick" => {
                 let (x, y) = need_point(self.x, self.y, "double_click")?;
@@ -389,11 +708,48 @@ impl LooseAction {
             "drag_and_drop" | "drag" | "drag_drop" => {
                 let (from_x, from_y) = need_point(self.from_x, self.from_y, "drag_and_drop start (from_x, from_y)")?;
                 let (to_x, to_y) = need_point(self.to_x, self.to_y, "drag_and_drop end (to_x, to_y)")?;
+                // Waypoints, a non-left button or a speed make it a stroke through those points.
+                let waypoints = match &self.waypoints {
+                    Some(value) => point_list(value, "drag_and_drop waypoints", 0)?,
+                    None => Vec::new(),
+                };
+                if !waypoints.is_empty() || button != MouseButton::Left || duration_from_speed.is_some() {
+                    let mut points = vec![(from_x, from_y)];
+                    points.extend(waypoints);
+                    points.push((to_x, to_y));
+                    return Ok(ActionPrimitive::DrawPath {
+                        points,
+                        button,
+                        duration_ms: self.duration_ms.or(duration_from_speed.map(f64::from)).map(|d| d.round().clamp(100.0, 20_000.0) as u64).unwrap_or(0),
+                        hold_keys,
+                        pointer: crate::input::PointerKind::Mouse,
+                        pressure: None,
+                        tilt_x: None,
+                        tilt_y: None,
+                    });
+                }
                 let duration_ms = self.duration_ms.map(|d| d.round().clamp(100.0, 5000.0) as u64).unwrap_or(250);
                 Ok(ActionPrimitive::DragAndDrop { from_x, from_y, to_x, to_y, duration_ms, hold_keys })
             }
             "type_text" | "type" | "text" | "write" => {
                 let text = self.text.ok_or("type_text requires a 'text' string.")?;
+                let method = match self.method.as_deref().map(|m| m.trim().to_lowercase()) {
+                    None => None,
+                    Some(m) if m == "auto" || m.is_empty() => Some(crate::input::TypeMethod::Auto),
+                    Some(m) if m == "keys" || m == "keyboard" => Some(crate::input::TypeMethod::Keys),
+                    Some(m) if m == "unicode" => Some(crate::input::TypeMethod::Unicode),
+                    Some(m) if m == "paste" || m == "clipboard" => Some(crate::input::TypeMethod::Paste),
+                    Some(other) => return Err(format!("Unknown typing method '{other}'. Use auto, keys, unicode or paste.")),
+                };
+                if method.is_some() || self.chars_per_second.is_some() {
+                    return Ok(ActionPrimitive::TypeWith {
+                        text,
+                        press_enter: self.press_enter.unwrap_or(false),
+                        overwrite: self.overwrite.unwrap_or(false),
+                        method: method.unwrap_or_default(),
+                        chars_per_second: self.chars_per_second.map(|c| c as f32),
+                    });
+                }
                 Ok(ActionPrimitive::TypeText {
                     text,
                     press_enter: self.press_enter.unwrap_or(false),
@@ -419,6 +775,9 @@ impl LooseAction {
                 let parts = split_key_combos(vec![key.clone()]);
                 if parts.len() > 1 {
                     return Ok(ActionPrimitive::Hotkey { keys: parts });
+                }
+                if let Some(hold_ms) = self.hold_ms {
+                    return Ok(ActionPrimitive::HoldKey { key, hold_ms: hold_ms.round().clamp(0.0, 30_000.0) as u64 });
                 }
                 Ok(ActionPrimitive::KeyPress { key })
             }
@@ -463,12 +822,21 @@ impl LooseAction {
                 Ok(ActionPrimitive::AskUser { question })
             }
             "scroll" => {
-                let clicks = self.clicks.ok_or("scroll requires an integer 'clicks' (positive up, negative down).")?;
                 let (x, y) = match (self.x, self.y) {
                     (Some(x), Some(y)) => (Some(to_i32(x)), Some(to_i32(y))),
                     (None, None) => (None, None),
                     _ => return Err("scroll needs both x and y, or neither.".to_owned()),
                 };
+                // Keys held (Ctrl = zoom) or a raw wheel delta make it a fine scroll.
+                if !hold_keys.is_empty() || self.delta.is_some() {
+                    let delta = match (self.delta, self.clicks) {
+                        (Some(delta), _) => to_i32(delta),
+                        (None, Some(clicks)) => to_i32(clicks) * 120,
+                        (None, None) => return Err("scroll requires 'clicks' (positive up, negative down) or a wheel 'delta'.".into()),
+                    };
+                    return Ok(ActionPrimitive::ScrollFine { x, y, delta: delta.clamp(-24_000, 24_000), horizontal: self.horizontal.unwrap_or(false), hold_keys });
+                }
+                let clicks = self.clicks.ok_or("scroll requires an integer 'clicks' (positive up, negative down).")?;
                 Ok(ActionPrimitive::Scroll {
                     clicks: to_i32(clicks).clamp(-50, 50),
                     x,
@@ -492,7 +860,8 @@ impl LooseAction {
             }),
             "" => Err("The action has no 'type'.".to_owned()),
             other => Err(format!(
-                "Unknown action type '{other}'. Allowed: {}.",
+                "Unknown action type '{other}'.{} Allowed: {}.",
+                nearest_action_name(other).map(|n| format!(" Did you mean '{n}'?")).unwrap_or_default(),
                 ACTION_TYPES.join(", ")
             )),
         }
@@ -558,6 +927,8 @@ struct RawProposal {
     action: LooseAction,
     confidence: Option<f64>,
     impact: Option<String>,
+    #[serde(rename = "voice_command", alias = "voiceCommand")]
+    voice_command: Option<String>,
 }
 
 pub fn parse_proposal(raw_text: &str) -> Result<ActionProposal, String> {
@@ -567,6 +938,9 @@ pub fn parse_proposal(raw_text: &str) -> Result<ActionProposal, String> {
 pub fn parse_proposal_with(raw_text: &str, resolve: ElementResolver) -> Result<ActionProposal, String> {
     let mut raw: RawProposal = parse_lenient(raw_text, "action proposal")?;
     raw.action.resolve_elements(resolve)?;
+    // `window` on a pointer or typing action names the window it is meant for; on a window
+    // command it is the window to change (consumed by the command itself).
+    let target_window = raw.action.window.clone().filter(|_| !matches!(raw.action.kind.trim(), "window_action" | "layout_windows") && !raw.action.kind.ends_with("_window"));
     let action = raw.action.into_primitive()?;
     Ok(ActionProposal {
         step_id: raw.step_id.map(|v| v.max(0.0) as u32).unwrap_or(0),
@@ -582,6 +956,8 @@ pub fn parse_proposal_with(raw_text: &str, resolve: ElementResolver) -> Result<A
         action,
         confidence: raw.confidence.unwrap_or(0.0) as f32,
         impact: parse_impact(raw.impact.as_deref()),
+        voice_command: raw.voice_command.map(|v| v.trim().chars().take(120).collect::<String>()).filter(|v| !v.is_empty()),
+        target_window,
     })
 }
 
@@ -694,6 +1070,158 @@ mod tests {
         let wait = LooseAction { kind: "wait".into(), seconds: Some(2.5), ..Default::default() }.into_primitive().unwrap();
         assert!(matches!(wait, ActionPrimitive::WaitSettle { max_timeout_ms: 2500, .. }));
         assert!(LooseAction { kind: "open_url".into(), ..Default::default() }.into_primitive().is_err());
+    }
+
+    fn contract_tail() -> &'static str {
+        r#""previousOutcome":"not_applicable","reflection":"r","thought":"t","target":{"description":"d"},"expectedOutcome":"e","impact":"routine""#
+    }
+
+    fn proposal_text(action: &str, extra: &str) -> String {
+        format!("{{{},\"action\":{action}{extra}}}", contract_tail())
+    }
+
+    #[test]
+    fn voice_command_is_read_when_present_and_optional_when_missing() {
+        let with = parse_proposal(&proposal_text(r#"{"type":"hotkey","keys":["ctrl","s"]}"#, r#","voice_command":"Saving the file""#)).unwrap();
+        assert_eq!(with.voice_command.as_deref(), Some("Saving the file"));
+        let camel = parse_proposal(&proposal_text(r#"{"type":"hotkey","keys":["ctrl","s"]}"#, r#","voiceCommand":"Saving""#)).unwrap();
+        assert_eq!(camel.voice_command.as_deref(), Some("Saving"));
+        let without = parse_proposal(&proposal_text(r#"{"type":"hotkey","keys":["ctrl","s"]}"#, "")).unwrap();
+        assert_eq!(without.voice_command, None, "an old-style reply still parses");
+        let schema = proposal_schema(0);
+        assert!(schema["required"].as_array().unwrap().iter().any(|k| k == "voice_command"));
+        assert_eq!(schema["properties"]["voice_command"]["type"], "string");
+    }
+
+    #[test]
+    fn fenced_prose_wrapped_and_quoted_number_replies_parse() {
+        let core = proposal_text(r#"{"type":"click","x":"640","y":"360.4","clicks":"2"}"#, "");
+        for wrapped in [format!("```json\n{core}\n```"), format!("Sure! Here is my answer:\n{core}\nHope that helps."), format!("<think>maybe {{x}}</think>{core}")] {
+            match parse_proposal(&wrapped).unwrap().action {
+                ActionPrimitive::Click { x, y, clicks, .. } => assert_eq!((x, y, clicks), (640, 360, 2)),
+                other => panic!("expected click, got {other:?}"),
+            }
+        }
+        let quoted_bool = parse_proposal(&proposal_text(r#"{"type":"type_text","text":"hi","press_enter":"true"}"#, "")).unwrap();
+        assert!(matches!(quoted_bool.action, ActionPrimitive::TypeText { press_enter: true, .. }));
+    }
+
+    #[test]
+    fn empty_truncated_wrong_typed_and_unknown_replies_give_specific_feedback() {
+        assert!(parse_proposal("").unwrap_err().contains("did not contain a JSON object"));
+        assert!(parse_proposal("   I think I should click the button.").unwrap_err().contains("did not contain"));
+        let cut = proposal_text(r#"{"type":"click","x":10,"y":10}"#, "");
+        assert!(parse_proposal(&cut[..cut.len() / 2]).unwrap_err().contains("cut off"));
+        assert!(parse_proposal(&proposal_text(r#"{"type":"click","x":"left","y":10}"#, "")).is_err(), "a word where a number belongs is refused");
+        let unknown = parse_proposal(&proposal_text(r#"{"type":"duble_click","x":1,"y":2}"#, "")).unwrap_err();
+        assert!(unknown.contains("Did you mean 'double_click'"), "{unknown}");
+        assert!(parse_proposal(&proposal_text(r#"{"x":1,"y":2}"#, "")).unwrap_err().contains("no 'type'"));
+        // An extremely long reply is not a crash: the object is found or a clear error is given.
+        let huge = format!("{}{}", "noise ".repeat(40_000), proposal_text(r#"{"type":"observe"}"#, ""));
+        assert!(matches!(parse_proposal(&huge).unwrap().action, ActionPrimitive::Observe {}));
+    }
+
+    #[test]
+    fn new_actions_and_optional_fields_parse_into_their_variants() {
+        let parse = |action: &str| parse_proposal(&proposal_text(action, "")).map(|p| p.action);
+        assert!(matches!(parse(r#"{"type":"triple_click","x":5,"y":6}"#).unwrap(), ActionPrimitive::Click { clicks: 3, .. }));
+        assert!(matches!(parse(r#"{"type":"mouse_move","x":5,"y":6,"dwell_ms":800}"#).unwrap(), ActionPrimitive::Hover { dwell_ms: 800, .. }));
+        assert!(matches!(parse(r#"{"type":"mouse_move","x":5,"y":6}"#).unwrap(), ActionPrimitive::MouseMove { .. }), "unchanged without the new field");
+        assert!(matches!(parse(r#"{"type":"mouse_down","x":5,"y":6,"button":"right"}"#).unwrap(), ActionPrimitive::MouseDown { button: MouseButton::Right, .. }));
+        assert!(matches!(parse(r#"{"type":"mouse_up"}"#).unwrap(), ActionPrimitive::MouseUp { x: None, .. }));
+        match parse(r#"{"type":"drag_and_drop","from_x":1,"from_y":1,"to_x":50,"to_y":1,"waypoints":[[20,30],["30","30"]]}"#).unwrap() {
+            ActionPrimitive::DrawPath { points, .. } => assert_eq!(points, vec![(1, 1), (20, 30), (30, 30), (50, 1)]),
+            other => panic!("expected a stroke, got {other:?}"),
+        }
+        assert!(matches!(parse(r#"{"type":"drag_and_drop","from_x":1,"from_y":1,"to_x":50,"to_y":1}"#).unwrap(), ActionPrimitive::DragAndDrop { .. }));
+        match parse(r#"{"type":"draw_path","shape":{"kind":"circle","cx":100,"cy":100,"r":20},"pointer":"pen","pressure":0.7}"#).unwrap() {
+            ActionPrimitive::DrawPath { points, pointer, pressure, .. } => {
+                assert_eq!(pointer, crate::input::PointerKind::Pen);
+                assert_eq!(pressure, Some(0.7));
+                assert_eq!(points.first(), points.last(), "a circle is closed");
+                assert!(points.len() > 60);
+            }
+            other => panic!("expected a stroke, got {other:?}"),
+        }
+        assert!(parse(r#"{"type":"draw_path"}"#).unwrap_err().contains("points"));
+        assert!(matches!(parse(r#"{"type":"scroll","clicks":-2,"hold_keys":["ctrl"]}"#).unwrap(), ActionPrimitive::ScrollFine { delta: -240, .. }));
+        assert!(matches!(parse(r#"{"type":"scroll","delta":-30}"#).unwrap(), ActionPrimitive::ScrollFine { delta: -30, .. }));
+        assert!(matches!(parse(r#"{"type":"type_text","text":"வணக்கம்","method":"paste"}"#).unwrap(), ActionPrimitive::TypeWith { method: crate::input::TypeMethod::Paste, .. }));
+        assert!(matches!(parse(r#"{"type":"type_text","text":"abc","chars_per_second":5}"#).unwrap(), ActionPrimitive::TypeWith { chars_per_second: Some(_), .. }));
+        assert!(matches!(parse(r#"{"type":"key_press","key":"shift","hold_ms":1500}"#).unwrap(), ActionPrimitive::HoldKey { hold_ms: 1500, .. }));
+        assert!(matches!(parse(r#"{"type":"key_down","key":"shift"}"#).unwrap(), ActionPrimitive::KeyDown { .. }));
+        assert!(matches!(parse(r#"{"type":"zoom","x":10,"y":10,"width":200,"height":100}"#).unwrap(), ActionPrimitive::Zoom { width: 200, .. }));
+        assert!(parse(r#"{"type":"zoom","x":10,"y":10}"#).unwrap_err().contains("width"));
+        assert!(matches!(parse(r#"{"type":"observe"}"#).unwrap(), ActionPrimitive::Observe {}));
+        assert!(matches!(parse(r#"{"type":"wait","seconds":2}"#).unwrap(), ActionPrimitive::WaitSettle { max_timeout_ms: 2000, .. }));
+        assert!(matches!(parse(r#"{"type":"clipboard_write","text":"x"}"#).unwrap(), ActionPrimitive::ClipboardWrite { .. }));
+        assert!(matches!(parse(r#"{"type":"snap_window","window":3,"side":"left"}"#).unwrap(), ActionPrimitive::WindowAction { command: crate::input::WindowCommand::Snap, window: Some(ref w), .. } if w == "w3"));
+        assert!(matches!(parse(r#"{"type":"close_window"}"#).unwrap(), ActionPrimitive::WindowAction { command: crate::input::WindowCommand::Close, window: None, .. }));
+        assert!(matches!(parse(r#"{"type":"layout_windows","windows":[1,"w2"]}"#).unwrap(), ActionPrimitive::LayoutWindows { ref windows, .. } if windows == &vec!["w1".to_owned(), "w2".to_owned()]));
+        assert!(matches!(parse(r#"{"type":"swipe","x":1,"y":2,"to_x":100,"to_y":2}"#).unwrap(), ActionPrimitive::Touch { gesture: crate::input::TouchGesture::Swipe, .. }));
+        assert!(parse(r#"{"type":"touch","gesture":"swipe","x":1,"y":2}"#).unwrap_err().contains("to_x"));
+        assert!(matches!(parse(r#"{"type":"switch_desktop","direction":"right"}"#).unwrap(), ActionPrimitive::SwitchDesktop { .. }));
+    }
+
+    #[test]
+    fn the_window_an_action_names_is_kept_for_the_registry_check() {
+        let proposal = parse_proposal(&proposal_text(r#"{"type":"click","x":5,"y":6,"window":"w4"}"#, "")).unwrap();
+        assert_eq!(proposal.target_window.as_deref(), Some("w4"));
+        let command = parse_proposal(&proposal_text(r#"{"type":"minimize_window","window":"w4"}"#, "")).unwrap();
+        assert_eq!(command.target_window, None, "a window command consumes its window");
+    }
+
+    #[test]
+    fn the_schema_offers_every_new_action() {
+        let schema = proposal_schema(5);
+        let text = schema.to_string();
+        for name in ACTION_TYPES {
+            assert!(text.contains(&format!("\"{name}\"")), "{name} missing from the schema");
+        }
+    }
+
+    #[test]
+    fn ten_thousand_mangled_replies_never_panic_and_never_yield_an_unchecked_point() {
+        // Deterministic pseudo-random mutations of valid replies: cut, duplicate, swap bytes,
+        // insert junk. Every result must be a clean Ok or Err.
+        let seeds = [
+            proposal_text(r#"{"type":"click","x":640,"y":360}"#, r#","voice_command":"Clicking""#),
+            proposal_text(r#"{"type":"draw_path","shape":{"kind":"spiral","cx":50,"cy":50,"r_end":40}}"#, ""),
+            proposal_text(r#"{"type":"drag_and_drop","from_x":1,"from_y":2,"to_x":3,"to_y":4,"waypoints":[[1,2]]}"#, ""),
+            proposal_text(r#"{"type":"type_text","text":"emoji 😀 தமிழ்","method":"keys"}"#, ""),
+        ];
+        let junk = ["{", "}", "\"", ",", ":", "null", "-1e309", "[[", "]]", "\\u0000", "NaN", "\"x\":\"9999999999999\""];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for i in 0..10_000 {
+            let mut text = seeds[i % seeds.len()].clone().into_bytes();
+            for _ in 0..(1 + next() % 4) {
+                let position = (next() as usize) % text.len().max(1);
+                match next() % 4 {
+                    0 => text.truncate(position),
+                    1 => {
+                        let piece = junk[(next() as usize) % junk.len()].as_bytes();
+                        text.splice(position..position, piece.iter().copied());
+                    }
+                    2 if text.len() > 2 => {
+                        let len = text.len();
+                        let other = (next() as usize) % len;
+                        text.swap(position.min(len - 1), other);
+                    }
+                    _ => {
+                        let copy = text[..position].to_vec();
+                        text.extend(copy);
+                    }
+                }
+            }
+            let mangled = String::from_utf8_lossy(&text).into_owned();
+            let _ = parse_proposal(&mangled); // must not panic
+        }
     }
 
     #[test]

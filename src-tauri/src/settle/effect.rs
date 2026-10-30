@@ -65,6 +65,13 @@ impl SettleProfile {
             | ActionPrimitive::DoubleClick { .. }
             | ActionPrimitive::DragAndDrop { .. } => (700, 250, 4_000),
             ActionPrimitive::Done { .. } | ActionPrimitive::Fail { .. } => (0, 0, 0),
+            ActionPrimitive::TypeWith { .. } | ActionPrimitive::KeyDown { .. } | ActionPrimitive::KeyUp { .. } | ActionPrimitive::HoldKey { .. } => (300, 150, 1_500),
+            ActionPrimitive::ScrollFine { .. } => (400, 200, 2_000),
+            ActionPrimitive::Hover { .. } => (300, 200, 1_500),
+            ActionPrimitive::MouseDown { .. } | ActionPrimitive::MouseUp { .. } | ActionPrimitive::DrawPath { .. } | ActionPrimitive::Touch { .. } => (700, 250, 4_000),
+            ActionPrimitive::WindowAction { .. } | ActionPrimitive::LayoutWindows { .. } | ActionPrimitive::SwitchDesktop { .. } => (1_200, 400, 5_000),
+            // No input: nothing on screen is expected to change.
+            ActionPrimitive::Zoom { .. } | ActionPrimitive::Observe {} | ActionPrimitive::ClipboardRead {} | ActionPrimitive::ClipboardWrite { .. } => (0, 0, 0),
         };
         let min_changed = if is_text_input(action) { TEXT_MIN_CHANGED_SAMPLES } else { MIN_CHANGED_SAMPLES };
         Self { min_changed, change_timeout_ms, stable_ms, max_ms }

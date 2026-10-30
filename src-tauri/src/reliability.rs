@@ -56,6 +56,13 @@ pub struct ActionProposal {
     pub confidence: f32,
     #[serde(default)]
     pub impact: ImpactClass,
+    /// Short sentence spoken aloud before the action runs (optional; a phrase is made from the
+    /// action when the model leaves it out).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_command: Option<String>,
+    /// Window id (`w3`) the model says the action is for; checked against the window registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_window: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -489,6 +496,8 @@ mod tests {
             },
             confidence: 1.0,
             impact: ImpactClass::Routine,
+            voice_command: None,
+            target_window: None,
         };
         assert_eq!(effective_impact(&proposal), ImpactClass::Destructive);
     }

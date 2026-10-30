@@ -148,6 +148,282 @@ pub enum ActionPrimitive {
     Fail {
         reason: String,
     },
+
+    // ---- Added in Phase 9 (HARNESS_COMPLETION_PLAN.md §4). The existing variants above are
+    // unchanged; optional fields the model gives on an existing action name (for example
+    // `dwell_ms` on mouse_move) are parsed into one of these instead.
+    /// Presses a mouse button and keeps it held into the next steps (until mouse_up or a stop).
+    #[serde(rename = "mouse_down")]
+    MouseDown {
+        x: i32,
+        y: i32,
+        #[serde(default)]
+        button: MouseButton,
+    },
+    /// Releases a held mouse button, optionally after moving to (x, y).
+    #[serde(rename = "mouse_up")]
+    MouseUp {
+        x: Option<i32>,
+        y: Option<i32>,
+        #[serde(default)]
+        button: MouseButton,
+    },
+    /// Moves the pointer onto (x, y) and rests there for `dwell_ms` (tooltips, hover menus).
+    #[serde(rename = "hover")]
+    Hover {
+        x: i32,
+        y: i32,
+        dwell_ms: u64,
+    },
+    /// One continuous stroke through `points`: press at the first, move through every point at a
+    /// steady event rate, release at the last. Drags with waypoints and drawing both use it.
+    #[serde(rename = "draw_path")]
+    DrawPath {
+        points: Vec<(i32, i32)>,
+        #[serde(default)]
+        button: MouseButton,
+        duration_ms: u64,
+        #[serde(default)]
+        hold_keys: Vec<String>,
+        #[serde(default)]
+        pointer: PointerKind,
+        /// Pen pressure 0..1 (pen only).
+        pressure: Option<f32>,
+        /// Pen tilt in degrees, -90..90 (pen only).
+        tilt_x: Option<i32>,
+        tilt_y: Option<i32>,
+    },
+    /// Wheel scroll in raw wheel units (120 = one notch), optionally with keys held (Ctrl = zoom).
+    #[serde(rename = "scroll_fine")]
+    ScrollFine {
+        x: Option<i32>,
+        y: Option<i32>,
+        delta: i32,
+        #[serde(default)]
+        horizontal: bool,
+        #[serde(default)]
+        hold_keys: Vec<String>,
+    },
+    /// Typing with an explicit method and/or speed.
+    #[serde(rename = "type_with")]
+    TypeWith {
+        text: String,
+        #[serde(default)]
+        press_enter: bool,
+        #[serde(default)]
+        overwrite: bool,
+        #[serde(default)]
+        method: TypeMethod,
+        chars_per_second: Option<f32>,
+    },
+    /// Presses a key and keeps it held into the next steps (until key_up or a stop).
+    #[serde(rename = "key_down")]
+    KeyDown {
+        key: String,
+    },
+    #[serde(rename = "key_up")]
+    KeyUp {
+        key: String,
+    },
+    /// Holds one key down for `hold_ms`, then releases it.
+    #[serde(rename = "hold_key")]
+    HoldKey {
+        key: String,
+        hold_ms: u64,
+    },
+    /// Asks for the region (physical pixels after scaling) as a zoomed screenshot. No input.
+    #[serde(rename = "zoom")]
+    Zoom {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
+    /// Takes a fresh look without acting. No input.
+    #[serde(rename = "observe")]
+    Observe {},
+    /// Reads the clipboard text into the step's result. No input.
+    #[serde(rename = "clipboard_read")]
+    ClipboardRead {},
+    /// Puts text on the clipboard. No input.
+    #[serde(rename = "clipboard_write")]
+    ClipboardWrite {
+        text: String,
+    },
+    /// Minimize / maximize / restore / close / move / resize / snap a window.
+    #[serde(rename = "window_action")]
+    WindowAction {
+        command: WindowCommand,
+        /// Window id or number from the window list, or part of its title; None = the target window.
+        window: Option<String>,
+        x: Option<i32>,
+        y: Option<i32>,
+        width: Option<i32>,
+        height: Option<i32>,
+        side: Option<String>,
+    },
+    /// Switches to the virtual desktop on the left or right.
+    #[serde(rename = "switch_desktop")]
+    SwitchDesktop {
+        direction: String,
+    },
+    /// Touch gesture through Windows synthetic pointer injection.
+    #[serde(rename = "touch")]
+    Touch {
+        gesture: TouchGesture,
+        x: i32,
+        y: i32,
+        to_x: Option<i32>,
+        to_y: Option<i32>,
+        /// Pinch: final finger distance / starting distance (2.0 = spread apart).
+        scale: Option<f32>,
+        /// Rotate: degrees, clockwise positive.
+        angle: Option<f32>,
+        duration_ms: u64,
+    },
+    /// Tiles the given windows (ids, numbers or titles) on the screen.
+    #[serde(rename = "layout_windows")]
+    LayoutWindows {
+        layout: String,
+        windows: Vec<String>,
+    },
+}
+
+/// Which input device a stroke is sent as.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PointerKind {
+    #[default]
+    Mouse,
+    Pen,
+    Touch,
+}
+
+/// How text is typed: `auto` keeps the existing behaviour (keys for short text, paste for long).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeMethod {
+    #[default]
+    Auto,
+    /// Real key presses where possible (Unicode packets for the rest), one character at a time.
+    Keys,
+    /// Unicode packets only.
+    Unicode,
+    /// Clipboard paste, previous clipboard restored.
+    Paste,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowCommand {
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+    Move,
+    Resize,
+    Snap,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TouchGesture {
+    Tap,
+    DoubleTap,
+    LongPress,
+    Swipe,
+    Pinch,
+    Rotate,
+}
+
+impl ActionPrimitive {
+    /// Every screen point the action uses (physical pixels once scaled). Exhaustive on purpose:
+    /// a new variant with coordinates must be handled here, or scaling would pass it through raw.
+    pub fn points(&self) -> Vec<(i32, i32)> {
+        use ActionPrimitive as A;
+        match self {
+            A::Click { x, y, .. } | A::DoubleClick { x, y, .. } | A::MouseMove { x, y } | A::MouseDown { x, y, .. } | A::Hover { x, y, .. } => vec![(*x, *y)],
+            A::DragAndDrop { from_x, from_y, to_x, to_y, .. } => vec![(*from_x, *from_y), (*to_x, *to_y)],
+            A::Scroll { x: Some(x), y: Some(y), .. } | A::ScrollFine { x: Some(x), y: Some(y), .. } | A::MouseUp { x: Some(x), y: Some(y), .. } => vec![(*x, *y)],
+            A::DrawPath { points, .. } => points.clone(),
+            A::Zoom { x, y, width, height } => vec![(*x, *y), (x + width - 1, y + height - 1)],
+            A::Touch { x, y, to_x, to_y, .. } => match (to_x, to_y) {
+                (Some(tx), Some(ty)) => vec![(*x, *y), (*tx, *ty)],
+                _ => vec![(*x, *y)],
+            },
+            A::WindowAction { x: Some(x), y: Some(y), .. } => vec![(*x, *y)],
+            A::Scroll { .. } | A::ScrollFine { .. } | A::MouseUp { .. } | A::WindowAction { .. } | A::TypeText { .. } | A::TypeWith { .. } | A::Hotkey { .. }
+            | A::KeyPress { .. } | A::KeyDown { .. } | A::KeyUp { .. } | A::HoldKey { .. } | A::OpenApp { .. } | A::FocusWindow { .. } | A::OpenUrl { .. }
+            | A::Note { .. } | A::AskUser { .. } | A::WaitSettle { .. } | A::Done { .. } | A::Fail { .. } | A::Observe {} | A::ClipboardRead {}
+            | A::ClipboardWrite { .. } | A::SwitchDesktop { .. } | A::LayoutWindows { .. } => Vec::new(),
+        }
+    }
+
+    /// The same action with every point passed through `map` (screenshot -> physical pixels).
+    /// Sizes (zoom and window width/height) are mapped as the distance between two mapped points,
+    /// which is exact for the affine screenshot transform. Exhaustive for the same reason as `points`.
+    pub fn map_points(self, map: &dyn Fn(i32, i32) -> Result<(i32, i32), String>) -> Result<ActionPrimitive, String> {
+        use ActionPrimitive as A;
+        let opt = |x: Option<i32>, y: Option<i32>| -> Result<(Option<i32>, Option<i32>), String> {
+            match (x, y) {
+                (Some(x), Some(y)) => map(x, y).map(|(x, y)| (Some(x), Some(y))),
+                _ => Ok((x, y)),
+            }
+        };
+        Ok(match self {
+            A::Click { x, y, button, clicks, hold_keys } => { let (x, y) = map(x, y)?; A::Click { x, y, button, clicks, hold_keys } }
+            A::DoubleClick { x, y, button } => { let (x, y) = map(x, y)?; A::DoubleClick { x, y, button } }
+            A::MouseMove { x, y } => { let (x, y) = map(x, y)?; A::MouseMove { x, y } }
+            A::MouseDown { x, y, button } => { let (x, y) = map(x, y)?; A::MouseDown { x, y, button } }
+            A::Hover { x, y, dwell_ms } => { let (x, y) = map(x, y)?; A::Hover { x, y, dwell_ms } }
+            A::DragAndDrop { from_x, from_y, to_x, to_y, duration_ms, hold_keys } => {
+                let (from_x, from_y) = map(from_x, from_y)?;
+                let (to_x, to_y) = map(to_x, to_y)?;
+                A::DragAndDrop { from_x, from_y, to_x, to_y, duration_ms, hold_keys }
+            }
+            A::Scroll { clicks, x, y, horizontal } => { let (x, y) = opt(x, y)?; A::Scroll { clicks, x, y, horizontal } }
+            A::ScrollFine { x, y, delta, horizontal, hold_keys } => { let (x, y) = opt(x, y)?; A::ScrollFine { x, y, delta, horizontal, hold_keys } }
+            A::MouseUp { x, y, button } => { let (x, y) = opt(x, y)?; A::MouseUp { x, y, button } }
+            A::DrawPath { points, button, duration_ms, hold_keys, pointer, pressure, tilt_x, tilt_y } => A::DrawPath {
+                points: points.into_iter().map(|(x, y)| map(x, y)).collect::<Result<_, _>>()?,
+                button, duration_ms, hold_keys, pointer, pressure, tilt_x, tilt_y,
+            },
+            A::Zoom { x, y, width, height } => {
+                let (left, top) = map(x, y)?;
+                let (right, bottom) = map(x + width.max(1) - 1, y + height.max(1) - 1)?;
+                A::Zoom { x: left, y: top, width: right - left + 1, height: bottom - top + 1 }
+            }
+            A::Touch { gesture, x, y, to_x, to_y, scale, angle, duration_ms } => {
+                let (x, y) = map(x, y)?;
+                let (to_x, to_y) = opt(to_x, to_y)?;
+                A::Touch { gesture, x, y, to_x, to_y, scale, angle, duration_ms }
+            }
+            A::WindowAction { command, window, x, y, width, height, side } => {
+                let (x, y) = opt(x, y)?;
+                let size = match (width, height) {
+                    (Some(w), Some(h)) => {
+                        let (ox, oy) = map(0, 0)?;
+                        let (ex, ey) = map(w.max(1) - 1, h.max(1) - 1)?;
+                        (Some(ex - ox + 1), Some(ey - oy + 1))
+                    }
+                    other => other,
+                };
+                A::WindowAction { command, window, x, y, width: size.0, height: size.1, side }
+            }
+            other @ (A::TypeText { .. } | A::TypeWith { .. } | A::Hotkey { .. } | A::KeyPress { .. } | A::KeyDown { .. } | A::KeyUp { .. } | A::HoldKey { .. }
+            | A::OpenApp { .. } | A::FocusWindow { .. } | A::OpenUrl { .. } | A::Note { .. } | A::AskUser { .. } | A::WaitSettle { .. } | A::Done { .. }
+            | A::Fail { .. } | A::Observe {} | A::ClipboardRead {} | A::ClipboardWrite { .. } | A::SwitchDesktop { .. } | A::LayoutWindows { .. }) => other,
+        })
+    }
+
+    /// True for actions that send no input at all (they only inform the loop).
+    pub fn sends_no_input(&self) -> bool {
+        matches!(
+            self,
+            ActionPrimitive::Note { .. } | ActionPrimitive::AskUser { .. } | ActionPrimitive::Done { .. } | ActionPrimitive::Fail { .. }
+                | ActionPrimitive::Zoom { .. } | ActionPrimitive::Observe {} | ActionPrimitive::ClipboardRead {} | ActionPrimitive::ClipboardWrite { .. }
+        )
+    }
 }
 
 fn default_clicks() -> u32 {
@@ -205,11 +481,17 @@ impl std::error::Error for InputError {}
 struct HeldInputs {
     keys: Vec<u16>,
     buttons: Vec<MouseButton>,
+    /// Held on purpose across steps by `key_down` / `mouse_down` orders. Kept through the cleanup
+    /// after each action; released by the matching up order, a stop, or the end of the run.
+    sticky_keys: Vec<u16>,
+    sticky_buttons: Vec<MouseButton>,
 }
 
 static HELD: Mutex<HeldInputs> = Mutex::new(HeldInputs {
     keys: Vec::new(),
     buttons: Vec::new(),
+    sticky_keys: Vec::new(),
+    sticky_buttons: Vec::new(),
 });
 
 fn lock_held() -> std::sync::MutexGuard<'static, HeldInputs> {
@@ -270,18 +552,75 @@ impl InputActuator {
     /// Releases every key and mouse button Aura still holds. Safe to call at any time,
     /// including after the kill switch has fired.
     pub fn release_all() {
+        let (mut keys, mut buttons) = {
+            let mut held = lock_held();
+            let mut keys = std::mem::take(&mut held.keys);
+            let mut buttons = std::mem::take(&mut held.buttons);
+            keys.append(&mut held.sticky_keys);
+            buttons.append(&mut held.sticky_buttons);
+            (keys, buttons)
+        };
+        buttons.dedup();
+        keys.dedup();
+        for button in buttons.iter().rev() {
+            let _ = Self::send_mouse_button(button, false);
+        }
+        for vk in &keys {
+            let _ = Self::send_key(*vk, false);
+        }
+        Self::release_stuck_physical_state(&keys, &buttons);
+    }
+
+    /// Releases what the current action pressed, but keeps deliberate `key_down` / `mouse_down`
+    /// holds for the next step. Used as the cleanup after every action.
+    pub fn release_transient() {
         let (keys, buttons) = {
             let mut held = lock_held();
-            (
-                std::mem::take(&mut held.keys),
-                std::mem::take(&mut held.buttons),
-            )
+            let sticky_keys = held.sticky_keys.clone();
+            let sticky_buttons = held.sticky_buttons.clone();
+            let keys: Vec<u16> = std::mem::take(&mut held.keys).into_iter().filter(|k| !sticky_keys.contains(k)).collect();
+            let buttons: Vec<MouseButton> = std::mem::take(&mut held.buttons).into_iter().filter(|b| !sticky_buttons.contains(b)).collect();
+            (keys, buttons)
         };
         for button in buttons.iter().rev() {
             let _ = Self::send_mouse_button(button, false);
         }
         for vk in keys {
             let _ = Self::send_key(vk, false);
+        }
+    }
+
+    /// Keys and buttons held on purpose across steps (for the prompt and for tests).
+    pub fn sticky_holds() -> (Vec<u16>, Vec<MouseButton>) {
+        let held = lock_held();
+        (held.sticky_keys.clone(), held.sticky_buttons.clone())
+    }
+
+    /// After a release, Windows' own idea of the key state is checked for the keys and buttons
+    /// Aura itself just let go: one that still reads as down (an up event lost on the way) gets
+    /// one more up event. Nothing the user pressed is ever touched, and nothing is checked while
+    /// the user is actively typing or clicking.
+    fn release_stuck_physical_state(keys: &[u16], buttons: &[MouseButton]) {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON};
+        if (keys.is_empty() && buttons.is_empty()) || crate::input::takeover::idle_ms() < 300 {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+        let down = |vk: u16| unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000 != 0;
+        for vk in keys {
+            if down(*vk) {
+                let _ = Self::send_key(*vk, false);
+            }
+        }
+        for button in buttons {
+            let vk = match button {
+                MouseButton::Left => VK_LBUTTON,
+                MouseButton::Right => VK_RBUTTON,
+                MouseButton::Middle => VK_MBUTTON,
+            };
+            if down(vk) {
+                let _ = Self::send_mouse_button(button, false);
+            }
         }
     }
 
@@ -353,19 +692,30 @@ impl InputActuator {
         }
     }
 
-    /// Converts physical screen coordinates to normalized Win32 absolute mouse space (0..65535).
-    ///
-    /// Formula from docs/CORE.md Section 4.1:
-    /// Normalized X = round((X - vx) * 65535 / (vw - 1))
-    /// Normalized Y = round((Y - vy) * 65535 / (vh - 1))
+    /// Converts physical screen coordinates to normalized Win32 absolute mouse space (0..65535)
+    /// so that Windows lands on exactly that pixel (see `exact_norm`). The CORE.md formula
+    /// `round(X * 65535 / (vw - 1))` missed 10 of 3000 pixels by 1 px on a 1920x1080 screen
+    /// (`aura-cli pointer-check`, 2026-10-30); this one missed none.
     pub fn normalize_coordinates(x: i32, y: i32, bounds: &ScreenBounds) -> (i32, i32) {
-        let max_w = (bounds.width - 1).max(1) as f64;
-        let max_h = (bounds.height - 1).max(1) as f64;
+        (Self::exact_norm(x - bounds.x, bounds.width), Self::exact_norm(y - bounds.y, bounds.height))
+    }
 
-        let norm_x = (((x - bounds.x) as f64 * 65535.0) / max_w).round() as i32;
-        let norm_y = (((y - bounds.y) as f64 * 65535.0) / max_h).round() as i32;
+    /// The normalized value (0..65535) that Windows maps back exactly onto pixel `offset` of a
+    /// `size`-pixel virtual desktop. Windows converts with `pixel = floor(norm * size / 65536)`, so
+    /// the smallest norm reaching the pixel is `ceil(offset * 65536 / size)`; the old
+    /// `round(offset * 65535 / (size - 1))` lands one pixel short on some positions.
+    pub fn exact_norm(offset: i32, size: i32) -> i32 {
+        if size <= 1 {
+            return 0;
+        }
+        let offset = offset.clamp(0, size - 1) as i64;
+        let size = size as i64;
+        (((offset * 65536) + size - 1) / size).clamp(0, 65535) as i32
+    }
 
-        (norm_x.clamp(0, 65535), norm_y.clamp(0, 65535))
+    /// Pixel Windows lands on for a normalized value (inverse of `exact_norm`, for tests and checks).
+    pub fn pixel_of_norm(norm: i32, size: i32) -> i32 {
+        ((norm as i64 * size as i64) / 65536) as i32
     }
 
     /// Validates screen bounds as mandated by docs/CORE.md Section 3.2 Bounds Validation Rule.
@@ -470,21 +820,51 @@ impl InputActuator {
         Ok(())
     }
 
-    /// Moves the pointer, waits a moment so hover effects register, and checks it arrived.
-    /// A wrong position is retried once; it is never an error (some sessions report a scaled
-    /// cursor position), so the action still goes ahead.
+    /// Where the pointer really is, in physical pixels.
+    pub fn cursor_position() -> Option<(i32, i32)> {
+        let mut point = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+        (unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetPhysicalCursorPos(&mut point) } != 0).then_some((point.x, point.y))
+    }
+
+    /// Waits up to `ms` for the pointer to report (x, y); returns where it ended up.
+    fn wait_for_cursor_at(x: i32, y: i32, ms: u64) -> Option<(i32, i32)> {
+        let deadline = std::time::Instant::now() + Duration::from_millis(ms);
+        loop {
+            let now = Self::cursor_position();
+            if now == Some((x, y)) || std::time::Instant::now() >= deadline {
+                return now;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Moves the pointer, waits a moment so hover effects register, and verifies it is on the exact
+    /// pixel (closed loop, 0 px tolerance). A miss is corrected with `SetCursorPos` followed by a
+    /// zero-distance move event (so the app still gets its mouse-move message) and checked again,
+    /// up to three times. If the pointer still is not there, the action is refused: clicking a
+    /// pixel next to the target is worse than not clicking.
     pub fn move_to_confirmed(x: i32, y: i32) -> Result<(), InputError> {
         let bounds = Self::get_screen_bounds();
         Self::validate_bounds(x, y, &bounds)?;
         Self::glide_to(x, y)?;
         Self::move_to(x, y)?;
-        thread::sleep(Duration::from_millis(35));
-        let mut point = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
-        let arrived = unsafe { GetCursorPos(&mut point) != 0 && (point.x - x).abs() <= 2 && (point.y - y).abs() <= 2 };
-        if !arrived {
+        let mut landed = Self::wait_for_cursor_at(x, y, 30);
+        let mut corrections = 0;
+        while landed != Some((x, y)) && corrections < 3 {
+            Self::check_killswitch()?;
+            corrections += 1;
+            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y) };
             Self::move_to(x, y)?;
-            thread::sleep(Duration::from_millis(35));
+            landed = Self::wait_for_cursor_at(x, y, 30);
         }
+        pointer_stats::record(landed.map(|(gx, gy)| (gx - x).abs().max((gy - y).abs())).unwrap_or(-1), corrections);
+        if landed != Some((x, y)) {
+            return Err(InputError::ActionFailed(format!(
+                "the pointer could not be placed exactly at ({x}, {y}); Windows reports {landed:?}"
+            )));
+        }
+        // Hover effects (menus, tooltips) need a moment with the pointer at rest.
+        thread::sleep(Duration::from_millis(25));
         Ok(())
     }
 
@@ -496,7 +876,11 @@ impl InputActuator {
             lock_held().buttons.push(button.clone());
             Ok(())
         } else {
-            lock_held().buttons.retain(|held| held != button);
+            {
+                let mut held = lock_held();
+                held.buttons.retain(|b| b != button);
+                held.sticky_buttons.retain(|b| b != button);
+            }
             Self::send_mouse_button(button, false)
         }
     }
@@ -768,7 +1152,11 @@ impl InputActuator {
 
     /// Dispatches a virtual key up event. Always delivered, even after an emergency stop.
     pub fn key_up(vk: u16) -> Result<(), InputError> {
-        lock_held().keys.retain(|held| *held != vk);
+        {
+            let mut held = lock_held();
+            held.keys.retain(|k| *k != vk);
+            held.sticky_keys.retain(|k| *k != vk);
+        }
         Self::send_key(vk, false)
     }
 
@@ -1083,7 +1471,8 @@ impl InputActuator {
     /// emergency stop mid-action), nothing stays held down afterwards.
     pub fn execute_action(action: &ActionPrimitive) -> Result<(), InputError> {
         let result = Self::execute_action_inner(action);
-        Self::release_all();
+        // Deliberate key_down / mouse_down holds survive into the next step; everything else goes up.
+        Self::release_transient();
         result
     }
 
@@ -1132,7 +1521,63 @@ impl InputActuator {
                 Ok(())
             }
             ActionPrimitive::Done { .. } | ActionPrimitive::Fail { .. } => Ok(()),
+            ActionPrimitive::MouseDown { .. }
+            | ActionPrimitive::MouseUp { .. }
+            | ActionPrimitive::Hover { .. }
+            | ActionPrimitive::DrawPath { .. }
+            | ActionPrimitive::ScrollFine { .. }
+            | ActionPrimitive::TypeWith { .. }
+            | ActionPrimitive::KeyDown { .. }
+            | ActionPrimitive::KeyUp { .. }
+            | ActionPrimitive::HoldKey { .. }
+            | ActionPrimitive::Zoom { .. }
+            | ActionPrimitive::Observe {}
+            | ActionPrimitive::ClipboardRead {}
+            | ActionPrimitive::ClipboardWrite { .. }
+            | ActionPrimitive::WindowAction { .. }
+            | ActionPrimitive::SwitchDesktop { .. }
+            | ActionPrimitive::Touch { .. }
+            | ActionPrimitive::LayoutWindows { .. } => Self::execute_extended(action),
         }
+    }
+}
+
+mod ext;
+pub use ext::{plan_stroke, precise_sleep, take_report};
+
+/// Closed-loop pointer statistics: how often a move landed exactly, and the worst error seen.
+/// Written to the test logs; the 0 px target is checked by `aura-cli pointer-check` and conformance.
+pub mod pointer_stats {
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+    static MOVES: AtomicU64 = AtomicU64::new(0);
+    static EXACT_FIRST_TRY: AtomicU64 = AtomicU64::new(0);
+    static CORRECTED: AtomicU64 = AtomicU64::new(0);
+    static FAILED: AtomicU64 = AtomicU64::new(0);
+    static WORST_PX: AtomicI64 = AtomicI64::new(0);
+
+    /// `error_px` is the final error (-1 when the position could not be read).
+    pub fn record(error_px: i32, corrections: u32) {
+        MOVES.fetch_add(1, Ordering::Relaxed);
+        if error_px == 0 && corrections == 0 {
+            EXACT_FIRST_TRY.fetch_add(1, Ordering::Relaxed);
+        } else if error_px == 0 {
+            CORRECTED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+        WORST_PX.fetch_max(error_px as i64, Ordering::Relaxed);
+    }
+
+    /// (moves, exact on the first try, exact after correction, failed, worst final error px)
+    pub fn snapshot() -> (u64, u64, u64, u64, i64) {
+        (
+            MOVES.load(Ordering::Relaxed),
+            EXACT_FIRST_TRY.load(Ordering::Relaxed),
+            CORRECTED.load(Ordering::Relaxed),
+            FAILED.load(Ordering::Relaxed),
+            WORST_PX.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -1204,12 +1649,25 @@ mod tests {
         let (nx, ny) = InputActuator::normalize_coordinates(0, 0, &bounds);
         assert_eq!((nx, ny), (0, 0));
 
-        let (nx, ny) = InputActuator::normalize_coordinates(1919, 1079, &bounds);
-        assert_eq!((nx, ny), (65535, 65535));
-
         let (nx, ny) = InputActuator::normalize_coordinates(960, 540, &bounds);
-        assert!((nx - 32767).abs() <= 100);
-        assert!((ny - 32767).abs() <= 100);
+        assert_eq!((nx, ny), (32768, 32768));
+    }
+
+    #[test]
+    fn every_pixel_maps_back_exactly_on_many_desktop_sizes() {
+        // Single monitors at common scalings, odd sizes, and multi-monitor virtual desktops with
+        // negative origins: every pixel must survive pixel -> norm -> pixel unchanged.
+        for (x0, y0, w, h) in [(0, 0, 1920, 1080), (0, 0, 1536, 864), (0, 0, 2560, 1440), (0, 0, 3840, 2160), (0, 0, 1366, 768), (0, 0, 1281, 721), (-1920, 0, 3840, 1080), (-1280, -300, 3200, 1440)] {
+            let bounds = ScreenBounds { x: x0, y: y0, width: w, height: h };
+            for x in x0..x0 + w {
+                let (nx, _) = InputActuator::normalize_coordinates(x, y0, &bounds);
+                assert_eq!(x0 + InputActuator::pixel_of_norm(nx, w), x, "x {x} on {w} wide desktop at {x0}");
+            }
+            for y in y0..y0 + h {
+                let (_, ny) = InputActuator::normalize_coordinates(x0, y, &bounds);
+                assert_eq!(y0 + InputActuator::pixel_of_norm(ny, h), y, "y {y} on {h} high desktop at {y0}");
+            }
+        }
     }
 
     #[test]

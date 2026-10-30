@@ -45,7 +45,7 @@ pub fn own_pid() -> u32 {
     unsafe { GetCurrentProcessId() }
 }
 
-fn process_of(hwnd: HWND) -> u32 {
+pub(crate) fn process_of(hwnd: HWND) -> u32 {
     let mut pid = 0u32;
     unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
     pid
@@ -67,7 +67,7 @@ pub fn title_of(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buffer[..len.max(0) as usize])
 }
 
-fn is_cloaked(hwnd: HWND) -> bool {
+pub(crate) fn is_cloaked(hwnd: HWND) -> bool {
     let mut cloaked = 0u32;
     let hr = unsafe {
         DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED as u32, &mut cloaked as *mut u32 as *mut _, 4)
@@ -82,7 +82,7 @@ fn is_candidate_window(hwnd: HWND) -> bool {
 }
 
 /// Like `is_candidate_window`, optionally counting minimized windows (they still exist and can be restored).
-fn is_candidate_window_with(hwnd: HWND, include_minimized: bool) -> bool {
+pub(crate) fn is_candidate_window_with(hwnd: HWND, include_minimized: bool) -> bool {
     unsafe {
         if IsWindowVisible(hwnd) == 0 || (!include_minimized && IsIconic(hwnd) != 0) {
             return false;
@@ -156,7 +156,7 @@ pub fn window_match_rank(query: &str, title: &str, exe_name: &str) -> u8 {
     }
 }
 
-unsafe extern "system" fn collect_windows(hwnd: HWND, list: isize) -> i32 {
+pub(crate) unsafe extern "system" fn collect_windows(hwnd: HWND, list: isize) -> i32 {
     let windows = &mut *(list as *mut Vec<HWND>);
     windows.push(hwnd);
     1

@@ -35,7 +35,25 @@ pub fn describe_step(action: &ActionPrimitive, target: &str) -> Option<String> {
         ActionPrimitive::OpenApp { name } => format!("open the app \"{name}\""),
         ActionPrimitive::FocusWindow { name } => format!("switch to the window \"{name}\""),
         ActionPrimitive::OpenUrl { url } => format!("open {url}"),
+        ActionPrimitive::MouseDown { .. } => on("press the mouse on"),
+        ActionPrimitive::MouseUp { .. } => "release the mouse button".to_owned(),
+        ActionPrimitive::Hover { .. } => on("hover over"),
+        ActionPrimitive::DrawPath { .. } => on("draw a stroke on"),
+        ActionPrimitive::ScrollFine { delta, .. } => format!("scroll {}", if *delta > 0 { "up" } else { "down" }),
+        ActionPrimitive::TypeWith { text, press_enter, .. } => {
+            let shown: String = text.chars().take(60).collect();
+            format!("type \"{shown}\"{}", if *press_enter { " and press Enter" } else { "" })
+        }
+        ActionPrimitive::KeyDown { key } => format!("hold {key} down"),
+        ActionPrimitive::KeyUp { key } => format!("release {key}"),
+        ActionPrimitive::HoldKey { key, .. } => format!("hold {key}"),
+        ActionPrimitive::ClipboardWrite { .. } => "put text on the clipboard".to_owned(),
+        ActionPrimitive::WindowAction { command, window, .. } => format!("{} the window {}", format!("{command:?}").to_lowercase(), window.as_deref().unwrap_or("in front")),
+        ActionPrimitive::SwitchDesktop { direction } => format!("switch to the virtual desktop on the {direction}"),
+        ActionPrimitive::Touch { gesture, .. } => on(&format!("{} on", format!("{gesture:?}").to_lowercase())),
+        ActionPrimitive::LayoutWindows { layout, .. } => format!("arrange the windows as {layout}"),
         // Bookkeeping and finishing actions are not part of a recipe.
+        ActionPrimitive::Zoom { .. } | ActionPrimitive::Observe {} | ActionPrimitive::ClipboardRead {} => return None,
         ActionPrimitive::WaitSettle { .. }
         | ActionPrimitive::Note { .. }
         | ActionPrimitive::AskUser { .. }

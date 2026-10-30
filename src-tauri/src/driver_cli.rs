@@ -138,8 +138,55 @@ fn run_inner(args: &[String]) -> Result<(), String> {
         }
         "demo" => demo(),
         "serve" => serve(args),
+        "pointer-check" => pointer_check(),
         _ => Err(usage()),
     }
+}
+
+/// `aura-cli pointer-check`: moves the pointer (never clicks) onto every pixel of one row and one
+/// column with two normalization formulas and counts where Windows put it somewhere else.
+fn pointer_check() -> Result<(), String> {
+    use crate::input::send_input::InputActuator;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT};
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let bounds = InputActuator::get_screen_bounds();
+    let send = |nx: i32, ny: i32| unsafe {
+        let input = INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dx: nx, dy: ny, mouseData: 0, dwFlags: MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE, time: 0, dwExtraInfo: 0 } } };
+        SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+    };
+    let read = || {
+        std::thread::sleep(Duration::from_millis(2));
+        let mut p = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+        unsafe { GetCursorPos(&mut p) };
+        (p.x, p.y)
+    };
+    let mut start = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    unsafe { GetCursorPos(&mut start) };
+    let row = bounds.y + bounds.height / 2;
+    let column = bounds.x + bounds.width / 2;
+    for (name, exact) in [("old round(x*65535/(w-1))", false), ("exact ceil(x*65536/w)", true)] {
+        let norm = |offset: i32, size: i32| if exact { InputActuator::exact_norm(offset, size) } else {
+            ((offset as f64 * 65535.0) / (size - 1).max(1) as f64).round().clamp(0.0, 65535.0) as i32
+        };
+        let (mut misses, mut worst) = (0, 0);
+        let ny_row = norm(row - bounds.y, bounds.height);
+        for x in bounds.x..bounds.x + bounds.width {
+            if crate::input::killswitch::is_killed() { return Err("stopped".into()); }
+            send(norm(x - bounds.x, bounds.width), ny_row);
+            let (gx, gy) = read();
+            if gx != x || gy != row { misses += 1; worst = worst.max((gx - x).abs().max((gy - row).abs())); }
+        }
+        let nx_col = norm(column - bounds.x, bounds.width);
+        for y in bounds.y..bounds.y + bounds.height {
+            if crate::input::killswitch::is_killed() { return Err("stopped".into()); }
+            send(nx_col, norm(y - bounds.y, bounds.height));
+            let (gx, gy) = read();
+            if gx != column || gy != y { misses += 1; worst = worst.max((gx - column).abs().max((gy - y).abs())); }
+        }
+        println!("{name}: {misses} of {} pixels missed, worst error {worst} px", bounds.width + bounds.height);
+    }
+    send(InputActuator::exact_norm(start.x - bounds.x, bounds.width), InputActuator::exact_norm(start.y - bounds.y, bounds.height));
+    Ok(())
 }
 
 /// `aura-cli serve [--browser chrome|edge] [--page /lab] [--seconds N]`: runs the test-page server
