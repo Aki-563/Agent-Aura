@@ -279,6 +279,46 @@ pub fn final_outcome_schema(_max_element: u32) -> Value {
     })
 }
 
+/// Grounding mode B: the second call answers only "where is this target": an element number or x/y.
+pub fn grounding_schema(max_element: u32) -> Value {
+    let element = if max_element > 0 { json!({"type": "integer", "minimum": 1, "maximum": max_element}) } else { json!({"type": "integer", "minimum": 1}) };
+    json!({
+        "type": "object",
+        "properties": {
+            "element": element,
+            "x": {"type": "integer"},
+            "y": {"type": "integer"},
+            "found": {"type": "boolean"}
+        },
+        "required": ["found"],
+        "additionalProperties": false
+    })
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawGrounding {
+    element: Option<f64>,
+    x: Option<f64>,
+    y: Option<f64>,
+    found: Option<bool>,
+}
+
+/// Where the grounding call says the target is (in screenshot pixels).
+pub fn parse_grounding_with(raw_text: &str, resolve: ElementResolver) -> Result<(i32, i32), String> {
+    let raw: RawGrounding = parse_lenient(raw_text, "grounding answer")?;
+    if raw.found == Some(false) {
+        return Err("The grounding call could not find the target on screen.".to_owned());
+    }
+    if let Some(id) = raw.element.filter(|v| *v >= 1.0) {
+        return resolve(id as u32);
+    }
+    match (raw.x, raw.y) {
+        (Some(x), Some(y)) => Ok((x.round() as i32, y.round() as i32)),
+        _ => Err("The grounding answer had neither an element nor x and y.".to_owned()),
+    }
+}
+
 /// Which schema (if any) accompanies a model request.
 #[derive(Debug, Clone, Copy)]
 pub struct SchemaSpec {
@@ -296,6 +336,7 @@ impl SchemaSpec {
 
 pub const PROPOSAL: SchemaSpec = SchemaSpec { name: "aura_proposal", build: proposal_schema, max_element: 0 };
 pub const VERIFICATION: SchemaSpec = SchemaSpec { name: "aura_verification", build: verification_schema, max_element: 0 };
+pub const GROUNDING: SchemaSpec = SchemaSpec { name: "aura_grounding", build: grounding_schema, max_element: 0 };
 pub const DONE_CHECK: SchemaSpec = SchemaSpec { name: "aura_done_check", build: done_check_schema, max_element: 0 };
 pub const FINAL_OUTCOME: SchemaSpec = SchemaSpec { name: "aura_final_outcome", build: final_outcome_schema, max_element: 0 };
 
@@ -1232,6 +1273,17 @@ mod tests {
         assert!(!sloppy.complete, "a reply without an explicit yes must not count as complete");
         assert!(parse_done_check("no json").is_err());
         assert_eq!(done_check_schema(0)["required"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn grounding_answers_parse_as_element_or_point() {
+        let resolve = |id: u32| if id <= 3 { Ok((10 * id as i32, 5)) } else { Err("no such element".to_owned()) };
+        assert_eq!(parse_grounding_with(r#"{"found":true,"element":2}"#, &resolve).unwrap(), (20, 5));
+        assert_eq!(parse_grounding_with(r#"{"found":true,"x":101,"y":7}"#, &resolve).unwrap(), (101, 7));
+        assert!(parse_grounding_with(r#"{"found":false}"#, &resolve).is_err());
+        assert!(parse_grounding_with(r#"{"found":true}"#, &resolve).is_err());
+        assert!(parse_grounding_with(r#"{"found":true,"element":9}"#, &resolve).is_err());
+        assert_eq!(grounding_schema(5)["properties"]["element"]["maximum"], 5);
     }
 
     #[test]

@@ -2287,7 +2287,78 @@ USER:
     .await?;
     let proposal_text = extract_model_text(&proposal_value, config.protocol)?;
     trace.text(&format!("proposal_raw_{retry_attempt}.txt"), &proposal_text);
-    let proposal: ActionProposal = model_schema::parse_proposal_with(&proposal_text, &resolve_element)?;
+    let mut proposal: ActionProposal = model_schema::parse_proposal_with(&proposal_text, &resolve_element)?;
+
+    // Grounding modes (HARNESS_COMPLETION_PLAN.md H4). A = the proposal's own coordinates. B = a
+    // second call on the SAME screenshot points at the described target. C = no extra call; the
+    // harness checks the point against the element list and moves a near miss onto the target.
+    let grounding_started = Instant::now();
+    let mode = crate::settings::get().grounding_mode;
+    let mut grounding_calls = 0u32;
+    let mut grounding_note = String::new();
+    let mut force_verify = false;
+    let target_text = proposal.target.visible_text.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| proposal.target.description.clone());
+    let raw_point = first_raw_point(&proposal.action).filter(|p| !capture.elements.iter().any(|e| e.center() == *p));
+    if let (Some(point), false) = (raw_point, target_text.trim().is_empty()) {
+        match mode {
+            crate::settings::GroundingMode::A => {}
+            crate::settings::GroundingMode::B => {
+                grounding_calls = 1;
+                let prompt = format!(
+                    "You are a precise UI pointer. Look at the screenshot ({}x{} pixels) and point at the described target. Reply with JSON only: {{\"found\":true,\"element\":N}} using a numbered element, or {{\"found\":true,\"x\":X,\"y\":Y}} in screenshot pixels, or {{\"found\":false}}.",
+                    capture.width, capture.height
+                );
+                let input = format!("TARGET: {}\n\nNUMBERED ELEMENTS:\n{}", target_text, element_text);
+                let grounding_config = {
+                    let settings = crate::settings::get();
+                    let mut c = config.clone();
+                    if !settings.grounding_model.trim().is_empty() {
+                        c.model = settings.grounding_model.clone();
+                    }
+                    if !settings.grounding_url.trim().is_empty() {
+                        c.base_url = settings.grounding_url.clone();
+                    }
+                    c
+                };
+                let outcome = match request_plan(client, &grounding_config, &prompt, &input, &screenshot_data_url, model_schema::GROUNDING.with_max_element(element_count as u32)).await {
+                    Ok(value) => extract_model_text(&value, grounding_config.protocol)
+                        .and_then(|text| {
+                            trace.text(&format!("grounding_raw_{retry_attempt}.txt"), &text);
+                            model_schema::parse_grounding_with(&text, &resolve_element)
+                        }),
+                    Err(error) => Err(error),
+                };
+                match outcome {
+                    Ok(grounded) => {
+                        grounding_note = format!("mode B moved the point from {point:?} to {grounded:?}");
+                        set_first_point(&mut proposal.action, grounded);
+                    }
+                    Err(error) => {
+                        grounding_note = format!("mode B failed ({error}); kept the proposal's point");
+                        force_verify = true;
+                    }
+                }
+            }
+            crate::settings::GroundingMode::C => {
+                let (action, fit) = crate::coords::refine_action_to_target(&capture.elements, &target_text, proposal.action.clone());
+                proposal.action = action;
+                match fit {
+                    Some(crate::coords::TargetFit::Confirmed) => grounding_note = "mode C: the point is on the described element".to_owned(),
+                    Some(crate::coords::TargetFit::Moved) => grounding_note = "mode C: moved the point onto the described element".to_owned(),
+                    Some(crate::coords::TargetFit::Unconfirmed) => {
+                        grounding_note = "mode C: no listed element matches the description there; asking the verifier".to_owned();
+                        force_verify = true;
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    if !grounding_note.is_empty() || grounding_calls > 0 {
+        let data = serde_json::json!({"mode": format!("{mode:?}"), "extra_calls": grounding_calls, "millis": grounding_started.elapsed().as_millis() as u64, "note": grounding_note});
+        trace.json("grounding.json", &data);
+        crate::testlog::record("grounding", &format!("{mode:?}"), data);
+    }
 
     if session.repeated_action_loop(&proposal.action) && proposal.previous_outcome != StepOutcome::Succeeded {
         return Err("Loop detector rejected a repeated action that was not making progress.".to_owned());
@@ -2304,7 +2375,7 @@ USER:
         )
     });
 
-    let (verification, canvas_action) = if needs_verification(&proposal, &impact, &capture.elements) {
+    let (verification, canvas_action) = if force_verify || needs_verification(&proposal, &impact, &capture.elements) {
         let verification_prompt = build_verification_prompt(capture.width, capture.height);
         let verification_input = format!(
             "ORIGINAL TASK:\n{task}\n\nPROPOSAL TO CRITIQUE:\n{}\n\nACTIVE WINDOW:\n{}\n\nThe first image is the monitor context; when present, the second image is a high-detail active-window crop for visual evidence only. Return coordinates relative to the first image. A red crosshair on the first image marks exactly where the proposal will click.\n\nNUMBERED ELEMENTS (same numbers as drawn on the screenshot):\n{}",
@@ -3104,6 +3175,29 @@ fn terminal_outcome(actions: &[ActionPrimitive]) -> Option<(bool, String)> {
         ActionPrimitive::Fail { reason } => Some((false, reason.clone())),
         _ => None,
     })
+}
+
+/// The first screenshot-space point of a single-point pointer action.
+fn first_raw_point(action: &ActionPrimitive) -> Option<(i32, i32)> {
+    match action {
+        ActionPrimitive::Click { x, y, .. } | ActionPrimitive::DoubleClick { x, y, .. } | ActionPrimitive::MouseMove { x, y } => Some((*x, *y)),
+        ActionPrimitive::DragAndDrop { from_x, from_y, .. } => Some((*from_x, *from_y)),
+        _ => None,
+    }
+}
+
+fn set_first_point(action: &mut ActionPrimitive, point: (i32, i32)) {
+    match action {
+        ActionPrimitive::Click { x, y, .. } | ActionPrimitive::DoubleClick { x, y, .. } | ActionPrimitive::MouseMove { x, y } => {
+            *x = point.0;
+            *y = point.1;
+        }
+        ActionPrimitive::DragAndDrop { from_x, from_y, .. } => {
+            *from_x = point.0;
+            *from_y = point.1;
+        }
+        _ => {}
+    }
 }
 
 /// Screen points an action will touch (used to check that Aura does not cover them).

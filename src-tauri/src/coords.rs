@@ -188,6 +188,79 @@ pub fn refine_point(model: &str, elements: &[Element], size: (u32, u32), x: i32,
     snap(elements, px, py)
 }
 
+/// How sure grounding mode C is that the point is on what the model described.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetFit {
+    /// The point is inside an element whose text matches the description.
+    Confirmed,
+    /// The point was moved onto the nearest element whose text matches.
+    Moved,
+    /// Nothing matched near the point; the crosshair verifier should look at it.
+    Unconfirmed,
+}
+
+/// A match radius (screenshot pixels) within which a differently placed matching element is
+/// preferred over where the model pointed.
+const TARGET_RADIUS: f64 = 60.0;
+
+fn words(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric()).filter(|w| w.chars().count() >= 2).map(str::to_lowercase).collect()
+}
+
+/// Whether the element's label is the thing the model described (`wanted` = visible text, else the
+/// description). Every word of the label must appear in `wanted`, or the label contains `wanted`.
+fn label_matches(label: &str, wanted: &[String], wanted_text: &str) -> bool {
+    let label_words = words(label);
+    if label_words.is_empty() || wanted.is_empty() {
+        return false;
+    }
+    let lowered = label.to_lowercase();
+    lowered.contains(&wanted_text.to_lowercase()) || label_words.iter().all(|w| wanted.contains(w))
+}
+
+/// Grounding mode C, no extra model call: hovers (in effect) over the point and checks that the
+/// element under it is the one described. If another element near the point matches the
+/// description instead, the point moves there.
+pub fn refine_to_target(elements: &[Element], point: (i32, i32), target_text: &str) -> ((i32, i32), TargetFit) {
+    let wanted = words(target_text);
+    let mut matching: Vec<&Element> = elements.iter().filter(|e| label_matches(&e.label, &wanted, target_text)).collect();
+    // An exact label ("Save" among "Save" and "Save As") beats a partial one.
+    let exact: Vec<&Element> = matching.iter().copied().filter(|e| e.label.trim().eq_ignore_ascii_case(target_text.trim())).collect();
+    if !exact.is_empty() {
+        matching = exact;
+    }
+    if matching.is_empty() {
+        return (point, TargetFit::Unconfirmed);
+    }
+    if matching.iter().any(|e| gap_to(e, point.0, point.1) == 0.0) {
+        return (point, TargetFit::Confirmed);
+    }
+    let best = matching.iter().map(|e| (*e, gap_to(e, point.0, point.1))).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    match best {
+        Some((element, gap)) if gap <= TARGET_RADIUS => (element.center(), TargetFit::Moved),
+        _ => (point, TargetFit::Unconfirmed),
+    }
+}
+
+/// Applies `refine_to_target` to the first raw point of a pointer action. Returns the action and the
+/// fit (`None` for actions without a point).
+pub fn refine_action_to_target(elements: &[Element], target_text: &str, action: ActionPrimitive) -> (ActionPrimitive, Option<TargetFit>) {
+    let mut action = action;
+    let mut fit = None;
+    let mut fix = |x: &mut i32, y: &mut i32| {
+        let ((nx, ny), f) = refine_to_target(elements, (*x, *y), target_text);
+        *x = nx;
+        *y = ny;
+        fit = Some(f);
+    };
+    match &mut action {
+        ActionPrimitive::Click { x, y, .. } | ActionPrimitive::DoubleClick { x, y, .. } | ActionPrimitive::MouseMove { x, y } => fix(x, y),
+        ActionPrimitive::DragAndDrop { from_x, from_y, .. } => fix(from_x, from_y),
+        _ => {}
+    }
+    (action, fit)
+}
+
 /// Applies `refine_point` to every raw point in a pointer action.
 pub fn refine_action(model: &str, elements: &[Element], size: (u32, u32), action: ActionPrimitive) -> ActionPrimitive {
     let mut action = action;
@@ -213,6 +286,34 @@ mod tests {
 
     fn element(id: u32, left: i32, top: i32, right: i32, bottom: i32) -> Element {
         Element { id, label: format!("e{id}"), kind: "Button".into(), left, top, right, bottom }
+    }
+
+    #[test]
+    fn mode_c_recovers_near_misses_onto_the_described_element() {
+        // A row of small buttons 8 px apart; the model "meant" one but missed by 1..20 px in a random direction.
+        let names = ["Save", "Save As", "Open", "Close", "Print", "Share", "Export", "Import"];
+        let elements: Vec<Element> = names.iter().enumerate().map(|(i, n)| {
+            let left = 40 + i as i32 * 78;
+            Element { id: i as u32 + 1, label: (*n).into(), kind: "Button".into(), left, top: 100, right: left + 70, bottom: 124 }
+        }).collect();
+        let mut seed = 12345u64;
+        let mut next = |m: i32| { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((seed >> 33) as i32).rem_euclid(m) };
+        let (mut recovered, mut total) = (0, 0);
+        for _ in 0..400 {
+            let target = &elements[next(elements.len() as i32) as usize];
+            let (cx, cy) = target.center();
+            let (dx, dy) = (next(41) - 20, next(41) - 20);
+            let (point, _) = refine_to_target(&elements, (cx + dx, cy + dy), &target.label);
+            total += 1;
+            let inside = point.0 >= target.left && point.0 <= target.right && point.1 >= target.top && point.1 <= target.bottom;
+            if ((point.0 - cx) as f64).hypot((point.1 - cy) as f64) <= 14.0 || inside {
+                recovered += 1;
+            }
+        }
+        assert!(recovered * 100 >= total * 95, "recovered {recovered} of {total}");
+        // Nothing matching the description nearby -> unconfirmed (the crosshair verifier takes over).
+        assert_eq!(refine_to_target(&elements, (300, 110), "Settings gear").1, TargetFit::Unconfirmed);
+        assert_eq!(refine_to_target(&elements, (75, 112), "Save").1, TargetFit::Confirmed);
     }
 
     #[test]
