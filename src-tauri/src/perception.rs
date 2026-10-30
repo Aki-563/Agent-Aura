@@ -148,6 +148,28 @@ pub fn collect_candidates(
 
 /// What has keyboard focus right now and what it holds: the read-back that tells the model whether
 /// its typing or click really landed ("keyboard focus is on edit 'Name' containing 'Jane Doe'").
+/// Whether the control with keyboard focus is a password field (UI Automation `IsPassword`).
+pub fn focused_is_password() -> bool {
+    UIAutomation::new()
+        .ok()
+        .and_then(|automation| automation.get_focused_element().ok())
+        .and_then(|element| element.is_password().ok())
+        .unwrap_or(false)
+}
+
+/// Whether the visible text suggests a CAPTCHA or "prove you are human" check. A model must never
+/// try to solve these: the person does.
+pub fn looks_like_captcha(labels: &[String]) -> bool {
+    const PHRASES: [&str; 10] = [
+        "captcha", "recaptcha", "hcaptcha", "i'm not a robot", "i am not a robot", "not a robot",
+        "verify you are human", "verify you're human", "are you a robot", "confirm you are human",
+    ];
+    labels.iter().any(|label| {
+        let lower = label.to_lowercase().replace('\u{2019}', "'");
+        PHRASES.iter().any(|phrase| lower.contains(phrase))
+    })
+}
+
 pub fn focused_element_summary() -> Option<(String, bool)> {
     use uiautomation::patterns::{UITextPattern, UIValuePattern};
     let automation = UIAutomation::new().ok()?;
@@ -467,4 +489,19 @@ pub fn collect_uia_for_test(process_id: u32, origin_x: i32, origin_y: i32, width
 #[cfg(test)]
 pub fn collect_ocr_for_test(rgba: &[u8], width: u32, height: u32, origin_x: i32, origin_y: i32) -> usize {
     collect_ocr_candidates(rgba, width, height, origin_x, origin_y).len()
+}
+
+#[cfg(test)]
+mod captcha_tests {
+    fn words(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn captcha_screens_are_recognised_from_their_words() {
+        assert!(super::looks_like_captcha(&words(&["Sign in", "I\u{2019}m not a robot"])));
+        assert!(super::looks_like_captcha(&words(&["Please verify you are human to continue"])));
+        assert!(super::looks_like_captcha(&words(&["Protected by reCAPTCHA"])));
+        assert!(!super::looks_like_captcha(&words(&["Robot vacuum cleaners", "Sign in", "Password"])));
+    }
 }

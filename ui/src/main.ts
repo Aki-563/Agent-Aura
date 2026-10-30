@@ -165,7 +165,7 @@ app.innerHTML = `
         <div class="button-row run-row">
           <label class="step-limit">
             <span>Maximum steps</span>
-            <input id="max-steps" type="number" min="1" max="30" value="12" />
+            <input id="max-steps" type="number" min="1" max="100" value="12" />
           </label>
           <button id="stop-task" class="button danger" type="button" disabled>Stop</button>
           <button id="run-task" class="button primary" type="button">Run autonomously</button>

@@ -1761,6 +1761,27 @@ fn windows_closed_window_is_refused_before_any_input(_lab: &Lab) -> Result<(), S
     }
 }
 
+fn safety_password_and_captcha_are_recognised(_lab: &Lab) -> Result<(), String> {
+    open_page("/login", "Login")?;
+    go(Order::Click("Username"))?;
+    if crate::perception::focused_is_password() {
+        return Err("the username field was taken for a password field".into());
+    }
+    go(Order::Click("Password"))?;
+    if !wait_until(2000, crate::perception::focused_is_password) {
+        return Err("a focused password field was not recognised as one".into());
+    }
+    let labels: Vec<String> = driver::observe("")?.all_candidates().into_iter().map(|(_, label, _)| label).collect();
+    if !crate::perception::looks_like_captcha(&labels) {
+        return Err(format!("the 'I'm not a robot' text was not recognised ({} labels)", labels.len()));
+    }
+    Ok(())
+}
+
+fn safety_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
+    vec![("safety", "password field and CAPTCHA text are recognised", safety_password_and_captcha_are_recognised)]
+}
+
 fn windows_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
     vec![
         ("windows", "registry matches the desktop, ids are stable", windows_registry_matches_the_desktop),
@@ -2127,7 +2148,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
         None => true,
     };
     let lab_cases: Vec<_> = cases().into_iter().filter(|(g, n, _)| selected(g, n)).collect();
-    let driver_selected: Vec<_> = driver_cases().into_iter().chain(draw_cases()).chain(load_cases()).chain(windows_cases()).filter(|(g, n, _)| selected(g, n)).collect();
+    let driver_selected: Vec<_> = driver_cases().into_iter().chain(draw_cases()).chain(load_cases()).chain(windows_cases()).chain(safety_cases()).filter(|(g, n, _)| selected(g, n)).collect();
     let app_cases: Vec<_> = driver_selected.into_iter().chain(body_cases().into_iter().filter(|(g, n, _)| selected(g, n))).chain(native_cases().into_iter().filter(|(g, n, _)| selected(g, n))).collect();
     if lab_cases.is_empty() && app_cases.is_empty() {
         return Err("no case matches that filter".into());
@@ -2144,7 +2165,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
     let mut results = Vec::new();
     let mut lab_open = !lab_cases.is_empty();
     for (group, name, case) in lab_cases.into_iter().chain(app_cases) {
-        if group != "native" && group != "driver" && group != "body" && group != "draw" && group != "load" && group != "windows" {
+        if group != "native" && group != "driver" && group != "body" && group != "draw" && group != "load" && group != "windows" && group != "safety" {
             // lab case: nothing to close
         } else if lab_open {
             // Close the lab tab before the real-application cases.
@@ -2158,8 +2179,8 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
             trail.clear();
         }
         let started = Instant::now();
-        let outcome = if group == "native" || group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" { case(&lab) } else { lab.reset().and_then(|_| case(&lab)) };
-        if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" {
+        let outcome = if group == "native" || group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" { case(&lab) } else { lab.reset().and_then(|_| case(&lab)) };
+        if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" {
             let _ = press("escape");
             close_fixture_tab();
         }
@@ -2171,7 +2192,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
             millis: started.elapsed().as_millis(),
             detail: outcome
                 .err()
-                .map(|e| if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" { format!("{e} [orders: {}]", trail_text()) } else { e })
+                .map(|e| if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" { format!("{e} [orders: {}]", trail_text()) } else { e })
                 .unwrap_or_default(),
         };
         progress(&result);

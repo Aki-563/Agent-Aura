@@ -957,6 +957,7 @@ async fn autonomous_loop(
     let mut settled_capture: Option<EncodedCapture> = None;
     let mut done_rejections = 0u8;
     let run_started = Instant::now();
+    let mut captcha_handed_off = false;
     let model_calls_at_start = model_calls_so_far();
 
     'steps: for step_number in 1..=max_steps {
@@ -1063,6 +1064,31 @@ async fn autonomous_loop(
                 "observeMs": observe_ms,
             }),
         );
+        // A CAPTCHA or "prove you are human" screen is for the person, not the model: ask once, then
+        // look again (it stays handed off until the words are gone from the screen).
+        let screen_labels: Vec<String> = encoded.elements.iter().map(|e| e.label.clone()).chain(encoded.candidates.iter().map(|c| c.label.clone())).collect();
+        if crate::perception::looks_like_captcha(&screen_labels) {
+            if !captcha_handed_off {
+                captcha_handed_off = true;
+                trace.event(step_number, "captcha_handoff", json!({}));
+                set_hud(state, HudState::Settling);
+                emit_status(window, "confirm", step_number, "A human check needs you");
+                let id = format!("{run_id}-{step_number}-captcha");
+                let helped = request_confirmation(window, state, &id, "This page asks you to prove you are human (a CAPTCHA). Please complete it yourself, then press \"Done, continue\".", "help").await;
+                set_hud(state, HudState::Thinking);
+                if crate::input::killswitch::is_killed() {
+                    return Ok(stopped_response(executed_steps));
+                }
+                if !helped {
+                    return Ok(AutonomousResponse { completed: false, stopped: false, steps_executed: executed_steps, message: "Stopped: the page needs a human check (CAPTCHA) and you could not complete it.".to_owned() });
+                }
+                settled_capture = None;
+                continue;
+            }
+        } else {
+            captcha_handed_off = false;
+        }
+
         let model_started = Instant::now();
         let screenshot_data_url =
             format!("data:image/png;base64,{}", BASE64.encode(&encoded.webp));
@@ -1420,6 +1446,38 @@ async fn autonomous_loop(
                 steps_executed: executed_steps,
                 message: "Aura's own window covers the click target and could not be moved away.".to_owned(),
             });
+        }
+
+        // Passwords are typed by the person, never by the model (and never end up in a trace).
+        if matches!(final_action, ActionPrimitive::TypeText { .. } | ActionPrimitive::TypeWith { .. })
+            && tokio::task::spawn_blocking(crate::perception::focused_is_password).await.unwrap_or(false)
+        {
+            trace.event(step_number, "password_handoff", json!({}));
+            set_hud(state, HudState::Settling);
+            emit_status(window, "confirm", step_number, "A password needs you");
+            let id = format!("{run_id}-{step_number}-password");
+            let helped = request_confirmation(window, state, &id, "The agent reached a password field. Please type the password yourself, then press \"Done, continue\". Aura will not type or see it.", "help").await;
+            set_hud(state, HudState::Thinking);
+            if crate::input::killswitch::is_killed() {
+                return Ok(stopped_response(executed_steps));
+            }
+            session.push(StepRecord {
+                step: step_number,
+                thought: String::new(),
+                target: proposal.target.clone(),
+                expected_outcome: proposal.expected_outcome.clone(),
+                action: ActionPrimitive::Note { text: "password field".to_owned() },
+                outcome: StepOutcome::Uncertain,
+                verification_reason: String::new(),
+                window_title: encoded.window.title.clone(),
+                effect: if helped {
+                    "The user typed the password themselves (it was not typed by Aura). Look at the screen again and continue.".to_owned()
+                } else {
+                    "The user did not enter the password. Do not try again; use the fail action or another approach.".to_owned()
+                },
+            });
+            settled_capture = None;
+            continue;
         }
 
         // Last check before input: a stop, pause or steer since the model was asked makes this

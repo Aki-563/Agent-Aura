@@ -402,6 +402,7 @@ if(e.clientX>r.left&&e.clientX<r.right&&e.clientY>r.top&&e.clientY<r.bottom)ev('
             "<h1>Layout shift</h1><div id=spacer style='height:0'></div><button onclick=\"ev('click:target')\">Target</button><script>document.addEventListener('keydown',function(e){if(e.key=='F9'){document.getElementById('spacer').style.height='160px';ev('shifted')}})</script>",
         ),
         "/canvas" => shell("Canvas", CANVAS_BODY),
+        "/login" => shell("Login", "<h1>Sign in</h1><p><input id=user type=text placeholder=\"Username\"></p><p><input id=pw type=password placeholder=\"Password\"></p><p><label><input type=checkbox> I'm not a robot</label></p>"),
         "/load" => shell("Load", LOAD_BODY),
         "/links/pricing" => shell("Pricing", "<h1>Pricing</h1><script>ev('visit:pricing')</script><p>The plan costs 5 dollars.</p>"),
         "/links/about" => shell("About", "<h1>About us</h1><script>ev('visit:about')</script>"),
