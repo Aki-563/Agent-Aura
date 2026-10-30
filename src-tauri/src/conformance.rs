@@ -2318,6 +2318,35 @@ fn orders_a_miscounted_element_is_corrected_by_its_name(_lab: &Lab) -> Result<()
     expect_no_event("click:alpha")
 }
 
+/// Runs whole proposals (target text included), each a step, then done.
+fn run_proposals(proposals: Vec<serde_json::Value>) -> Result<(), String> {
+    use crate::mock_server::{replies, MockServer};
+    let mut script: Vec<(&str, String)> = proposals.into_iter().map(|p| ("aura_proposal", p.to_string())).collect();
+    script.push(("aura_proposal", replies::proposal(serde_json::json!({"type": "done", "summary": "done"}), "finish")));
+    script.push(("aura_verification", replies::accept_verification()));
+    script.push(("aura_done_check", replies::done_check(true, "")));
+    let steps = script.len() as u32 + 2;
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|e| e.to_string())?;
+    runtime.block_on(async move {
+        let server = MockServer::start(script).await.map_err(|e| e.to_string())?;
+        let state = crate::agent::AgentRuntime::with_data_root(std::env::temp_dir().join("aura-orders-proposals"), false)?;
+        state.set_provider(crate::agent::ProviderConfigInput { protocol: crate::agent::ApiProtocol::OpenAiCompatibleChat, base_url: server.base_url.clone(), model: "scripted-orders".into(), api_key: String::new() })?;
+        crate::agent::execute_run(&state, &crate::agent::Host::new(SilentHost), ORDERS_TASK.to_owned(), steps).await.map(|_| ())
+    })
+}
+
+fn orders_a_point_on_the_wrong_button_is_moved_to_the_named_one(_lab: &Lab) -> Result<(), String> {
+    open_page("/click", "Click")?;
+    let (_, ax, ay) = seen(ORDERS_TASK, "Alpha")?;
+    run_proposals(vec![serde_json::json!({
+        "previousOutcome": "not_applicable", "reflection": "r", "thought": "click Gamma",
+        "target": {"description": "the Gamma button", "visibleText": "Gamma"},
+        "expectedOutcome": "Gamma is clicked", "action": {"type": "click", "x": ax, "y": ay}, "impact": "routine"
+    })])?;
+    expect_event("click:gamma")?;
+    expect_no_event("click:alpha")
+}
+
 fn orders_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
     vec![
         ("orders", "click by element number", orders_click_by_element_number),
@@ -2328,6 +2357,7 @@ fn orders_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
         ("orders", "drag between elements", orders_drag_between_elements),
         ("orders", "scroll, then click what appeared", orders_scroll_then_click_what_appeared),
         ("orders", "a miscounted element is corrected by its name", orders_a_miscounted_element_is_corrected_by_its_name),
+        ("orders", "a point on the wrong button is moved to the named one", orders_a_point_on_the_wrong_button_is_moved_to_the_named_one),
     ]
 }
 

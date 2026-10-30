@@ -2516,6 +2516,24 @@ USER:
                 crate::testlog::record("grounding", "element_check", json!({"note": &note}));
             }
         }
+    } else if let (true, Some(point), Some(wanted)) = (proposal_elements.is_empty(), first_raw_point(&proposal.action), proposal.target.visible_text.clone().filter(|t| !t.trim().is_empty())) {
+        // Raw coordinates: the same check by name. A point on (or near) something else while
+        // exactly one element carries the name the model gave is moved onto that element.
+        let under = capture.elements.iter().find(|e| point.0 >= e.left && point.0 <= e.right && point.1 >= e.top && point.1 <= e.bottom);
+        let agrees = under.is_some_and(|e| crate::coords::label_agrees(&e.label, &wanted));
+        if !agrees {
+            if let Some(better) = crate::coords::exactly_named(&capture.elements, &wanted) {
+                set_first_point(&mut proposal.action, better.center());
+                let note = format!(
+                    "the point {point:?} is on {}, not '{wanted}'; aimed at element {} '{}' instead",
+                    under.map(|e| format!("'{}'", e.label)).unwrap_or_else(|| "no element".to_owned()),
+                    better.id,
+                    better.label
+                );
+                trace.json("element_check.json", &json!({"note": &note}));
+                crate::testlog::record("grounding", "point_check", json!({"note": &note}));
+            }
+        }
     }
     let target_text = proposal.target.visible_text.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| proposal.target.description.clone());
     let raw_point = first_raw_point(&proposal.action).filter(|p| !capture.elements.iter().any(|e| e.center() == *p));
