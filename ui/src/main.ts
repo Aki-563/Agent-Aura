@@ -57,51 +57,50 @@ const app = document.querySelector<HTMLDivElement>("#app")!;
 
 app.innerHTML = `
   <section id="run-view" class="run-view" aria-live="polite">
-    <div class="run-head">
-      <span class="run-brand">Agent Aura</span>
-      <span id="run-step" class="run-step">Step 0</span>
-    </div>
-    <div id="run-status" class="run-status phase-starting">
-      <span class="run-dot"></span>
-      <div>
-        <div id="run-phase" class="run-phase">Starting</div>
-        <div id="run-detail" class="run-detail">Getting ready…</div>
+    <div id="mini" class="mini">
+      <div class="mini-bar">
+        <span id="mini-dot" class="mini-dot phase-starting"></span>
+        <div class="mini-text">
+          <div id="mini-main" class="swap"><span class="swap-line current">Getting ready</span></div>
+          <div id="mini-sub" class="mini-sub">Starting</div>
+        </div>
+      </div>
+      <div id="mini-more" class="mini-more">
+        <div class="mini-more-inner">
+          <div class="mini-actions">
+            <button id="run-pause" class="mini-btn" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14M16 5v14" /></svg><span id="run-pause-label">Pause</span>
+            </button>
+            <button id="run-mic" class="mini-btn icon-only" type="button" aria-pressed="false" title="Voice input (coming soon)">
+              <svg class="mic-on" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="12" rx="3" /><path d="M5 11a7 7 0 0 0 14 0M12 18v3" /></svg>
+              <svg class="mic-off" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="12" rx="3" /><path d="M5 11a7 7 0 0 0 14 0M12 18v3M4 4l16 16" /></svg>
+            </button>
+            <button id="run-stop" class="mini-btn danger" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2" /></svg><span>End task</span>
+            </button>
+          </div>
+          <form id="run-steer-form" class="steer" autocomplete="off">
+            <input id="run-steer-text" type="text" placeholder="Tell Aura what to change…" maxlength="400" />
+            <button id="run-steer-send" class="steer-send" type="submit" aria-label="Send" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7" /></svg>
+            </button>
+          </form>
+          <div id="run-confirm" class="run-confirm hidden" role="alertdialog" aria-live="assertive">
+            <div id="run-confirm-title" class="run-confirm-title">Allow this action?</div>
+            <div id="run-confirm-text" class="run-confirm-text"></div>
+            <div class="run-confirm-buttons">
+              <button id="run-confirm-deny" class="mini-btn" type="button">No, choose another way</button>
+              <button id="run-confirm-allow" class="mini-btn primary" type="button">Yes, allow it</button>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
-    <div class="run-block">
-      <div class="run-label">Plan</div>
-      <div id="run-thought" class="run-text">—</div>
-    </div>
-    <div class="run-block">
-      <div class="run-label">Action</div>
-      <div id="run-action" class="run-text run-mono">—</div>
-    </div>
-    <div class="run-block">
-      <div class="run-label">What happened</div>
-      <div id="run-result" class="run-text">—</div>
-    </div>
-    <div id="run-confirm" class="run-confirm hidden" role="alertdialog" aria-live="assertive">
-      <div id="run-confirm-title" class="run-confirm-title">Allow this action?</div>
-      <div id="run-confirm-text" class="run-confirm-text"></div>
-      <div class="run-confirm-buttons">
-        <button id="run-confirm-deny" class="button danger" type="button">No, choose another way</button>
-        <button id="run-confirm-allow" class="button primary" type="button">Yes, allow it</button>
-      </div>
-    </div>
-    <div id="run-steer" class="run-confirm hidden" role="dialog">
-      <div class="run-confirm-title">Tell the agent what to do differently</div>
-      <textarea id="run-steer-text" rows="3" placeholder="For example: wrong, go back · use the other tab · save it as PDF instead"></textarea>
-      <div class="run-confirm-buttons">
-        <button id="run-steer-cancel" class="button" type="button">Cancel</button>
-        <button id="run-steer-send" class="button primary" type="button">Send and continue</button>
-      </div>
-    </div>
-    <img id="run-shot" class="run-shot hidden" alt="Latest screen the agent saw" />
-    <div id="run-log" class="run-log"></div>
-    <div class="run-controls">
-      <button id="run-pause" class="button" type="button">Pause (Pause key)</button>
-      <button id="run-steer-open" class="button" type="button">Steer (Ctrl+Alt+Space)</button>
-      <button id="run-stop" class="button danger run-stop" type="button">Stop (Esc)</button>
+    <!-- Details the progress handlers still fill in; not shown in the mini player. -->
+    <div class="run-legacy hidden">
+      <span id="run-step"></span><div id="run-status"></div><span id="run-phase"></span><span id="run-detail"></span>
+      <div id="run-thought"></div><div id="run-action"></div><div id="run-result"></div>
+      <img id="run-shot" alt="" /><div id="run-log"></div>
     </div>
   </section>
 
@@ -231,22 +230,20 @@ element<HTMLButtonElement>("run-stop").addEventListener("click", stopAutonomousT
 element<HTMLButtonElement>("run-confirm-allow").addEventListener("click", () => void answerConfirmation(true));
 element<HTMLButtonElement>("run-confirm-deny").addEventListener("click", () => void answerConfirmation(false));
 element<HTMLButtonElement>("run-pause").addEventListener("click", () => void togglePause());
-element<HTMLButtonElement>("run-steer-open").addEventListener("click", () => void openSteerBox());
-element<HTMLButtonElement>("run-steer-cancel").addEventListener("click", () => void closeSteerBox(false));
-element<HTMLButtonElement>("run-steer-send").addEventListener("click", () => void closeSteerBox(true));
-element<HTMLTextAreaElement>("run-steer-text").addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey) {
-    event.preventDefault();
-    void closeSteerBox(true);
-  }
-});
+element<HTMLButtonElement>("run-mic").addEventListener("click", toggleMic);
+initMiniPlayer();
 window.setInterval(() => void pollRunControls(), 250);
+window.setInterval(() => void keepOnTop(), 2000);
 
 updateProtocolFields();
 void refreshProviderStatus();
+void listen<{ text: string }>("agent-voice", (event) => {
+  hasVoiceLine = true;
+  setMiniText(event.payload.text);
+});
 void listen<AutonomousProgress>("agent-progress", (event) => renderAutonomousProgress(event.payload));
 void listen<{ id: string; message: string; kind?: string }>("agent-confirm", (event) =>
-  showConfirmation(event.payload.id, event.payload.message, event.payload.kind ?? "approval"),
+  { showConfirmation(event.payload.id, event.payload.message, event.payload.kind ?? "approval"); openMini(); },
 );
 
 function element<T extends HTMLElement>(id: string): T {
@@ -383,10 +380,15 @@ const PHASE_LABELS: Record<string, { label: string; className: string }> = {
 };
 
 let runMaxSteps = 0;
+let hasVoiceLine = false;
 
 function resetRunView(maxSteps: number): void {
   runMaxSteps = maxSteps;
-  setRunStatus("starting", "Getting ready…");
+  hasVoiceLine = false;
+  miniOpen = false;
+  element<HTMLElement>("mini").classList.remove("open");
+  setPausedUi(false);
+  setRunStatus("starting", "Getting ready");
   element<HTMLElement>("run-step").textContent = `Step 0 of ${maxSteps}`;
   element<HTMLElement>("run-thought").textContent = "—";
   element<HTMLElement>("run-action").textContent = "—";
@@ -397,6 +399,9 @@ function resetRunView(maxSteps: number): void {
 
 function setRunStatus(phase: string, detail: string): void {
   const info = PHASE_LABELS[phase] ?? { label: phase, className: "phase-starting" };
+  setMiniPhase(info.className);
+  if (!runPaused || phase === "paused") setMiniSub(info.label);
+  if (!hasVoiceLine) setMiniText(detail.length > 70 ? info.label : detail);
   element<HTMLElement>("run-status").className = `run-status ${info.className}`;
   element<HTMLElement>("run-phase").textContent = info.label;
   element<HTMLElement>("run-detail").textContent = detail;
@@ -500,9 +505,13 @@ async function saveReview(input: Record<string, unknown>): Promise<void> {
   }
 }
 
-// ---- Pause, resume and steering (the run keeps its progress; nothing restarts from zero) ----
+// ---- Mini player: pause, steer, mic, changing words ----------------------------------------
 
 let runPaused = false;
+let steerOpen = false;
+let miniOpen = false;
+let collapseTimer: number | undefined;
+let lastPhaseClass = "phase-starting";
 
 async function togglePause(): Promise<void> {
   try {
@@ -512,32 +521,172 @@ async function togglePause(): Promise<void> {
   }
 }
 
-async function openSteerBox(): Promise<void> {
+function setPausedUi(paused: boolean): void {
+  runPaused = paused;
+  element<HTMLElement>("run-pause-label").textContent = paused ? "Resume" : "Pause";
+  element<HTMLElement>("run-pause").classList.toggle("active", paused);
+  if (paused) {
+    setMiniSub("Paused");
+  }
+}
+
+/** Shows `text` as the main line. The old line lifts away and blurs while the new one rises in. */
+function setMiniText(text: string): void {
+  const host = element<HTMLElement>("mini-main");
+  const current = host.querySelector<HTMLElement>(".swap-line.current");
+  if (current && current.textContent === text) return;
+  const next = document.createElement("span");
+  next.className = "swap-line entering";
+  next.textContent = text;
+  host.appendChild(next);
+  current?.classList.replace("current", "leaving");
+  // Two frames so the browser registers the starting state before the transition begins.
+  requestAnimationFrame(() => requestAnimationFrame(() => next.classList.replace("entering", "current")));
+  window.setTimeout(() => host.querySelectorAll(".swap-line.leaving").forEach((line) => line.remove()), 650);
+}
+
+function setMiniSub(text: string): void {
+  const sub = element<HTMLElement>("mini-sub");
+  if (sub.textContent === text) return;
+  sub.classList.add("fading");
+  window.setTimeout(() => {
+    sub.textContent = text;
+    sub.classList.remove("fading");
+  }, 160);
+}
+
+function setMiniPhase(className: string): void {
+  if (className === lastPhaseClass) return;
+  const dot = element<HTMLElement>("mini-dot");
+  dot.classList.replace(lastPhaseClass, className) || dot.classList.add(className);
+  lastPhaseClass = className;
+}
+
+/** The window is resized to fit the player: the page tells the window how tall it needs to be. */
+function desiredHeight(): number {
+  const bar = 56;
+  const more = element<HTMLElement>("mini-more-inner").scrollHeight;
+  return miniOpen ? bar + more + 36 : 84;
+}
+
+async function syncHeight(): Promise<void> {
+  try {
+    await invoke("set_mini_height", { height: desiredHeight() });
+  } catch {
+    // Resizing is cosmetic; a failure leaves the player at its current size.
+  }
+}
+
+function openMini(): void {
+  window.clearTimeout(collapseTimer);
+  if (miniOpen) return;
+  miniOpen = true;
+  // Grow the window first (it is transparent), then let the card unfold with an eased animation.
+  void syncHeight().then(() => element<HTMLElement>("mini").classList.add("open"));
+}
+
+function scheduleCollapse(): void {
+  window.clearTimeout(collapseTimer);
+  collapseTimer = window.setTimeout(() => {
+    const confirmShown = !element<HTMLElement>("run-confirm").classList.contains("hidden");
+    if (steerOpen || confirmShown || !miniOpen) return;
+    miniOpen = false;
+    element<HTMLElement>("mini").classList.remove("open");
+    // Shrink the window after the card has folded away.
+    window.setTimeout(() => {
+      if (!miniOpen) void syncHeight();
+    }, 520);
+  }, 650);
+}
+
+function initMiniPlayer(): void {
+  const view = element<HTMLElement>("run-view");
+  view.addEventListener("mouseenter", openMini);
+  view.addEventListener("mouseleave", scheduleCollapse);
+  const input = element<HTMLInputElement>("run-steer-text");
+  const send = element<HTMLButtonElement>("run-steer-send");
+  input.addEventListener("input", () => (send.disabled = input.value.trim().length === 0));
+  input.addEventListener("focus", () => void beginSteering());
+  input.addEventListener("blur", () => void endSteering(false));
+  element<HTMLFormElement>("run-steer-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    void sendSteer();
+  });
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      input.value = "";
+      input.blur();
+    }
+  });
+  // Keep the window height right when the content changes (approval card appears, text wraps).
+  new ResizeObserver(() => miniOpen && void syncHeight()).observe(element<HTMLElement>("mini-more-inner"));
+  setMicUi(localStorage.getItem("aura.mic") === "on");
+}
+
+/** Typing a correction pauses the run (so nothing happens mid-sentence) and lets the box take focus. */
+async function beginSteering(): Promise<void> {
+  if (steerOpen) return;
+  steerOpen = true;
   try {
     await invoke("set_steer_box_open", { open: true });
   } catch (error) {
     log("error", toMessage(error));
   }
-  element<HTMLElement>("run-steer").classList.remove("hidden");
-  element<HTMLTextAreaElement>("run-steer-text").focus();
 }
 
-async function closeSteerBox(send: boolean): Promise<void> {
-  const box = element<HTMLTextAreaElement>("run-steer-text");
-  const text = box.value.trim();
-  element<HTMLElement>("run-steer").classList.add("hidden");
+async function endSteering(sent: boolean): Promise<void> {
+  if (!steerOpen) return;
+  steerOpen = false;
+  const input = element<HTMLInputElement>("run-steer-text");
   try {
     await invoke("set_steer_box_open", { open: false });
-    if (send && text) {
-      await invoke("steer_autonomous_task", { text });
-      log("info", `New instruction sent: ${text}`);
-    } else {
-      await invoke("resume_autonomous_task");
-    }
+    // Leaving the box empty-handed resumes; a half-written message stays and the run stays paused.
+    if (!sent && input.value.trim().length === 0) await invoke("resume_autonomous_task");
   } catch (error) {
     log("error", toMessage(error));
   }
-  box.value = "";
+  scheduleCollapse();
+}
+
+async function sendSteer(): Promise<void> {
+  const input = element<HTMLInputElement>("run-steer-text");
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = "";
+  element<HTMLButtonElement>("run-steer-send").disabled = true;
+  try {
+    await invoke("steer_autonomous_task", { text });
+    log("info", `New instruction sent: ${text}`);
+    setMiniText("Got it, adjusting");
+  } catch (error) {
+    log("error", toMessage(error));
+  }
+  steerOpen = true; // endSteering only acts when the box was open
+  await endSteering(true);
+  input.blur();
+}
+
+function setMicUi(on: boolean): void {
+  const button = element<HTMLButtonElement>("run-mic");
+  button.setAttribute("aria-pressed", String(on));
+  button.classList.toggle("active", on);
+  button.title = on ? "Voice input on (coming soon)" : "Voice input off (coming soon)";
+}
+
+/** Voice input is not wired yet; the switch keeps the setting for when it is. */
+function toggleMic(): void {
+  const on = element<HTMLButtonElement>("run-mic").getAttribute("aria-pressed") !== "true";
+  localStorage.setItem("aura.mic", on ? "on" : "off");
+  setMicUi(on);
+}
+
+async function keepOnTop(): Promise<void> {
+  if (!document.body.classList.contains("running")) return;
+  try {
+    await invoke("keep_run_panel_on_top");
+  } catch {
+    // Best effort.
+  }
 }
 
 async function pollRunControls(): Promise<void> {
@@ -545,11 +694,13 @@ async function pollRunControls(): Promise<void> {
   try {
     const status = await invoke<{ paused: boolean; pauseReason: string; openSteerBox: boolean }>("run_control_status");
     if (status.paused !== runPaused) {
-      runPaused = status.paused;
-      element<HTMLButtonElement>("run-pause").textContent = runPaused ? "Resume (Pause key)" : "Pause (Pause key)";
+      setPausedUi(status.paused);
       log("info", runPaused ? `Paused: ${status.pauseReason}` : "Resumed: the agent looks at the screen again.");
     }
-    if (status.openSteerBox) await openSteerBox();
+    if (status.openSteerBox) {
+      openMini();
+      element<HTMLInputElement>("run-steer-text").focus();
+    }
   } catch {
     // The status poll is best effort; a failed poll changes nothing.
   }

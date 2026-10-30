@@ -122,6 +122,27 @@ struct RenderContext {
     ripples: Vec<RippleEffect>,
 }
 
+/// Easing used by every HUD animation: slow start, slow finish (like iOS's standard curve).
+pub fn ease_in_out(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
+/// Fast start, gentle landing (for things that appear).
+pub fn ease_out(t: f32) -> f32 {
+    let t = 1.0 - t.clamp(0.0, 1.0);
+    1.0 - t * t * t
+}
+
+fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
+}
+
+/// How long a colour change between two states takes.
+const COLOR_TRANSITION_SECS: f32 = 0.55;
+/// How long the HUD takes to appear and to disappear.
+const FADE_SECS: f32 = 0.45;
+
 pub struct GlowRenderer {
     window: Arc<OverlayWindow>,
     context: Arc<Mutex<RenderContext>>,
@@ -153,9 +174,8 @@ impl GlowRenderer {
             ctx.state = state;
         }
 
-        if state == HudState::Inactive {
-            self.window.hide();
-        } else {
+        // Hiding is done by the render loop once the glow has faded out (an eased fade, not a cut).
+        if state != HudState::Inactive {
             self.window.show();
         }
     }
@@ -211,16 +231,32 @@ impl GlowRenderer {
             };
 
             let pixel_count = (width * height) as usize;
-            let mut label_cache: Option<(&'static str, LabelMask)> = None;
+            let mut label_cur: Option<(&'static str, LabelMask)> = None;
+            let mut label_prev: Option<LabelMask> = None;
+            let mut label_changed = Instant::now();
+            let mut last_label_text: Option<&'static str> = None;
+            let mut pill_w_disp: f32 = 0.0;
             let start_instant = Instant::now();
             let target_frame_dur = Duration::from_millis(16); // ~60 FPS
+            // Eased state: the colour glides between states, the glow fades in and out, and the
+            // brightness follows its target through a low-pass instead of jumping.
+            let mut color_from = [147.0f32, 51.0, 234.0];
+            let mut color_to = color_from;
+            let mut color_cur = color_from;
+            let mut color_started = Instant::now();
+            let mut master_p: f32 = 0.0;
+            let mut alpha_disp: f32 = 0.0;
+            let mut last_frame = Instant::now();
+            let mut hidden = true;
+            let mut last_topmost = Instant::now();
 
             while running.load(Ordering::SeqCst) {
                 let frame_start = Instant::now();
+                let dt = frame_start.duration_since(last_frame).as_secs_f32().min(0.1);
+                last_frame = frame_start;
                 let elapsed_secs = start_instant.elapsed().as_secs_f32();
 
                 // Snapshot current context
-                let mut hide_now = false;
                 let (current_state, state_age, halo_enabled, active_ripples) = {
                     let mut guard = match context.lock() {
                         Ok(g) => g,
@@ -228,16 +264,64 @@ impl GlowRenderer {
                     };
                     // Clean up finished ripples
                     guard.ripples.retain(|r| r.start_time.elapsed() < r.duration);
-                    // The "finished" banner hides itself.
+                    // The "finished" banner leaves by itself (the fade-out below is eased).
                     if guard.state == HudState::Finished && guard.state_since.elapsed().as_secs_f32() > FINISHED_SHOW_SECS {
                         guard.state = HudState::Inactive;
                         guard.state_since = Instant::now();
-                        hide_now = true;
                     }
                     (guard.state, guard.state_since.elapsed().as_secs_f32(), guard.halo_enabled, guard.ripples.clone())
                 };
-                if hide_now {
-                    window.hide();
+                let _ = state_age;
+
+                // Fade in and out with an ease-in-out curve; hide the window only once fully faded.
+                let active = current_state != HudState::Inactive;
+                let fade_step = dt / FADE_SECS;
+                master_p = if active { (master_p + fade_step).min(1.0) } else { (master_p - fade_step).max(0.0) };
+                let master = ease_in_out(master_p);
+                if !active && master_p <= 0.0 {
+                    if !hidden {
+                        window.hide();
+                        hidden = true;
+                    }
+                    thread::sleep(Duration::from_millis(40));
+                    continue;
+                }
+                let just_shown = hidden;
+                hidden = false;
+
+                // The colour glides to the new state's colour (no cut between purple and cyan).
+                if active {
+                    let base = current_state.base_color();
+                    let target = [base.r as f32, base.g as f32, base.b as f32];
+                    if just_shown {
+                        color_from = target;
+                        color_to = target;
+                        color_cur = target;
+                    } else if target != color_to {
+                        color_from = color_cur;
+                        color_to = target;
+                        color_started = Instant::now();
+                    }
+                }
+                color_cur = lerp3(color_from, color_to, ease_in_out(color_started.elapsed().as_secs_f32() / COLOR_TRANSITION_SECS));
+                let color = RgbColor { r: color_cur[0].round() as u8, g: color_cur[1].round() as u8, b: color_cur[2].round() as u8 };
+
+                // Keep above every other window, including other always-on-top ones.
+                if last_topmost.elapsed() >= Duration::from_secs(1) {
+                    last_topmost = Instant::now();
+                    unsafe {
+                        windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                            hwnd,
+                            windows_sys::Win32::UI::WindowsAndMessaging::HWND_TOPMOST,
+                            0,
+                            0,
+                            0,
+                            0,
+                            windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                                | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
+                                | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+                        );
+                    }
                 }
 
                 // Clear premultiplied ARGB buffer to zero
@@ -245,68 +329,71 @@ impl GlowRenderer {
                     ptr::write_bytes(bits, 0, pixel_count * 4);
                 }
 
-                if current_state != HudState::Inactive {
+                {
                     let buffer_slice = unsafe {
                         std::slice::from_raw_parts_mut(bits as *mut u32, pixel_count)
                     };
 
-                    // 1. Calculate breathing alpha modulation based on state
-                    let (alpha_scale, color) = match current_state {
-                        HudState::Thinking => {
-                            // 1.5s sine-wave breathing pulse (cycles between 0.35 and 1.0)
-                            let sine = (elapsed_secs * (2.0 * std::f32::consts::PI / 1.5)).sin();
-                            let alpha = 0.35 + 0.65 * (0.5 + 0.5 * sine);
-                            (alpha, current_state.base_color())
-                        }
-                        HudState::Working => (1.0, current_state.base_color()),
-                        HudState::Settling => {
-                            // Soft 0.8s shimmering pulse
-                            let shimmer = (elapsed_secs * 6.0).sin();
-                            let alpha = 0.55 + 0.45 * (0.5 + 0.5 * shimmer);
-                            (alpha, current_state.base_color())
-                        }
+                    // 1. Target brightness per state (smooth breathing, no hard edges), then a
+                    //    low-pass so a change of state eases instead of jumping.
+                    let target_alpha = match current_state {
+                        // 1.5 s breathing between 0.35 and 1.0
+                        HudState::Thinking => 0.35 + 0.65 * (0.5 + 0.5 * (elapsed_secs * (2.0 * std::f32::consts::PI / 1.5)).sin()),
+                        HudState::Working => 1.0,
+                        HudState::Settling => 0.55 + 0.45 * (0.5 + 0.5 * (elapsed_secs * 3.2).sin()),
+                        // Two soft pulses per second instead of a hard on/off flash.
                         HudState::Emergency => {
-                            // Rapid double-flash pattern
                             let cycle = elapsed_secs % 1.0;
-                            let alpha = if (cycle > 0.0 && cycle < 0.18) || (cycle > 0.28 && cycle < 0.46) {
-                                1.0
-                            } else {
-                                0.0
-                            };
-                            (alpha, current_state.base_color())
+                            let bump = |centre: f32| 0.5 * (1.0 + (std::f32::consts::PI * ((cycle - centre) / 0.13).clamp(-1.0, 1.0)).cos());
+                            0.25 + 0.75 * bump(0.1).max(bump(0.4))
                         }
-                        HudState::Capturing => (0.85, current_state.base_color()),
-                        HudState::Finished => {
-                            // Bright, then fading out over the last second.
-                            let fade = (FINISHED_SHOW_SECS - state_age).clamp(0.0, 1.0);
-                            (0.95 * fade, current_state.base_color())
-                        }
-                        HudState::Inactive => (0.0, current_state.base_color()),
+                        HudState::Capturing => 0.85,
+                        HudState::Finished => 0.95,
+                        HudState::Inactive => alpha_disp,
                     };
+                    alpha_disp += (target_alpha - alpha_disp) * (1.0 - (-dt / 0.14).exp());
+                    let alpha_scale = alpha_disp * master;
 
-                    // 2. Render Screen-Edge Glow (14px gradient border)
+                    // 2. Screen-edge glow (soft quadratic falloff)
                     if alpha_scale > 0.01 {
-                        Self::render_edge_glow(buffer_slice, width, height, &color, 14, alpha_scale);
+                        Self::render_edge_glow(buffer_slice, width, height, &color, 22, alpha_scale);
                     }
 
-                    // 2b. Status label at the top centre of the primary screen
+                    // 2b. Status pill at the top centre of the primary screen
                     if let Some(text) = current_state.label() {
-                        if label_cache.as_ref().map(|(cached, _)| *cached != text).unwrap_or(true) {
-                            label_cache = Self::render_label_mask(text).map(|mask| (text, mask));
+                        if last_label_text != Some(text) {
+                            label_prev = label_cur.take().map(|(_, mask)| mask);
+                            label_cur = Self::render_label_mask(text).map(|mask| (text, mask));
+                            label_changed = Instant::now();
+                            last_label_text = Some(text);
                         }
-                        if let Some((_, mask)) = label_cache.as_ref() {
-                            let (vx, vy, _, _) = window.bounds();
-                            let primary_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-                            let center_x = -vx + primary_w / 2;
-                            let appear = (state_age / 0.18).clamp(0.0, 1.0);
-                            let fade_out = if current_state == HudState::Finished {
-                                ((FINISHED_SHOW_SECS - state_age) / 0.8).clamp(0.0, 1.0)
-                            } else {
-                                1.0
-                            };
-                            let pulse = if current_state == HudState::Working { 1.0 } else { 0.75 + 0.25 * (elapsed_secs * 4.0).sin().abs() };
-                            Self::render_label_pill(buffer_slice, width, height, center_x, -vy + 26, mask, &color, appear * fade_out, pulse);
+                    }
+                    if let Some((_, mask)) = label_cur.as_ref() {
+                        let (vx, vy, _, _) = window.bounds();
+                        let primary_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+                        let center_x = -vx + primary_w / 2;
+                        // Words crossfade and slide a few pixels; the capsule's width glides.
+                        let swap = ease_in_out(label_changed.elapsed().as_secs_f32() / 0.32);
+                        if swap >= 1.0 {
+                            label_prev = None;
                         }
+                        let target_w = (mask.width + 60) as f32;
+                        if pill_w_disp < 1.0 || just_shown {
+                            pill_w_disp = target_w;
+                        } else {
+                            pill_w_disp += (target_w - pill_w_disp) * (1.0 - (-dt / 0.10).exp());
+                        }
+                        let scale = 0.90 + 0.10 * master;
+                        let (pill_w, pill_h) = (pill_w_disp * scale, 44.0 * scale);
+                        let top = -vy + 22 - ((1.0 - master) * 12.0) as i32;
+                        let has_prev = label_prev.is_some();
+                        let mut lines: Vec<(&LabelMask, f32, f32)> = Vec::new();
+                        if let Some(prev) = label_prev.as_ref() {
+                            lines.push((prev, 1.0 - swap, -6.0 * swap));
+                        }
+                        lines.push((mask, if has_prev { swap } else { 1.0 }, if has_prev { 6.0 * (1.0 - swap) } else { 0.0 }));
+                        let dot_pulse = 0.85 + 0.15 * (elapsed_secs * 3.0).sin();
+                        Self::render_label_pill(buffer_slice, width, height, center_x, top, pill_w, pill_h, &lines, &color_cur, master, dot_pulse);
                     }
 
                     // 3. Render Glowing Halo Cursor
@@ -320,7 +407,7 @@ impl GlowRenderer {
                         let cy = pt.y - vy;
 
                         if cx >= 0 && cx < width && cy >= 0 && cy < height {
-                            Self::render_halo_cursor(buffer_slice, width, height, cx, cy, &color, 0.85);
+                            Self::render_halo_cursor(buffer_slice, width, height, cx, cy, &color, 0.85 * master);
                         }
                     }
 
@@ -331,7 +418,7 @@ impl GlowRenderer {
                         let progress = (elapsed / total).clamp(0.0, 1.0);
 
                         let radius = 10.0 + (ripple.max_radius - 10.0) * progress;
-                        let ripple_alpha = (1.0 - progress) * 0.9;
+                        let ripple_alpha = (1.0 - ease_out(progress)) * 0.9 * master;
 
                         Self::render_ripple_ring(
                             buffer_slice,
@@ -462,7 +549,7 @@ impl GlowRenderer {
 
         // Top border
         for y in 0..g.min(height) {
-            let factor = 1.0 - (y as f32 / g as f32);
+            let factor = (1.0 - (y as f32 / g as f32)).powf(2.2);
             let a = ((255.0 * factor * alpha_scale) as u32).min(255);
             let px = Self::pack_premultiplied(color, a);
             for x in 0..width {
@@ -474,7 +561,7 @@ impl GlowRenderer {
         // Bottom border
         for y in 0..g.min(height) {
             let row = height - 1 - y;
-            let factor = 1.0 - (y as f32 / g as f32);
+            let factor = (1.0 - (y as f32 / g as f32)).powf(2.2);
             let a = ((255.0 * factor * alpha_scale) as u32).min(255);
             let px = Self::pack_premultiplied(color, a);
             for x in 0..width {
@@ -485,7 +572,7 @@ impl GlowRenderer {
 
         // Left border
         for x in 0..g.min(width) {
-            let factor = 1.0 - (x as f32 / g as f32);
+            let factor = (1.0 - (x as f32 / g as f32)).powf(2.2);
             let a = ((255.0 * factor * alpha_scale) as u32).min(255);
             let px = Self::pack_premultiplied(color, a);
             for y in 0..height {
@@ -497,7 +584,7 @@ impl GlowRenderer {
         // Right border
         for x in 0..g.min(width) {
             let col = width - 1 - x;
-            let factor = 1.0 - (x as f32 / g as f32);
+            let factor = (1.0 - (x as f32 / g as f32)).powf(2.2);
             let a = ((255.0 * factor * alpha_scale) as u32).min(255);
             let px = Self::pack_premultiplied(color, a);
             for y in 0..height {
@@ -594,7 +681,7 @@ impl GlowRenderer {
             if hdc.is_null() {
                 return None;
             }
-            let font = CreateFontW(-24, 0, 0, 0, FW_SEMIBOLD as i32, 0, 0, 0, 1, 0, 0, ANTIALIASED_QUALITY as u32, 0, face.as_ptr());
+            let font = CreateFontW(-20, 0, 0, 0, FW_SEMIBOLD as i32, 0, 0, 0, 1, 0, 0, ANTIALIASED_QUALITY as u32, 0, face.as_ptr());
             let old_font = SelectObject(hdc, font);
             let mut size = SIZE { cx: 0, cy: 0 };
             GetTextExtentPoint32W(hdc, wide.as_ptr(), wide.len() as i32, &mut size);
@@ -626,7 +713,10 @@ impl GlowRenderer {
         }
     }
 
-    /// Draws the status pill: a dark rounded bar with a state-coloured border and dot, and the text.
+    /// Draws the status pill in the style of iOS's Dynamic Island: a near-black rounded capsule with
+    /// a hairline edge, a softly glowing state dot and white text. `pill_w` is the animated width,
+    /// `scale` the appear animation, and `lines` the text(s) to draw, each with its own opacity and
+    /// vertical offset so a change of words crossfades and slides instead of switching.
     #[allow(clippy::too_many_arguments)]
     fn render_label_pill(
         buffer: &mut [u32],
@@ -634,65 +724,79 @@ impl GlowRenderer {
         height: i32,
         center_x: i32,
         top: i32,
-        mask: &LabelMask,
-        color: &RgbColor,
+        pill_w: f32,
+        pill_h: f32,
+        lines: &[(&LabelMask, f32, f32)],
+        color: &[f32; 3],
         opacity: f32,
         dot_pulse: f32,
     ) {
-        let pad_x = 26;
-        let pad_y = 11;
-        let dot_room = 26;
-        let pill_w = mask.width + pad_x * 2 + dot_room;
-        let pill_h = mask.height + pad_y * 2;
-        let left = center_x - pill_w / 2;
-        let radius = pill_h as f32 / 2.0;
-        let text_left = left + pad_x + dot_room;
-        let text_top = top + pad_y;
-        let dot_cx = (left + pad_x + 6) as f32;
-        let dot_cy = top as f32 + pill_h as f32 / 2.0;
+        if opacity <= 0.003 || pill_w < 4.0 {
+            return;
+        }
+        let left_f = center_x as f32 - pill_w / 2.0;
+        let top_f = top as f32;
+        let radius = pill_h / 2.0;
+        let (cx, cy) = (center_x as f32, top_f + pill_h / 2.0);
+        let dot_cx = left_f + 24.0;
+        let text_area_left = left_f + 24.0 + 14.0;
+        let text_area_w = (pill_w - (24.0 + 14.0) - 22.0).max(1.0);
 
-        for y in top.max(0)..(top + pill_h).min(height) {
-            for x in left.max(0)..(left + pill_w).min(width) {
-                // Signed distance to the rounded rectangle (negative inside).
-                let px = x as f32 + 0.5 - (left as f32 + pill_w as f32 / 2.0);
-                let py = y as f32 + 0.5 - (top as f32 + pill_h as f32 / 2.0);
-                let qx = px.abs() - (pill_w as f32 / 2.0 - radius);
-                let qy = py.abs() - (pill_h as f32 / 2.0 - radius);
+        let x0 = (left_f.floor() as i32 - 2).max(0);
+        let x1 = ((left_f + pill_w).ceil() as i32 + 2).min(width);
+        let y0 = (top - 2).max(0);
+        let y1 = ((top_f + pill_h).ceil() as i32 + 2).min(height);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                // Signed distance to the rounded rectangle (negative inside), anti-aliased edge.
+                let px = x as f32 + 0.5 - cx;
+                let py = y as f32 + 0.5 - cy;
+                let qx = px.abs() - (pill_w / 2.0 - radius);
+                let qy = py.abs() - (pill_h / 2.0 - radius);
                 let dist = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - radius;
-                if dist > 0.5 {
+                if dist > 1.0 {
                     continue;
                 }
-                let edge = (0.5 - dist).clamp(0.0, 1.0); // anti-aliased outline
-                // Dark body with a 2 px state-coloured border.
-                let border = (1.0 - ((-dist - 1.0) / 1.5).clamp(0.0, 1.0)) * 0.9;
-                let body_a = 0.84 * opacity * edge;
-                let (br, bg, bb) = (12.0f32, 14.0f32, 26.0f32);
-                let mut r = br * (1.0 - border) + color.r as f32 * border;
-                let mut g = bg * (1.0 - border) + color.g as f32 * border;
-                let mut b = bb * (1.0 - border) + color.b as f32 * border;
-                let mut a = body_a + (1.0 - body_a) * border * opacity * edge * 0.55;
+                let edge = (0.5 - dist).clamp(0.0, 1.0);
+                // Body: near-black; a one pixel light hairline just inside the edge.
+                let hairline = (1.0 - (-dist - 0.5).abs().min(1.0)).clamp(0.0, 1.0) * 0.16;
+                let (mut r, mut g, mut b) = (10.0f32, 10.0f32, 12.0f32);
+                r += (255.0 - r) * hairline;
+                g += (255.0 - g) * hairline;
+                b += (255.0 - b) * hairline;
+                let mut a = 0.93 * opacity * edge;
 
-                // Status dot
+                // State dot with a soft halo.
                 let ddx = x as f32 + 0.5 - dot_cx;
-                let ddy = y as f32 + 0.5 - dot_cy;
+                let ddy = y as f32 + 0.5 - cy;
                 let dd = ddx.hypot(ddy);
-                if dd < 6.5 {
-                    let cover = (6.5 - dd).clamp(0.0, 1.0) * dot_pulse;
-                    r = r * (1.0 - cover) + color.r as f32 * cover;
-                    g = g * (1.0 - cover) + color.g as f32 * cover;
-                    b = b * (1.0 - cover) + color.b as f32 * cover;
-                    a += (1.0 - a) * cover * opacity;
+                if dd < 11.0 {
+                    let core = (5.5 - dd).clamp(0.0, 1.0);
+                    let halo = (1.0 - (dd / 11.0)).clamp(0.0, 1.0).powi(2) * 0.38 * dot_pulse;
+                    let cover = (core * (0.55 + 0.45 * dot_pulse) + halo).clamp(0.0, 1.0);
+                    r = r * (1.0 - cover) + color[0] * cover;
+                    g = g * (1.0 - cover) + color[1] * cover;
+                    b = b * (1.0 - cover) + color[2] * cover;
                 }
 
-                // Text (white) over the body
-                let tx = x - text_left;
-                let ty = y - text_top;
-                if tx >= 0 && ty >= 0 && tx < mask.width && ty < mask.height {
-                    let cover = mask.coverage[(ty * mask.width + tx) as usize] as f32 / 255.0 * opacity;
-                    r = r * (1.0 - cover) + 255.0 * cover;
-                    g = g * (1.0 - cover) + 255.0 * cover;
-                    b = b * (1.0 - cover) + 255.0 * cover;
-                    a += (1.0 - a) * cover;
+                // Text, vertically centred, left aligned after the dot; clipped to the capsule.
+                for (mask, line_opacity, y_offset) in lines {
+                    if *line_opacity <= 0.003 {
+                        continue;
+                    }
+                    let text_left = text_area_left;
+                    let text_top = cy - mask.height as f32 / 2.0 + y_offset;
+                    let tx = (x as f32 - text_left).floor() as i32;
+                    let ty = (y as f32 - text_top).floor() as i32;
+                    if tx >= 0 && ty >= 0 && tx < mask.width && ty < mask.height && (tx as f32) < text_area_w + 4.0 {
+                        // Fade the last few pixels so a long line does not end in a hard cut.
+                        let tail = ((text_area_w - tx as f32) / 12.0).clamp(0.0, 1.0);
+                        let cover = mask.coverage[(ty * mask.width + tx) as usize] as f32 / 255.0 * line_opacity * opacity * tail;
+                        r = r * (1.0 - cover) + 255.0 * cover;
+                        g = g * (1.0 - cover) + 255.0 * cover;
+                        b = b * (1.0 - cover) + 255.0 * cover;
+                        a += (1.0 - a) * cover;
+                    }
                 }
 
                 let a = a.clamp(0.0, 1.0);
@@ -701,7 +805,6 @@ impl GlowRenderer {
                 let pg = ((g.clamp(0.0, 255.0) * a) as u32).min(a8);
                 let pb = ((b.clamp(0.0, 255.0) * a) as u32).min(a8);
                 let idx = (y * width + x) as usize;
-                // Painted over whatever the glow put there.
                 buffer[idx] = (a8 << 24) | (pr << 16) | (pg << 8) | pb;
             }
         }
@@ -796,12 +899,35 @@ mod tests {
         assert!(mask.coverage.iter().any(|c| *c > 200), "the text must produce solid pixels");
         let (w, h) = (600, 120);
         let mut buffer = vec![0u32; (w * h) as usize];
-        let color = HudState::Thinking.base_color();
-        GlowRenderer::render_label_pill(&mut buffer, w, h, 300, 20, &mask, &color, 1.0, 1.0);
+        let c = HudState::Thinking.base_color();
+        let color = [c.r as f32, c.g as f32, c.b as f32];
+        let lines = [(&mask, 1.0f32, 0.0f32)];
+        GlowRenderer::render_label_pill(&mut buffer, w, h, 300, 20, (mask.width + 60) as f32, 44.0, &lines, &color, 1.0, 1.0);
         let painted = buffer.iter().filter(|px| (*px >> 24) > 0).count();
         assert!(painted > 2000, "the pill should cover a few thousand pixels, got {painted}");
+        // Fully faded out it paints nothing, and halfway it is partly transparent.
+        let mut empty = vec![0u32; (w * h) as usize];
+        GlowRenderer::render_label_pill(&mut empty, w, h, 300, 20, (mask.width + 60) as f32, 44.0, &lines, &color, 0.0, 1.0);
+        assert!(empty.iter().all(|px| *px == 0));
         // Premultiplied: no colour channel may exceed alpha.
         assert!(buffer.iter().all(|px| ((px >> 16) & 0xFF) <= (px >> 24) && ((px >> 8) & 0xFF) <= (px >> 24) && (px & 0xFF) <= (px >> 24)));
+    }
+
+    #[test]
+    fn easing_curves_start_and_end_gently_and_colours_blend_smoothly() {
+        assert_eq!((ease_in_out(0.0), ease_in_out(1.0)), (0.0, 1.0));
+        assert!((ease_in_out(0.5) - 0.5).abs() < 1e-6);
+        assert!(ease_in_out(0.1) < 0.1 && ease_in_out(0.9) > 0.9, "slow at both ends");
+        assert!(ease_out(0.2) > 0.2, "fast start");
+        // Purple to cyan passes through intermediate colours, never jumping.
+        let (purple, cyan) = ([147.0, 51.0, 234.0], [6.0, 182.0, 212.0]);
+        let mut last = lerp3(purple, cyan, 0.0);
+        for i in 1..=20 {
+            let now = lerp3(purple, cyan, ease_in_out(i as f32 / 20.0));
+            assert!((now[0] - last[0]).abs() < 40.0, "no jump between frames");
+            last = now;
+        }
+        assert_eq!(last, cyan);
     }
 
     #[test]

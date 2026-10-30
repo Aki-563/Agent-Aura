@@ -4,9 +4,15 @@
 
 use tauri::{PhysicalPosition, PhysicalSize, WebviewWindow};
 
-const PANEL_WIDTH_DIP: f64 = 400.0;
-const PANEL_HEIGHT_DIP: f64 = 600.0;
+/// The mini player: a compact capsule that grows when hovered (the page asks for its height).
+const PANEL_WIDTH_DIP: f64 = 372.0;
+/// Collapsed height: the capsule plus room for its soft shadow.
+pub const MINI_HEIGHT_DIP: f64 = 84.0;
+/// Tallest the player may grow (approval card, steer box).
+pub const MAX_HEIGHT_DIP: f64 = 460.0;
 const MARGIN_DIP: f64 = 12.0;
+
+static HEIGHT_DIP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(MINI_HEIGHT_DIP as u32);
 
 /// Window geometry to restore after the run.
 pub struct SavedLayout {
@@ -85,7 +91,25 @@ fn monitor_of(window: &WebviewWindow) -> Option<MonitorGeometry> {
 }
 
 fn panel_size(scale: f64) -> (u32, u32) {
-    ((PANEL_WIDTH_DIP * scale) as u32, (PANEL_HEIGHT_DIP * scale) as u32)
+    let height = HEIGHT_DIP.load(std::sync::atomic::Ordering::SeqCst) as f64;
+    ((PANEL_WIDTH_DIP * scale) as u32, (height * scale) as u32)
+}
+
+/// Resizes the player to `height_dip` keeping its top-left corner (or moving it up when it would
+/// otherwise run off the bottom of the screen). Called by the page as the capsule expands.
+pub fn set_height(window: &WebviewWindow, height_dip: f64) {
+    let height = height_dip.clamp(MINI_HEIGHT_DIP, MAX_HEIGHT_DIP).round();
+    HEIGHT_DIP.store(height as u32, std::sync::atomic::Ordering::SeqCst);
+    let Some(monitor) = monitor_of(window) else { return };
+    let size = panel_size(monitor.scale);
+    let _ = window.set_size(PhysicalSize::new(size.0, size.1));
+    if let Ok(position) = window.outer_position() {
+        let bottom_limit = monitor.position.1 + monitor.size.1 as i32 - (MARGIN_DIP * monitor.scale) as i32;
+        let overflow = position.y + size.1 as i32 - bottom_limit;
+        if overflow > 0 {
+            let _ = window.set_position(PhysicalPosition::new(position.x, position.y - overflow));
+        }
+    }
 }
 
 /// Shrinks the window into a non-focusable corner panel. Returns what to restore afterwards.
@@ -101,6 +125,13 @@ pub fn enter_run_mode(window: &WebviewWindow) -> Option<SavedLayout> {
     if saved.was_maximized {
         let _ = window.unmaximize();
     }
+    // A frameless capsule: no title bar, no border, no taskbar button, never takes the keyboard.
+    HEIGHT_DIP.store(MINI_HEIGHT_DIP as u32, std::sync::atomic::Ordering::SeqCst);
+    let panel = panel_size(monitor.scale);
+    let _ = window.set_resizable(false);
+    let _ = window.set_decorations(false);
+    let _ = window.set_shadow(false);
+    let _ = window.set_skip_taskbar(true);
     let _ = window.set_size(PhysicalSize::new(panel.0, panel.1));
     let (x, y) = corner_position(Corner::TopRight, monitor.position, monitor.size, panel, margin);
     let _ = window.set_position(PhysicalPosition::new(x, y));
@@ -113,6 +144,10 @@ pub fn enter_run_mode(window: &WebviewWindow) -> Option<SavedLayout> {
 pub fn leave_run_mode(window: &WebviewWindow, saved: Option<SavedLayout>) {
     let _ = window.set_focusable(true);
     let _ = window.set_always_on_top(false);
+    let _ = window.set_decorations(true);
+    let _ = window.set_shadow(true);
+    let _ = window.set_resizable(true);
+    let _ = window.set_skip_taskbar(false);
     if let Some(saved) = saved {
         let _ = window.set_size(saved.size);
         let _ = window.set_position(saved.position);

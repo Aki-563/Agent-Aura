@@ -53,6 +53,9 @@ pub fn run() {
         eprintln!("{}", err_msg);
     }));
 
+    // A previous run killed mid-way may have left the working cursor behind.
+    overlay::cursor::restore();
+
     let agent_runtime = agent::AgentRuntime::new().expect("failed to initialize Agent Aura runtime");
 
     tauri::Builder::default()
@@ -72,6 +75,8 @@ pub fn run() {
             agent::steer_autonomous_task,
             agent::run_control_status,
             agent::set_steer_box_open,
+            agent::set_mini_height,
+            agent::keep_run_panel_on_top,
             agent::answer_confirmation,
             agent::get_last_task_run,
             agent::submit_task_review,

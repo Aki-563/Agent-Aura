@@ -741,6 +741,8 @@ pub async fn execute_run(
     let _ = state.pending.lock().map(|mut pending| *pending = None);
     crate::input::killswitch::KillSwitch::reset();
     crate::control::begin_run();
+    // The pointer looks different while the agent drives it (put back when the run ends).
+    crate::overlay::cursor::show_working_cursor();
     crate::control::set_yield_to_user(crate::settings::get().yield_to_user);
     set_hud(state, HudState::Thinking);
     crate::sound::play(crate::sound::Sound::Start);
@@ -787,6 +789,7 @@ pub async fn execute_run(
     }
     // Whatever happened, nothing stays held and nothing keeps talking after the run.
     crate::control::end_run();
+    crate::overlay::cursor::restore();
     InputActuator::release_all();
     crate::voice::stop_speaking();
     state.running.store(false, Ordering::SeqCst);
@@ -881,6 +884,19 @@ pub fn set_steer_box_open(window: tauri::WebviewWindow, open: bool) -> Result<()
         window.set_focusable(false).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// The mini player asks for a height as it expands (hover, steer box, approval card).
+#[tauri::command]
+pub fn set_mini_height(window: tauri::WebviewWindow, height: f64) -> Result<(), String> {
+    crate::desktop::panel::set_height(&window, height);
+    Ok(())
+}
+
+/// Called every few seconds while the player is shown: keeps it above other always-on-top windows.
+#[tauri::command]
+pub fn keep_run_panel_on_top(window: tauri::WebviewWindow) -> Result<(), String> {
+    window.set_always_on_top(true).map_err(|e| e.to_string())
 }
 
 /// State the UI polls while a run is active: paused or not, and whether the steer hotkey
@@ -1393,6 +1409,8 @@ async fn autonomous_loop(
         if !final_action.sends_no_input() || matches!(final_action, ActionPrimitive::Done { .. }) {
             let sentence = crate::voice::sentence(proposal.voice_command.as_deref(), &canvas_action, &proposal.target.description, None);
             trace.event(step_number, "voice", json!({"text": &sentence, "fromModel": proposal.voice_command.is_some()}));
+            // The mini player shows the same words that are spoken (also when speech is off).
+            let _ = window.emit("agent-voice", json!({"text": &sentence, "step": step_number}));
             tokio::task::spawn_blocking(move || crate::voice::announce(&sentence)).await.ok();
         }
 
