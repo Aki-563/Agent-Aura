@@ -74,12 +74,12 @@
 - **D9.9 Photoshop and Illustrator** are not installed. They are covered by a mock creative app page (`/studio`) plus real MS Paint. The README will say the real apps were not tested.
 - **D9.10 Terminal use.** The harness has no shell execution and must not get one (`AGENTS.md`). "Terminal use" means typing into a console window with `type_text` and `key_press`, which needs the console typing path (Unicode/VK, no Ctrl+V).
 
-### 3.2 Open questions for the user (asked once, before H0 work starts)
+### 3.2 Questions answered by the user (2026-10-30)
 
-1. **Git (D1, still open).** This phase touches most modules and the folder is not a git repository. Recommended: `git init` plus a first commit before H1.
-2. **File Explorer in tests.** The rules say never type or press Enter in Explorer. The brief asks for Explorer tests (address bar, context menus, file lists). Proposal: allowed **only** in an Explorer window the test opened on `%TEMP%\AuraEval\explorer`. Its folder path is verified through `IShellWindows` before every keystroke, and nothing is ever sent outside that window.
-3. **System-changing tests (T3).** May they change display scaling, create virtual desktops, toggle Sticky Keys or High Contrast, and run CPU stress, each restored afterwards? Default: built, but run only when the user passes `--system`.
-4. **Second monitor.** Is one available for multi-monitor tests? Without it, multi-monitor coverage is synthetic (mapping math with fake layouts) and the README says so.
+1. **Git: yes.** Repository initialised on `main`, with the baseline commit `8f52e4c` (repo-local identity; `reference/`, build output, binaries and `node_modules` are ignored). Commit at the end of each milestone.
+2. **File Explorer in tests: yes, sandboxed.** Allowed **only** in an Explorer window the test opened on `%TEMP%\AuraEval\explorer`. Its folder path is verified through `IShellWindows` immediately before every keystroke, and nothing is ever sent outside that window. All other Explorer rules in `AGENTS.md` still apply.
+3. **System-changing tests (T3): yes.** Display scaling, virtual desktops, Sticky Keys and High Contrast, CPU stress, the 10-minute pause and the 24-hour soak may run. Every setting is restored afterwards, even when the test fails (restore in a `finally`-style guard), and each run announces what it changes. They still run only with `--system`, so a plain `test-all` stays quick and non-invasive.
+4. **Monitors: single monitor only for now.** Multi-monitor work is out of scope. The mapping code keeps handling monitor origins (it already does), but no multi-monitor tests are built. The README will say multi-monitor is untested. This machine has one display, 1920×1080 physical at 125% scaling (1536×864 logical), so 125% is the native test case.
 
 ---
 

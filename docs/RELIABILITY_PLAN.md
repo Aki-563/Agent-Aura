@@ -542,7 +542,7 @@ Model calls per step: **1** normally. +1 for a PointCheck only under §5.6 condi
 
 ## 10. Open Decisions (defaults used until the user says otherwise)
 
-- **D1 — Version control:** initializing git before M1 is recommended. *Default:* ask the user. Don't run `git init` without approval.
+- **D1 — Version control (resolved 2026-10-30: yes).** Git initialised on `main`; baseline commit `8f52e4c`. See `HARNESS_COMPLETION_PLAN.md` §3.2.
 - **D2 — Legacy `engine/` Python folder:** it is unwired and contradicts "no Python". *Default:* leave it in place and mark it deprecated in docs. Delete or move it only with user approval.
 - **D3 — Built-in app tips** (Notepad, Explorer, Chrome/Edge, Office, VS Code shortcuts) as read-only Rust constants, not DB seed rows. *Default:* include them, with a settings toggle to disable.
 - **D4 — Windows.Graphics.Capture** fallback (per-window capture of occluded windows). *Default:* defer until after M3 unless DXGI problems show up in testing.
