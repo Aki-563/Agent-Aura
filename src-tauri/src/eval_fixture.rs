@@ -63,6 +63,13 @@ pub fn rect(id: &str) -> Option<[f64; 4]> {
     RECTS.lock().ok().and_then(|rects| rects.get(id).copied())
 }
 
+/// Forgets one state value (so a test can wait for a fresh report).
+pub fn clear_state(key: &str) {
+    if let Ok(mut state) = STATE.lock() {
+        state.remove(key);
+    }
+}
+
 pub fn clear_rects() {
     if let Ok(mut rects) = RECTS.lock() {
         rects.clear();
@@ -286,6 +293,29 @@ setInterval(report,250);setInterval(poll,200);pageState();
 </script>
 "##;
 
+/// A drawing surface (Phase 9, §H0): draws a line between every two received points (like a paint
+/// app), records each event's position (including coalesced events), pointer type, pressure and
+/// tilt, and reports the whole stroke as state `stroke` when the pointer lifts. Positions are in
+/// CSS pixels relative to the canvas. The pointer position outside a stroke is reported as `move`
+/// so the tests can map page pixels to screen pixels exactly.
+const CANVAS_BODY: &str = r##"<style>body{margin:8px;overflow:hidden}#cv{border:1px solid #333;touch-action:none;display:block;cursor:crosshair}</style>
+<h1 id=title style="margin:2px 0;font-size:14px">Canvas</h1>
+<canvas id=cv width=900 height=560></canvas>
+<script>
+function st(k,v){fetch('/state',{method:'POST',body:k+'='+encodeURIComponent(v)})}
+var cv=document.getElementById('cv'),g=cv.getContext('2d'),pts=[],down=false,info={};
+function report(){var r=cv.getBoundingClientRect();fetch('/rects',{method:'POST',body:'cv='+r.left+','+r.top+','+r.width+','+r.height+'\nwin='+innerWidth+','+innerHeight+','+devicePixelRatio+',0'})}
+setInterval(report,250);report();
+function add(e){var r=cv.getBoundingClientRect();var list=(e.getCoalescedEvents&&e.getCoalescedEvents().length)?e.getCoalescedEvents():[e];
+ list.forEach(function(c){var p=[+(c.clientX-r.left).toFixed(2),+(c.clientY-r.top).toFixed(2)];
+  if(pts.length){var a=pts[pts.length-1];g.beginPath();g.moveTo(a[0],a[1]);g.lineTo(p[0],p[1]);g.lineWidth=2;g.stroke()}
+  pts.push(p);info.events++;info.maxPressure=Math.max(info.maxPressure,c.pressure||0);info.maxTilt=Math.max(info.maxTilt,Math.abs(c.tiltX||0),Math.abs(c.tiltY||0))})}
+cv.addEventListener('pointerdown',function(e){down=true;pts=[];info={type:e.pointerType,events:0,maxPressure:0,maxTilt:0,buttons:e.buttons};try{cv.setPointerCapture(e.pointerId)}catch(x){}add(e)});
+document.addEventListener('pointermove',function(e){if(down){add(e)}else{st('move',e.clientX+','+e.clientY)}});
+cv.addEventListener('pointerup',function(e){if(!down)return;down=false;add(e);st('stroke',JSON.stringify({info:info,pts:pts}));ev('stroke:'+info.type)});
+var seq=0;setInterval(function(){fetch('/cmd').then(function(r){return r.text()}).then(function(t){var p=t.indexOf('|');var n=parseInt(t.substring(0,p));if(n>seq){seq=n;if(t.substring(p+1)=='clear'){g.clearRect(0,0,cv.width,cv.height)}st('ack',n)}})},200);
+</script>"##;
+
 fn page(path: &str) -> Option<String> {
     Some(match path {
         "/click" => shell(
@@ -342,6 +372,7 @@ if(e.clientX>r.left&&e.clientX<r.right&&e.clientY>r.top&&e.clientY<r.bottom)ev('
             "Shift",
             "<h1>Layout shift</h1><div id=spacer style='height:0'></div><button onclick=\"ev('click:target')\">Target</button><script>document.addEventListener('keydown',function(e){if(e.key=='F9'){document.getElementById('spacer').style.height='160px';ev('shifted')}})</script>",
         ),
+        "/canvas" => shell("Canvas", CANVAS_BODY),
         "/links/pricing" => shell("Pricing", "<h1>Pricing</h1><script>ev('visit:pricing')</script><p>The plan costs 5 dollars.</p>"),
         "/links/about" => shell("About", "<h1>About us</h1><script>ev('visit:about')</script>"),
         "/links/contact" => shell("Contact", "<h1>Contact</h1><script>ev('visit:contact')</script>"),

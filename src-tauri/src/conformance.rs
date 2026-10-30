@@ -1374,6 +1374,190 @@ fn driver_page_shifts_before_the_click(_lab: &Lab) -> Result<(), String> {
     expect_event("click:target")
 }
 
+// ----------------------------------------------------------------------------- drawing (§H2, §H9)
+
+/// Screen mapping of an open test page, measured from fractional pointer positions it reports.
+struct PageMap {
+    off_x: f64,
+    off_y: f64,
+    dpr: f64,
+}
+
+impl PageMap {
+    fn to_screen(&self, x: f64, y: f64) -> (f64, f64) {
+        (self.off_x + x * self.dpr, self.off_y + y * self.dpr)
+    }
+}
+
+fn calibrate_front_page() -> Result<PageMap, String> {
+    let window = desktop_target::effective_foreground().ok_or("no window in front")?;
+    let (l, t, r, b) = desktop_target::visible_bounds(window).ok_or("the test page window has no bounds")?;
+    let probe_a = (l + (r - l) * 2 / 5, t + (b - t) * 2 / 5);
+    let probe_b = (l + (r - l) * 3 / 5, t + (b - t) * 3 / 5);
+    let read = |probe: (i32, i32)| -> Result<(f64, f64), String> {
+        fx::clear_state("move");
+        act(A::MouseMove { x: probe.0 + 4, y: probe.1 + 4 })?;
+        act(A::MouseMove { x: probe.0, y: probe.1 })?;
+        std::thread::sleep(Duration::from_millis(250));
+        let report = fx::state("move").ok_or("the page never reported the pointer")?;
+        let mut parts = report.split(',').filter_map(|v| v.parse::<f64>().ok());
+        Ok((parts.next().ok_or("bad report")?, parts.next().ok_or("bad report")?))
+    };
+    let (ax, ay) = read(probe_a)?;
+    let (bx, _) = read(probe_b)?;
+    let dpr = (probe_b.0 - probe_a.0) as f64 / (bx - ax);
+    Ok(PageMap { off_x: probe_a.0 as f64 - ax * dpr, off_y: probe_a.1 as f64 - ay * dpr, dpr })
+}
+
+/// Opens the canvas page and returns its mapping plus the canvas rectangle in screen pixels.
+fn open_canvas() -> Result<(PageMap, (f64, f64, f64, f64)), String> {
+    open_page("/canvas", "Canvas")?;
+    if !wait_until(3000, || fx::rect("cv").is_some()) {
+        return Err("the canvas never reported its position".into());
+    }
+    let map = calibrate_front_page()?;
+    let cv = fx::rect("cv").ok_or("no canvas")?;
+    let (left, top) = map.to_screen(cv[0], cv[1]);
+    let size = (cv[2] * map.dpr, cv[3] * map.dpr);
+    Ok((map, (left, top, size.0, size.1)))
+}
+
+/// Waits for the stroke the page received and returns (pointer type, max pressure, max tilt, points
+/// in screen pixels).
+fn received_stroke(map: &PageMap) -> Result<(String, f64, f64, Vec<(f64, f64)>), String> {
+    if !wait_until(4000, || fx::state("stroke").is_some()) {
+        return Err(format!("the page never reported a stroke (events: {})", fx::events().join(", ")));
+    }
+    let value: serde_json::Value = serde_json::from_str(&fx::state("stroke").unwrap_or_default()).map_err(|e| e.to_string())?;
+    let cv = fx::rect("cv").ok_or("no canvas")?;
+    let points = value["pts"].as_array().ok_or("no points")?.iter().filter_map(|p| Some(map.to_screen(cv[0] + p[0].as_f64()?, cv[1] + p[1].as_f64()?))).collect();
+    let info = &value["info"];
+    Ok((info["type"].as_str().unwrap_or("").to_owned(), info["maxPressure"].as_f64().unwrap_or(0.0), info["maxTilt"].as_f64().unwrap_or(0.0), points))
+}
+
+/// Ideal curve resampled every quarter pixel, for measuring how far the drawn stroke strays.
+fn fine(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let mut out = Vec::new();
+    for w in points.windows(2) {
+        let n = ((w[1].0 - w[0].0).hypot(w[1].1 - w[0].1) * 4.0).ceil().max(1.0) as usize;
+        for i in 0..n {
+            let t = i as f64 / n as f64;
+            out.push((w[0].0 + (w[1].0 - w[0].0) * t, w[0].1 + (w[1].1 - w[0].1) * t));
+        }
+    }
+    out.extend(points.last());
+    out
+}
+
+fn draw_and_measure(shape: crate::input::shapes::Shape, pointer: crate::input::PointerKind, pressure: Option<f32>) -> Result<(String, f64, f64, f64, usize), String> {
+    let (map, _) = open_canvas()?;
+    fx::clear_state("stroke");
+    let ideal = shape.outline();
+    let mut points = crate::input::shapes::to_pixels(&ideal);
+    if shape.is_closed() && points.first() != points.last() {
+        points.push(points[0]);
+    }
+    act(A::DrawPath { points, button: MouseButton::Left, duration_ms: 0, hold_keys: vec![], pointer, pressure, tilt_x: pressure.map(|_| 20), tilt_y: None })?;
+    let (kind, max_pressure, max_tilt, drawn) = received_stroke(&map)?;
+    let deviation = crate::input::shapes::max_deviation(&drawn, &fine(&ideal));
+    crate::testlog::record("draw", &format!("{shape:?}").chars().take(40).collect::<String>(), serde_json::json!({"pointer": kind, "events": drawn.len(), "maxDeviationPx": deviation, "pressure": max_pressure, "tilt": max_tilt}));
+    Ok((kind, max_pressure, max_tilt, deviation, drawn.len()))
+}
+
+fn canvas_center_and_size() -> Result<(f64, f64, f64), String> {
+    let (_, (left, top, width, height)) = open_canvas()?;
+    Ok((left + width / 2.0, top + height / 2.0, width.min(height)))
+}
+
+fn draw_a_circle_within_one_pixel(_lab: &Lab) -> Result<(), String> {
+    let (cx, cy, size) = canvas_center_and_size()?;
+    let (kind, _, _, deviation, events) = draw_and_measure(crate::input::shapes::Shape::Circle { cx, cy, r: size * 0.35 }, crate::input::PointerKind::Mouse, None)?;
+    if kind != "mouse" || events < 60 {
+        return Err(format!("expected a mouse stroke with many events, got {kind} with {events}"));
+    }
+    if deviation > 1.0 {
+        return Err(format!("the circle strays up to {deviation:.2} px from the ideal one (limit 1.0)"));
+    }
+    Ok(())
+}
+
+fn draw_a_spiral_bezier_and_sine_within_one_pixel(_lab: &Lab) -> Result<(), String> {
+    use crate::input::shapes::Shape;
+    let (cx, cy, size) = canvas_center_and_size()?;
+    let s = size * 0.4;
+    for shape in [
+        Shape::Spiral { cx, cy, r_start: 4.0, r_end: s * 0.8, turns: 3.0 },
+        Shape::Bezier { points: vec![(cx - s, cy + s * 0.5), (cx - s * 0.3, cy - s), (cx + s * 0.3, cy + s), (cx + s, cy - s * 0.5)] },
+        Shape::Sine { x1: cx - s, x2: cx + s, y: cy, amplitude: s * 0.3, wavelength: s * 0.7 },
+    ] {
+        let (_, _, _, deviation, _) = draw_and_measure(shape.clone(), crate::input::PointerKind::Mouse, None)?;
+        if deviation > 1.0 {
+            return Err(format!("{shape:?} strays up to {deviation:.2} px (limit 1.0)").chars().take(200).collect());
+        }
+    }
+    Ok(())
+}
+
+fn draw_with_a_pen_reports_pressure_and_tilt(_lab: &Lab) -> Result<(), String> {
+    let (cx, cy, size) = canvas_center_and_size()?;
+    let (kind, pressure, tilt, deviation, _) = draw_and_measure(
+        crate::input::shapes::Shape::Line { x1: cx - size * 0.3, y1: cy, x2: cx + size * 0.3, y2: cy + size * 0.1 },
+        crate::input::PointerKind::Pen,
+        Some(0.7),
+    )?;
+    if kind != "pen" {
+        return Err(format!("the page saw pointerType '{kind}', not 'pen'"));
+    }
+    if (pressure - 0.7).abs() > 0.05 {
+        return Err(format!("pen pressure arrived as {pressure:.3}, sent 0.7"));
+    }
+    if tilt < 15.0 {
+        return Err(format!("pen tilt arrived as {tilt}, sent 20"));
+    }
+    if deviation > 1.0 {
+        return Err(format!("the pen line strays {deviation:.2} px"));
+    }
+    Ok(())
+}
+
+fn touch_swipe_arrives_as_touch(_lab: &Lab) -> Result<(), String> {
+    let (map, (left, top, width, height)) = open_canvas()?;
+    fx::clear_state("stroke");
+    let (y, x1, x2) = ((top + height * 0.6) as i32, (left + width * 0.2) as i32, (left + width * 0.8) as i32);
+    act(A::Touch { gesture: crate::input::TouchGesture::Swipe, x: x1, y, to_x: Some(x2), to_y: Some(y), scale: None, angle: None, duration_ms: 400 })?;
+    let (kind, _, _, drawn) = received_stroke(&map)?;
+    if kind != "touch" {
+        return Err(format!("the page saw pointerType '{kind}', not 'touch'"));
+    }
+    let (first, last) = (drawn.first().copied().unwrap_or_default(), drawn.last().copied().unwrap_or_default());
+    if (first.0 - x1 as f64).abs() > 3.0 || (last.0 - x2 as f64).abs() > 3.0 {
+        return Err(format!("the swipe went from {first:?} to {last:?}, asked {x1} to {x2}"));
+    }
+    Ok(())
+}
+
+fn drag_with_waypoints_keeps_its_corners(_lab: &Lab) -> Result<(), String> {
+    use crate::input::shapes::Shape;
+    let (cx, cy, size) = canvas_center_and_size()?;
+    let h = size * 0.25;
+    let square = vec![(cx - h, cy - h), (cx + h, cy - h), (cx + h, cy + h), (cx - h, cy + h), (cx - h, cy - h)];
+    let (_, _, _, deviation, _) = draw_and_measure(Shape::Polyline { points: square }, crate::input::PointerKind::Mouse, None)?;
+    if deviation > 1.0 {
+        return Err(format!("the square's stroke strays {deviation:.2} px (corners cut?)"));
+    }
+    Ok(())
+}
+
+fn draw_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
+    vec![
+        ("draw", "circle within 1 px of the ideal", draw_a_circle_within_one_pixel),
+        ("draw", "spiral, bezier, sine within 1 px", draw_a_spiral_bezier_and_sine_within_one_pixel),
+        ("draw", "square through waypoints keeps its corners", drag_with_waypoints_keeps_its_corners),
+        ("draw", "pen stroke with pressure and tilt", draw_with_a_pen_reports_pressure_and_tilt),
+        ("draw", "touch swipe arrives as touch", touch_swipe_arrives_as_touch),
+    ]
+}
+
 fn driver_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
     vec![
         ("driver", "click a button by label", driver_click_button),
@@ -1707,7 +1891,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
         None => true,
     };
     let lab_cases: Vec<_> = cases().into_iter().filter(|(g, n, _)| selected(g, n)).collect();
-    let driver_selected: Vec<_> = driver_cases().into_iter().filter(|(g, n, _)| selected(g, n)).collect();
+    let driver_selected: Vec<_> = driver_cases().into_iter().chain(draw_cases()).filter(|(g, n, _)| selected(g, n)).collect();
     let app_cases: Vec<_> = driver_selected.into_iter().chain(body_cases().into_iter().filter(|(g, n, _)| selected(g, n))).chain(native_cases().into_iter().filter(|(g, n, _)| selected(g, n))).collect();
     if lab_cases.is_empty() && app_cases.is_empty() {
         return Err("no case matches that filter".into());
@@ -1724,7 +1908,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
     let mut results = Vec::new();
     let mut lab_open = !lab_cases.is_empty();
     for (group, name, case) in lab_cases.into_iter().chain(app_cases) {
-        if group != "native" && group != "driver" && group != "body" {
+        if group != "native" && group != "driver" && group != "body" && group != "draw" {
             // lab case: nothing to close
         } else if lab_open {
             // Close the lab tab before the real-application cases.
@@ -1738,8 +1922,8 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
             trail.clear();
         }
         let started = Instant::now();
-        let outcome = if group == "native" || group == "driver" || group == "body" { case(&lab) } else { lab.reset().and_then(|_| case(&lab)) };
-        if group == "driver" || group == "body" {
+        let outcome = if group == "native" || group == "driver" || group == "body" || group == "draw" { case(&lab) } else { lab.reset().and_then(|_| case(&lab)) };
+        if group == "driver" || group == "body" || group == "draw" {
             let _ = press("escape");
             close_fixture_tab();
         }
@@ -1751,7 +1935,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
             millis: started.elapsed().as_millis(),
             detail: outcome
                 .err()
-                .map(|e| if group == "driver" || group == "body" { format!("{e} [orders: {}]", trail_text()) } else { e })
+                .map(|e| if group == "driver" || group == "body" || group == "draw" { format!("{e} [orders: {}]", trail_text()) } else { e })
                 .unwrap_or_default(),
         };
         progress(&result);
