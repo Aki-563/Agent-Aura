@@ -391,6 +391,29 @@ fn type_accents_cjk_emoji(lab: &Lab) -> Result<(), String> {
     expect_state("i1", "café naïve 日本語 😀")
 }
 
+fn type_tamil_arabic_devanagari(lab: &Lab) -> Result<(), String> {
+    focus_field(lab, "i1")?;
+    type_text("வணக்கம் உலகம்")?;
+    type_text(" مرحبا بالعالم")?;
+    type_text(" नमस्ते दुनिया")?;
+    expect_state("i1", "வணக்கம் உலகம் مرحبا بالعالم नमस्ते दुनिया")
+}
+
+fn type_zwj_emoji_flags_and_combining_marks(lab: &Lab) -> Result<(), String> {
+    focus_field(lab, "i1")?;
+    // A family (zero-width joiners), a flag (two regional indicators), a heart with a variation
+    // selector, and "e" + combining acute accent (not the precomposed é).
+    type_text("👨\u{200d}👩\u{200d}👧 🇮🇳 ❤\u{fe0f} e\u{301}")?;
+    expect_state("i1", "👨\u{200d}👩\u{200d}👧 🇮🇳 ❤\u{fe0f} e\u{301}")
+}
+
+fn type_long_tamil_by_paste(lab: &Lab) -> Result<(), String> {
+    focus_field(lab, "i1")?;
+    let text = "தமிழ் மொழி உலகின் மிகப் பழமையான மொழிகளில் ஒன்று; அது இன்றும் பேசப்படுகிறது.";
+    type_text(text)?;
+    expect_state("i1", text)
+}
+
 fn type_every_symbol(lab: &Lab) -> Result<(), String> {
     focus_field(lab, "i1")?;
     // Two chunks of 20 characters or fewer, so both go through key-by-key typing.
@@ -859,6 +882,9 @@ fn cases() -> Vec<(&'static str, &'static str, CaseFn)> {
         ("type", "long text by paste", type_long_text_by_paste),
         ("type", "paste keeps the clipboard", long_paste_keeps_the_clipboard),
         ("type", "accents, CJK, emoji", type_accents_cjk_emoji),
+        ("type", "tamil, arabic, devanagari", type_tamil_arabic_devanagari),
+        ("type", "zwj emoji, flag, combining marks", type_zwj_emoji_flags_and_combining_marks),
+        ("type", "long tamil by paste", type_long_tamil_by_paste),
         ("type", "every symbol", type_every_symbol),
         ("type", "newlines in a text area", type_newlines_into_a_text_area),
         ("type", "long multi-line paste", type_long_multiline_by_paste),
