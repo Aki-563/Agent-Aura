@@ -2390,7 +2390,18 @@ fn setup() -> Result<Lab, String> {
     }
     std::thread::sleep(Duration::from_millis(600));
     if let Some(window) = desktop_target::find_window_by_name("Aura Fixture") {
+        // The isolated profile remembers where its last window was (and its zoom and scroll), so a
+        // window left maximized, moved or zoomed by an earlier run would shift every target.
+        // Start from a known place: restored, at a fixed rectangle, 100% zoom, scrolled to the top.
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{MoveWindow, ShowWindow, SW_RESTORE};
+            ShowWindow(window, SW_RESTORE);
+            MoveWindow(window, 60, 30, 1500, 950, 1);
+        }
         desktop_target::bring_to_front(window);
+        std::thread::sleep(Duration::from_millis(400));
+        let _ = hotkey(&["ctrl", "0"]);
+        let _ = hotkey(&["ctrl", "home"]);
     }
     std::thread::sleep(Duration::from_millis(400));
 

@@ -142,20 +142,23 @@
 - [x] **M7 (suite + runner built; model results pending)** Qualification: eval suites (basic, web, intermediate, all) with independent checkers and `--repeat` pass rates; docs refreshed 2026-10-30; release build in `dist/`. Model pass rates are the next milestone.
 
 
-### Phase 9: Harness completion (details: [`HARNESS_COMPLETION_PLAN.md`](./HARNESS_COMPLETION_PLAN.md)), status 2026-10-30
-- [x] **H0** test infrastructure: fixture pages (canvas, load, login), measurements to `testlogs`, scripted-model failure directives, `test-all.ps1`.
-- [x] **H1** stop / pause / steer: epoch-based control bus, stale answers dropped, held inputs released within 100 ms, ledger with DO NOT REPEAT, hotkeys, control port, mini-player controls.
-- [x] **H2** mouse precision: exact SendInput mapping (old formula missed 10 of 3000 px), closed-loop 0 px, draw_path shapes within 1 px, pen and touch.
-- [x] **H3 (core)** window registry with stable ids, state block in every prompt, window actions with read-back, tiling, registry validation. Open: UAC handoff, virtual desktops, per-app tips.
-- [x] **H4 (settle)** loading-aware settle (spinner, progress, faint skeleton), caret mask, adaptive lag, STILL LOADING report. **Open:** grounding modes A/B/C and their metrics, `zoom` end to end with a model.
-- [ ] **H5** window layout (done: tiling math and read-back) and parallel workers / input arbiter / model scheduler (not started).
-- [x] **H6** model JSON validation and fuzzing, retry with backoff, password and CAPTCHA handoffs, time and call budgets. Open: secret masking in traces.
-- [x] **H7** scheduler (drift-free, overlap and missed policies, persistence, idle timer, `schedule` CLI and daemon). Open: UI for schedules, sleep/lock detection, 24 h soak.
-- [x] **H8** offline voice (SAPI) with fallback phrases and no backlog; **open:** audible smoke test.
-- [ ] **H9** remaining inputs (done: Caps Lock was already correct, touch, pen, clipboard actions; open: Tamil/emoji read-back checks, accessibility settings, black-frame fallback).
-- [x] **H10** README sections and the single test command.
-- [x] Also done: mini player, iOS-style HUD, working cursor, saved provider settings with DPAPI-encrypted key.
-- Verified: 192 unit tests, 116 desktop conformance cases, all passing.
+### Phase 9: Harness completion (details: [`HARNESS_COMPLETION_PLAN.md`](./HARNESS_COMPLETION_PLAN.md)), status 2026-10-30 (late)
+- [x] **H0** test infrastructure: fixture pages, measurements to `testlogs`, scripted-model failure directives, `test-all.ps1`.
+- [x] **H1** stop / pause / steer: epoch-based control bus, stale answers dropped, held inputs released, ledger, hotkeys, control port, mini-player controls. 10 minute pause test passes (idle CPU, no model calls).
+- [x] **H2** mouse precision: exact SendInput mapping, closed-loop 0 px, draw_path shapes within 1 px, pen and touch.
+- [x] **H3** window registry, state block, window actions with read-back, tiling, UAC/lock handoff, virtual-desktop round trip test, per-app profiles.
+- [x] **H4** loading-aware settle (caret blink no longer counts as loading); grounding modes A/B/C with per-step metrics; `coordinate_scale`. Open: pass-rate measurements with a real model per mode, `zoom`/`observe` with a model.
+- [x] **H5** parallel window workers (input arbiter, model scheduler, `aura-cli parallel`). Open: per-window capture (workers capture the screen and raise the window).
+- [x] **H6** JSON validation and fuzzing, retry with backoff, password/CAPTCHA/UAC handoffs, budgets, secret masking in traces.
+- [x] **H7** scheduler (CLI, daemon, in-app, schedule screen), locked PC skips. Open: the 24 hour soak run (`aura-cli soak`).
+- [x] **H8** offline voice with an audible smoke test; approval prompts are spoken.
+- [x] **H9** Tamil/Arabic/Devanagari/emoji read-back, Sticky/Filter keys guard, High Contrast note, black-frame GDI fallback, per-app profiles. Open: display scaling at 125/150/200% (needs a manual OS change).
+- [x] **H10** README and the single test command.
+- [x] **H11** obstruction handling (toast, tooltip, widget, other window) with tests using real foreign-process windows.
+- [x] **T3 system group:** virtual desktop round trip, display scale and exact pointer, loading pages under full CPU load.
+- [x] App fixes found by driving the real app: a missing element id stopped the page script (no run could start); events now reach the page through a polled queue because Tauri's listener is blocked by the build's capabilities; no approval prompts for wait/note/backspace/scroll; Save & test connection now probes the model; the saved key shows as a mask.
+- Verified: 216 unit tests, 124 desktop conformance cases, all passing.
+- Open: sandboxed Explorer test, real-model measurements (GUI-Owl, gpt-5.6-terra), flake watch on "long text by paste".
 
 ---
 

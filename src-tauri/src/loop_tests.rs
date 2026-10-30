@@ -166,7 +166,7 @@ async fn a_declined_risky_action_stops_the_run_after_the_model_tries_again() {
         vec![
             (
                 "aura_proposal",
-                replies::proposal_with_impact(json!({"type": "wait_settle", "max_timeout_ms": 100}), "wipe it", "destructive"),
+                replies::proposal_with_impact(json!({"type": "hotkey", "keys": ["ctrl", "shift", "delete"]}), "wipe it", "destructive"),
             ),
             ("aura_verification", replies::accept_verification()),
         ],
@@ -188,7 +188,7 @@ async fn an_approved_risky_action_goes_ahead() {
         vec![
             (
                 "aura_proposal",
-                replies::proposal_with_impact(json!({"type": "wait_settle", "max_timeout_ms": 100}), "pause", "destructive"),
+                replies::proposal_with_impact(json!({"type": "hotkey", "keys": ["shift"]}), "tap shift", "destructive"),
             ),
             ("aura_proposal", replies::proposal(done("ok"), "finish")),
             ("aura_verification", replies::accept_verification()),
