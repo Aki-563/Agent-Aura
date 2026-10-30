@@ -1155,6 +1155,13 @@ fn open_page(path: &str, title: &str) -> Result<(), String> {
     }
     if wait_until(20_000, || fx::saw(&format!("load:Aura Fixture {title}"))) {
         std::thread::sleep(Duration::from_millis(900));
+        // A browser started by a background process may not get the foreground by itself.
+        if !desktop_target::foreground_title().contains("Aura Fixture") {
+            if let Some(window) = desktop_target::find_window_by_name("Aura Fixture") {
+                desktop_target::bring_to_front(window);
+                std::thread::sleep(Duration::from_millis(400));
+            }
+        }
         // Edge may show a "Restore pages" bubble that takes the keyboard focus: Escape closes it.
         let _ = press("escape");
         std::thread::sleep(Duration::from_millis(300));
@@ -1804,6 +1811,114 @@ fn safety_password_and_captcha_are_recognised(_lab: &Lab) -> Result<(), String> 
     Ok(())
 }
 
+// ----------------------------------------------------------------------------- system (T3)
+
+/// Whether the window is on the virtual desktop the user is looking at.
+fn on_current_desktop(hwnd: isize) -> Result<bool, String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let manager: IVirtualDesktopManager = CoCreateInstance(&VirtualDesktopManager, None, CLSCTX_ALL).map_err(|e| format!("no virtual desktop manager: {e}"))?;
+        manager.IsWindowOnCurrentVirtualDesktop(HWND(hwnd as _)).map(|b| b.as_bool()).map_err(|e| e.to_string())
+    }
+}
+
+fn system_virtual_desktop_round_trip(_lab: &Lab) -> Result<(), String> {
+    ensure_app("notepad", "notepad")?;
+    let notepad = app_window("notepad").ok_or("no notepad window")?;
+    if !on_current_desktop(notepad)? {
+        return Err("notepad is not on the current desktop to begin with".into());
+    }
+    if registry_window("notepad").is_none() {
+        return Err("the registry does not list notepad before the test".into());
+    }
+    // A new virtual desktop (Win+Ctrl+D) is empty: notepad is on the other one.
+    hotkey(&["win", "ctrl", "d"])?;
+    let result = (|| {
+        if !wait_until(5000, || on_current_desktop(notepad) == Ok(false)) {
+            return Err("after Win+Ctrl+D notepad is still reported on the current desktop".to_owned());
+        }
+        std::thread::sleep(Duration::from_millis(600));
+        let snapshot = crate::desktop::registry::refresh();
+        if snapshot.windows.iter().any(|w| w.hwnd == notepad) {
+            return Err("the registry still lists a window that is on another virtual desktop".to_owned());
+        }
+        Ok(())
+    })();
+    // Close the empty desktop (Win+Ctrl+F4): its windows (none) move left and we land back on the first.
+    hotkey(&["win", "ctrl", "f4"])?;
+    result?;
+    if !wait_until(5000, || on_current_desktop(notepad) == Ok(true)) {
+        return Err("after closing the empty desktop notepad is not back on the current desktop".into());
+    }
+    std::thread::sleep(Duration::from_millis(600));
+    if !crate::desktop::registry::refresh().windows.iter().any(|w| w.hwnd == notepad) {
+        return Err("the registry does not list notepad again after returning".into());
+    }
+    // The same through the harness's own action.
+    act(A::SwitchDesktop { direction: "right".into() })?;
+    std::thread::sleep(Duration::from_millis(500));
+    if !on_current_desktop(notepad)? {
+        return Err("switch_desktop right with only one desktop moved notepad away".into());
+    }
+    Ok(())
+}
+
+fn system_display_scale_is_known_and_capture_is_physical(_lab: &Lab) -> Result<(), String> {
+    use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    let (dpi, width, height) = unsafe { (GetDpiForSystem(), GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    let capture = crate::capture::dxgi::DxgiCapture::new(0).map_err(|e| e.to_string())?;
+    crate::testlog::record("system", "display_scale", serde_json::json!({"dpi": dpi, "scale_percent": dpi * 100 / 96, "screen": [width, height]}));
+    if capture.width() as i32 != width || capture.height() as i32 != height {
+        return Err(format!("capture is {}x{} but the DPI-aware screen is {width}x{height} (scale {}%)", capture.width(), capture.height(), dpi * 100 / 96));
+    }
+    // The pointer must land exactly at this scale too.
+    for (x, y) in [(0, 0), (width - 1, height - 1), (width / 2, height / 2), (17, height - 23)] {
+        act(A::MouseMove { x, y })?;
+        if InputActuator::cursor_position() != Some((x, y)) {
+            return Err(format!("at {}% scale a move to ({x}, {y}) landed on {:?}", dpi * 100 / 96, InputActuator::cursor_position()));
+        }
+    }
+    Ok(())
+}
+
+fn system_loads_under_cpu_stress(lab: &Lab) -> Result<(), String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let stop = Arc::new(AtomicBool::new(false));
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let workers: Vec<_> = (0..threads)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut x = 1u64;
+                while !stop.load(Ordering::Relaxed) {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    std::hint::black_box(x);
+                }
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(1500));
+    let outcome = load_one_second_spinner(lab).and_then(|_| load_three_second_progress_bar(lab)).and_then(|_| load_seven_second_skeleton(lab));
+    stop.store(true, Ordering::Relaxed);
+    for worker in workers {
+        let _ = worker.join();
+    }
+    outcome.map_err(|e| format!("under full CPU load on {threads} threads: {e}"))
+}
+
+fn system_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
+    vec![
+        ("system", "virtual desktop round trip", system_virtual_desktop_round_trip),
+        ("system", "display scale and exact pointer at it", system_display_scale_is_known_and_capture_is_physical),
+        ("system", "loading pages under full CPU load", system_loads_under_cpu_stress),
+    ]
+}
+
 fn safety_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
     vec![("safety", "password field and CAPTCHA text are recognised", safety_password_and_captcha_are_recognised)]
 }
@@ -2166,6 +2281,9 @@ fn setup() -> Result<Lab, String> {
 /// page) comes along because its name happens to contain the word.
 pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Result<Vec<CaseResult>, String> {
     let selected = |group: &str, name: &str| match filter {
+        // The system group changes things outside the test page (virtual desktops, CPU load), so it
+        // runs only when asked for by name.
+        _ if group == "system" && !matches!(filter, Some(w) if w.to_lowercase().contains("system")) => false,
         Some(wanted) if wanted.starts_with("group:") => wanted["group:".len()..].split(',').any(|g| g.trim().eq_ignore_ascii_case(group)),
         Some(wanted) => {
             let wanted = wanted.to_lowercase();
@@ -2174,7 +2292,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
         None => true,
     };
     let lab_cases: Vec<_> = cases().into_iter().filter(|(g, n, _)| selected(g, n)).collect();
-    let driver_selected: Vec<_> = driver_cases().into_iter().chain(draw_cases()).chain(load_cases()).chain(windows_cases()).chain(safety_cases()).filter(|(g, n, _)| selected(g, n)).collect();
+    let driver_selected: Vec<_> = driver_cases().into_iter().chain(draw_cases()).chain(load_cases()).chain(windows_cases()).chain(safety_cases()).chain(system_cases()).filter(|(g, n, _)| selected(g, n)).collect();
     let app_cases: Vec<_> = driver_selected.into_iter().chain(body_cases().into_iter().filter(|(g, n, _)| selected(g, n))).chain(native_cases().into_iter().filter(|(g, n, _)| selected(g, n))).collect();
     if lab_cases.is_empty() && app_cases.is_empty() {
         return Err("no case matches that filter".into());
@@ -2198,7 +2316,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
     let mut results = Vec::new();
     let mut lab_open = !lab_cases.is_empty();
     for (group, name, case) in lab_cases.into_iter().chain(app_cases) {
-        if group != "native" && group != "driver" && group != "body" && group != "draw" && group != "load" && group != "windows" && group != "safety" {
+        if group != "native" && group != "driver" && group != "body" && group != "draw" && group != "load" && group != "windows" && group != "safety" && group != "system" {
             // lab case: nothing to close
         } else if lab_open {
             // Close the lab tab before the real-application cases.
@@ -2212,8 +2330,8 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
             trail.clear();
         }
         let started = Instant::now();
-        let outcome = if group == "native" || group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" { case(&lab) } else { lab.reset().and_then(|_| case(&lab)) };
-        if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" {
+        let outcome = if group == "native" || group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" { case(&lab) } else { lab.reset().and_then(|_| case(&lab)) };
+        if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" {
             let _ = press("escape");
             close_fixture_tab();
         }
@@ -2225,7 +2343,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
             millis: started.elapsed().as_millis(),
             detail: outcome
                 .err()
-                .map(|e| if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" { format!("{e} [orders: {}]", trail_text()) } else { e })
+                .map(|e| if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" { format!("{e} [orders: {}]", trail_text()) } else { e })
                 .unwrap_or_default(),
         };
         progress(&result);

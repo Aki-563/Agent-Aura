@@ -24,6 +24,7 @@ pub mod recipe;
 pub mod reliability;
 pub mod settle;
 pub mod settings;
+pub mod soak;
 pub mod schedule;
 pub mod schedule_app;
 pub mod schedule_cli;

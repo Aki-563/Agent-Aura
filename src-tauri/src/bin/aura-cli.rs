@@ -57,6 +57,7 @@ enum Command {
     Conformance,
     Daemon,
     Parallel,
+    Soak,
 }
 
 struct Args {
@@ -74,6 +75,7 @@ struct Args {
     auto_approve: bool,
     windows: Vec<String>,
     model_slots: usize,
+    minutes: u64,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -84,6 +86,7 @@ fn parse_args() -> Result<Args, String> {
         Some("conformance") => Command::Conformance,
         Some("daemon") => Command::Daemon,
         Some("parallel") => Command::Parallel,
+        Some("soak") => Command::Soak,
         _ => return Err(usage()),
     };
     let mut args = Args {
@@ -101,6 +104,7 @@ fn parse_args() -> Result<Args, String> {
         auto_approve: false,
         windows: Vec::new(),
         model_slots: 2,
+        minutes: 60,
     };
     while let Some(flag) = raw.next() {
         let mut value = || raw.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -115,6 +119,7 @@ fn parse_args() -> Result<Args, String> {
             "--repeat" => args.repeat = value()?.parse().map_err(|_| "--repeat must be a number".to_owned())?,
             "--max-steps" => args.max_steps = value()?.parse().map_err(|_| "--max-steps must be a number".to_owned())?,
             "--window" => args.windows.push(value()?),
+            "--minutes" => args.minutes = value()?.parse().map_err(|_| "--minutes must be a number".to_owned())?,
             "--model-slots" => args.model_slots = value()?.parse().map_err(|_| "--model-slots must be a number".to_owned())?,
             "--openai" => args.openai = true,
             "--auto-approve" => args.auto_approve = true,
@@ -124,7 +129,7 @@ fn parse_args() -> Result<Args, String> {
     if args.command == Command::Parallel && args.windows.is_empty() {
         return Err(format!("parallel needs one or more --window \"name=task\"\n{}", usage()));
     }
-    if args.command != Command::Conformance && (args.model.is_empty() || (args.command == Command::Run && args.task.is_empty())) {
+    if !matches!(args.command, Command::Conformance | Command::Soak) && (args.model.is_empty() || (args.command == Command::Run && args.task.is_empty())) {
         return Err(format!("--model is required (and --task for `run`)\n{}", usage()));
     }
     Ok(args)
@@ -133,6 +138,7 @@ fn parse_args() -> Result<Args, String> {
 fn usage() -> String {
     "usage: aura-cli run  --model <id> --task <text> [--url <base url>] [--openai] [--key <api key>] \
      [--max-steps <n>] [--auto-approve]\n       aura-cli parallel --model <id> --window \"Notepad=type hello\" --window \"Calculator=compute 6*7\" [--model-slots <n>]\n       aura-cli conformance [--only <group or name>]
+       aura-cli soak --minutes <n> [--browser chrome]
        aura-cli eval --model <id> [--suite basic|intermediate|all] \
      [--only <task id>] [--repeat <n>] [--url <base url>] [--openai] [--key <api key>]\n       \
      (the key can also come from AURA_API_KEY or OPENAI_API_KEY)"
@@ -178,6 +184,13 @@ async fn main() {
     agent_aura_lib::make_process_dpi_aware();
     if let Err(error) = KillSwitch::start_monitoring() {
         eprintln!("warning: the Esc kill switch could not be installed: {error}");
+    }
+    if args.command == Command::Soak {
+        println!("soak: {} minute(s) of safe desktop cases in a separate Chrome, watching memory, handles and GDI objects. Do not use the mouse or keyboard; Esc stops.", args.minutes);
+        agent_aura_lib::conformance::set_browser(args.browser.clone().or_else(|| Some("chrome".to_owned())));
+        let minutes = args.minutes;
+        let code = tokio::task::spawn_blocking(move || agent_aura_lib::soak::run(minutes)).await.unwrap_or(2);
+        std::process::exit(code);
     }
     if args.command == Command::Conformance {
         println!("harness conformance: orders every input variation through the executor and checks the test page received it.

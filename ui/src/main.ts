@@ -324,6 +324,14 @@ async function refreshProviderStatus(): Promise<void> {
   }
 }
 
+// A saved key never comes back to the page. The field shows this mask instead, so it is plain that
+// the key is stored; typing replaces it, and sending the mask unchanged means "keep the saved key".
+const SAVED_KEY_MASK = "•".repeat(24);
+
+apiKey.addEventListener("focus", () => {
+  if (apiKey.value === SAVED_KEY_MASK) apiKey.select();
+});
+
 async function saveAndTestProvider(): Promise<void> {
   const button = element<HTMLButtonElement>("save-provider");
   await withBusy(button, "Testing…", async () => {
@@ -332,10 +340,9 @@ async function saveAndTestProvider(): Promise<void> {
         protocol: protocol.value as ApiProtocol,
         baseUrl: baseUrl.value.trim(),
         model: model.value.trim(),
-        apiKey: apiKey.value,
+        apiKey: apiKey.value === SAVED_KEY_MASK ? "" : apiKey.value,
       },
     });
-    apiKey.value = "";
     renderProviderStatus(status);
     log("info", `Configuration loaded for ${status.model} at ${status.baseUrl}.`);
 
@@ -794,7 +801,13 @@ function renderProviderStatus(status: ProviderStatus): void {
   if (status.baseUrl) baseUrl.value = status.baseUrl;
   if (status.model) model.value = status.model;
   // The key itself never comes back to the page; the field only says whether one is saved.
-  if (status.hasApiKey) apiKey.placeholder = "Key saved (encrypted). Leave empty to keep it, or type a new one";
+  if (status.hasApiKey) {
+    // Do not overwrite a new key the user is typing; otherwise show the saved-key mask.
+    if (apiKey.value === "" || apiKey.value === SAVED_KEY_MASK) apiKey.value = SAVED_KEY_MASK;
+    apiKey.placeholder = "Key saved (encrypted). Type a new one to replace it";
+  } else if (apiKey.value === SAVED_KEY_MASK) {
+    apiKey.value = "";
+  }
 }
 
 function renderStep(thought: string, actions: Record<string, unknown>[]): void {

@@ -3727,8 +3727,9 @@ fn check_observation_fresh(actions: &[ActionPrimitive], observed: &WindowContext
         let same_program = root == observed_hwnd || pid == observed.process_id;
         if !same_program && !desktop_target::is_shell_window(root) && !desktop_target::is_own_window(root) {
             return Err(format!(
-                "the point ({x}, {y}) is now covered by '{}', not by the window you looked at ('{}')",
+                "the point ({x}, {y}) is now covered by '{}' ({}), not by the window you looked at ('{}')",
                 desktop_target::title_of(root),
+                desktop_target::process_name_of(root),
                 observed.title
             ));
         }
