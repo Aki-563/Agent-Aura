@@ -576,6 +576,158 @@ fn drag_outside_the_box_misses(lab: &Lab) -> Result<(), String> {
     expect_event("drop:miss")
 }
 
+// ----------------------------------------------------------------------------- stop, pause, holds (§H1)
+
+fn left_button_down() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+    unsafe { GetAsyncKeyState(VK_LBUTTON as i32) as u16 & 0x8000 != 0 }
+}
+
+fn any_modifier_down() -> Option<&'static str> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_SHIFT};
+    [(VK_SHIFT, "shift"), (VK_CONTROL, "ctrl"), (VK_MENU, "alt"), (VK_LWIN, "win")]
+        .into_iter()
+        .find(|(vk, _)| unsafe { GetAsyncKeyState(*vk as i32) as u16 & 0x8000 != 0 })
+        .map(|(_, name)| name)
+}
+
+/// Runs `action` on a worker thread, fires `interrupt` after `after_ms`, and returns the action's
+/// result and how long it took to return after the interrupt.
+fn interrupt_during(action: A, after_ms: u64, interrupt: impl FnOnce()) -> (Result<(), String>, Duration) {
+    let worker = std::thread::spawn(move || act(action));
+    std::thread::sleep(Duration::from_millis(after_ms));
+    let fired = Instant::now();
+    interrupt();
+    let result = worker.join().unwrap_or_else(|_| Err("the action thread panicked".into()));
+    (result, fired.elapsed())
+}
+
+fn stop_mid_drag_releases_the_button(lab: &Lab) -> Result<(), String> {
+    let (x, y) = lab.center("thumb")?;
+    let drag = A::DragAndDrop { from_x: x, from_y: y, to_x: x + (250.0 * lab.dpr) as i32, to_y: y, duration_ms: 3000, hold_keys: vec![] };
+    let (result, latency) = interrupt_during(drag, 900, crate::input::killswitch::KillSwitch::trigger);
+    let button_down = left_button_down();
+    crate::input::killswitch::KillSwitch::reset();
+    if result.is_ok() {
+        return Err("the drag ran to the end despite the stop".into());
+    }
+    if button_down {
+        InputActuator::release_all();
+        return Err("the left button was still down after the stop".into());
+    }
+    if latency > Duration::from_millis(100) {
+        return Err(format!("the drag took {latency:?} to stop"));
+    }
+    expect_number("slider", "less than the full 250 (cut short)", |v| v < 245.0).map(|_| ())
+}
+
+fn stop_mid_typing_leaves_no_key_down(lab: &Lab) -> Result<(), String> {
+    focus_field(lab, "i1")?;
+    let text = "Ab".repeat(100); // capitals need Shift: a stop must not leave it down
+    let typing = A::TypeWith { text: text.clone(), press_enter: false, overwrite: false, method: crate::input::TypeMethod::Keys, chars_per_second: Some(40.0) };
+    let (result, latency) = interrupt_during(typing, 1200, crate::input::killswitch::KillSwitch::trigger);
+    let held = any_modifier_down();
+    crate::input::killswitch::KillSwitch::reset();
+    if result.is_ok() {
+        return Err("typing ran to the end despite the stop".into());
+    }
+    if let Some(key) = held {
+        InputActuator::release_all();
+        return Err(format!("{key} was still down after the stop"));
+    }
+    if latency > Duration::from_millis(100) {
+        return Err(format!("typing took {latency:?} to stop"));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let typed = fx::state("i1").unwrap_or_default().chars().count();
+    if typed == 0 || typed >= text.chars().count() {
+        return Err(format!("expected a partial text, the field holds {typed} characters"));
+    }
+    Ok(())
+}
+
+fn pause_mid_drag_cuts_the_action(lab: &Lab) -> Result<(), String> {
+    let (x, y) = lab.center("thumb")?;
+    let drag = A::DragAndDrop { from_x: x, from_y: y, to_x: x + (250.0 * lab.dpr) as i32, to_y: y, duration_ms: 3000, hold_keys: vec![] };
+    crate::control::begin_run();
+    let (result, latency) = interrupt_during(drag, 900, || crate::control::pause("conformance"));
+    let button_down = left_button_down();
+    crate::control::end_run();
+    match result {
+        Err(error) if error.starts_with("PAUSED") => {}
+        other => return Err(format!("expected the drag to be cut by the pause, got {other:?}")),
+    }
+    if button_down {
+        InputActuator::release_all();
+        return Err("the left button was still down after the pause".into());
+    }
+    if latency > Duration::from_millis(100) {
+        return Err(format!("the drag took {latency:?} to pause"));
+    }
+    Ok(())
+}
+
+fn key_down_survives_the_step(_lab: &Lab) -> Result<(), String> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_SHIFT};
+    let shift_down = || unsafe { GetAsyncKeyState(VK_SHIFT as i32) as u16 & 0x8000 != 0 };
+    let outcome = (|| {
+        act(A::KeyDown { key: "shift".into() })?;
+        act(A::Observe {})?; // another step's cleanup must not release a deliberate hold
+        if !shift_down() {
+            return Err("shift was released by the next action's cleanup".to_owned());
+        }
+        act(A::KeyUp { key: "shift".into() })?;
+        std::thread::sleep(Duration::from_millis(30));
+        if shift_down() {
+            return Err("key_up did not release shift".into());
+        }
+        Ok(())
+    })();
+    InputActuator::release_all();
+    outcome
+}
+
+fn pointer_lands_on_the_exact_pixel(_lab: &Lab) -> Result<(), String> {
+    // Moves only (no clicks) to 300 pseudo-random pixels across the screen, edges and corners
+    // included; each must read back exactly. Gliding is off so the case takes seconds, not minutes.
+    let bounds = InputActuator::get_screen_bounds();
+    let mut points = vec![(bounds.x, bounds.y), (bounds.x + bounds.width - 1, bounds.y), (bounds.x, bounds.y + bounds.height - 1), (bounds.x + bounds.width - 1, bounds.y + bounds.height - 1)];
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    while points.len() < 300 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        points.push((bounds.x + (state % bounds.width as u64) as i32, bounds.y + ((state >> 20) % bounds.height as u64) as i32));
+    }
+    InputActuator::set_smooth_motion(false);
+    let mut misses = Vec::new();
+    for &(x, y) in &points {
+        if let Err(error) = act(A::MouseMove { x, y }) {
+            misses.push(format!("({x},{y}): {error}"));
+        } else if InputActuator::cursor_position() != Some((x, y)) {
+            misses.push(format!("({x},{y}) read back {:?}", InputActuator::cursor_position()));
+        }
+    }
+    InputActuator::set_smooth_motion(true);
+    let (moves, exact, corrected, failed, worst) = crate::input::send_input::pointer_stats::snapshot();
+    crate::testlog::record("precision", "pointer_exact", serde_json::json!({"points": points.len(), "misses": misses.len(), "moves": moves, "exactFirstTry": exact, "corrected": corrected, "failed": failed, "worstPx": worst}));
+    if misses.is_empty() { Ok(()) } else { Err(format!("{} of 300 missed: {}", misses.len(), misses.iter().take(3).cloned().collect::<Vec<_>>().join("; "))) }
+}
+
+fn one_pixel_target_twenty_times(lab: &Lab) -> Result<(), String> {
+    for round in 1..=20 {
+        fx::clear();
+        let (x, y) = lab.center("px1")?;
+        act(left_click(x, y, 1, &[]))?;
+        if !wait_until(1500, || fx::saw("click:px1")) {
+            return Err(format!("round {round}: the 1 px target at ({x},{y}) did not get the click (saw: {})", fx::events().join(", ")));
+        }
+        // Move away so the next round really travels to the target again.
+        act(A::MouseMove { x: x + 40, y: y + 40 })?;
+    }
+    Ok(())
+}
+
 fn drag_a_slider(lab: &Lab) -> Result<(), String> {
     let (x, y) = lab.center("thumb")?;
     act(A::DragAndDrop { from_x: x, from_y: y, to_x: x + (150.0 * lab.dpr) as i32, to_y: y, duration_ms: 400, hold_keys: vec![] })?;
@@ -736,6 +888,12 @@ fn cases() -> Vec<(&'static str, &'static str, CaseFn)> {
         ("window", "open_url refuses other schemes", open_url_refuses_other_schemes),
         ("window", "wait takes the time asked", wait_action_takes_the_time_asked),
         ("window", "open_url reuses the current tab", open_url_reuses_the_current_tab),
+        ("control", "stop mid-drag releases the button within 100 ms", stop_mid_drag_releases_the_button),
+        ("control", "stop mid-typing leaves no key down", stop_mid_typing_leaves_no_key_down),
+        ("control", "pause mid-drag cuts the action and releases", pause_mid_drag_cuts_the_action),
+        ("control", "a key held by key_down survives the step, key_up releases it", key_down_survives_the_step),
+        ("precision", "pointer lands on the exact pixel 300 times", pointer_lands_on_the_exact_pixel),
+        ("precision", "1 px target hit 20 of 20", one_pixel_target_twenty_times),
     ]
 }
 

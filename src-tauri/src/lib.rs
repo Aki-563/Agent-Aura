@@ -24,6 +24,7 @@ pub mod reliability;
 pub mod settle;
 pub mod settings;
 pub mod sound;
+pub mod testlog;
 pub mod trace;
 pub mod voice;
 

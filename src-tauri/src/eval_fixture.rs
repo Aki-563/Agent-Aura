@@ -216,7 +216,8 @@ const LAB_BODY: &str = r##"
 .box{width:200px;height:70px;line-height:70px;font-size:18px}</style>
 <h1 id=title>Lab</h1>
 <div class=row><button id=btn-a>A</button><button id=btn-b>B</button><button id=btn-c>C</button>
-<button id=tiny style="font-size:10px;padding:0;width:22px;height:22px;margin-left:30px">s</button></div>
+<button id=tiny style="font-size:10px;padding:0;width:22px;height:22px;margin-left:30px">s</button>
+<span id=px1 style="display:inline-block;width:1px;height:1px;background:#f00;margin-left:40px;vertical-align:middle"></span></div>
 <div class=row><div id=box class=box style="display:inline-block;border:3px solid #333;text-align:center;user-select:none">click box</div>
 <div id=hov class=box style="display:inline-block;border:3px solid #a33;text-align:center;margin-left:30px">hover me</div></div>
 <form id=f class=row><input id=i1 type=text placeholder="field one"><input id=i2 type=text placeholder="field two"><button type=submit>Go</button></form>
@@ -234,7 +235,7 @@ function st(k,v){fetch('/state',{method:'POST',body:k+'='+encodeURIComponent(v)}
 function mods(e){return (e.ctrlKey?'ctrl+':'')+(e.altKey?'alt+':'')+(e.shiftKey?'shift+':'')}
 var inner=$('inner'),wide=$('wide');
 for(var n=1;n<=40;n++){var d=document.createElement('div');d.textContent='Inner line '+n;inner.appendChild(d)}
-['btn-a','btn-b','btn-c','tiny','bottom'].forEach(function(id){$(id).onclick=function(){ev('click:'+id)}});
+['btn-a','btn-b','btn-c','tiny','px1','bottom'].forEach(function(id){$(id).onclick=function(){ev('click:'+id)}});
 var box=$('box');
 box.onclick=function(e){ev('click:box:d'+e.detail);if(e.shiftKey)ev('click:box:shift');if(e.ctrlKey)ev('click:box:ctrl')};
 box.ondblclick=function(){ev('dblclick:box')};
@@ -253,7 +254,7 @@ function pageState(){st('scrollY',Math.round(window.scrollY));st('scrollMax',doc
 window.onscroll=pageState;
 inner.onscroll=function(){st('innerTop',Math.round(inner.scrollTop))};
 wide.onscroll=function(){st('innerLeft',Math.round(wide.scrollLeft))};
-document.onmousemove=function(e){st('move',e.clientX+','+e.clientY)};
+document.addEventListener('pointermove',function(e){st('move',e.clientX+','+e.clientY)});
 var drag=null,thumb=$('thumb'),src=$('src');
 thumb.onmousedown=function(e){drag={k:'t',x:e.clientX,l:thumb.offsetLeft};e.preventDefault()};
 src.onmousedown=function(e){drag={k:'s',x:e.clientX,y:e.clientY};e.preventDefault()};
@@ -265,7 +266,7 @@ document.addEventListener('mouseup',function(e){if(!drag)return;var k=drag.k;dra
   ev(e.clientX>r.left&&e.clientX<r.right&&e.clientY>r.top&&e.clientY<r.bottom?'drop:ok':'drop:miss')}});
 $('hdst').ondragover=function(e){e.preventDefault()};
 $('hdst').ondrop=function(e){e.preventDefault();ev('html5drop:ok')};
-function report(){var ids=['title','btn-a','btn-b','btn-c','tiny','box','hov','i1','i2','area','para','inner','wide','track','thumb','src','dst','hsrc','hdst','bottom'];
+function report(){var ids=['title','btn-a','btn-b','btn-c','tiny','px1','box','hov','i1','i2','area','para','inner','wide','track','thumb','src','dst','hsrc','hdst','bottom'];
  var lines=ids.map(function(id){var r=$(id).getBoundingClientRect();return id+'='+r.left+','+r.top+','+r.width+','+r.height});
  lines.push('win='+window.innerWidth+','+window.innerHeight+','+window.devicePixelRatio+',0');
  fetch('/rects',{method:'POST',body:lines.join('\n')})}
