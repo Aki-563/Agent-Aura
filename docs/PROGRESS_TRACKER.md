@@ -101,7 +101,7 @@
 - [x] Replace `com.tauri.dev` with the production bundle identifier `com.agentaura.desktop`.
 - [x] Rebuild and launch `dist/agent-aura.exe` through the Tauri production pipeline.
 - [x] Replace the sample UI and simulated status messages with a real task, observation, proposal, and approval workflow.
-- [x] Add memory-only credentials for OpenAI Responses API and optional-key OpenAI-compatible local servers.
+- [x] Add credentials for OpenAI Responses API and optional-key OpenAI-compatible local servers (2026-10-30: provider settings are saved, the key DPAPI-encrypted).
 - [x] Connect real DXGI capture, vision-model planning, coordinate scaling, typed action validation, and Win32 execution.
 - [x] Add autonomous multi-step execution with live progress events, a configurable step ceiling, and the global Esc kill switch.
 - [x] Enforce a strict one-action loop: propose one action, execute, optically settle, capture a fresh screenshot, then plan again.

@@ -255,8 +255,14 @@ impl AgentRuntime {
             renderer.start().ok().map(|_| renderer)
         });
 
+        // Settings saved by an earlier session (the key is decrypted only for this Windows account).
+        let saved_config = crate::vault::load(&data_root).and_then(|(saved, key)| {
+            let protocol: ApiProtocol = serde_json::from_value(serde_json::Value::String(saved.protocol)).ok()?;
+            Some(ProviderConfig { protocol, base_url: saved.base_url, model: saved.model, api_key: key })
+        });
+
         Ok(Self {
-            config: Mutex::new(None),
+            config: Mutex::new(saved_config),
             pending: Mutex::new(None),
             client,
             running: AtomicBool::new(false),
@@ -275,7 +281,7 @@ impl AgentRuntime {
         &self.data_root
     }
 
-    /// Validates and stores the model provider settings (the key stays in memory only).
+    /// Validates and stores the model provider settings (saved to disk; the key is DPAPI-encrypted).
     pub fn set_provider(&self, input: ProviderConfigInput) -> Result<ProviderStatus, String> {
         configure_provider_inner(self, input)
     }
@@ -296,7 +302,16 @@ fn configure_provider_inner(state: &AgentRuntime, input: ProviderConfigInput) ->
     }
 
     let base_url = normalize_base_url(&input.base_url, input.protocol)?;
-    if input.protocol == ApiProtocol::OpenAiResponses && input.api_key.trim().is_empty() {
+    // Leaving the key field empty keeps the key that is already saved for the same server.
+    let mut api_key = input.api_key.trim().to_owned();
+    if api_key.is_empty() {
+        if let Ok(existing) = state.config.lock() {
+            if let Some(current) = existing.as_ref().filter(|c| c.protocol == input.protocol && c.base_url == base_url) {
+                api_key = current.api_key.clone();
+            }
+        }
+    }
+    if input.protocol == ApiProtocol::OpenAiResponses && api_key.is_empty() {
         return Err("An OpenAI API key is required for the OpenAI Responses API.".to_owned());
     }
 
@@ -304,8 +319,15 @@ fn configure_provider_inner(state: &AgentRuntime, input: ProviderConfigInput) ->
         protocol: input.protocol,
         base_url,
         model,
-        api_key: input.api_key.trim().to_owned(),
+        api_key,
     };
+    let protocol_name = match config.protocol {
+        ApiProtocol::OpenAiResponses => "open_ai_responses",
+        ApiProtocol::OpenAiCompatibleChat => "open_ai_compatible_chat",
+    };
+    if let Err(error) = crate::vault::save(&state.data_root, protocol_name, &config.base_url, &config.model, &config.api_key) {
+        log::warn!("provider settings were not saved: {error}");
+    }
     let status = status_from_config(Some(&config));
 
     *state
@@ -331,6 +353,7 @@ pub fn get_provider_status(state: State<'_, AgentRuntime>) -> Result<ProviderSta
 
 #[tauri::command]
 pub fn clear_provider(state: State<'_, AgentRuntime>) -> Result<ProviderStatus, String> {
+    crate::vault::clear(&state.data_root);
     *state
         .config
         .lock()
@@ -3287,6 +3310,33 @@ fn truncate(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provider_settings_and_key_survive_a_restart_and_an_empty_key_field_keeps_the_key() {
+        let root = std::env::temp_dir().join(format!("aura-persist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let input = |key: &str| ProviderConfigInput { protocol: ApiProtocol::OpenAiResponses, base_url: "https://api.openai.com/v1".into(), model: "gpt-test".into(), api_key: key.into() };
+        {
+            let first = AgentRuntime::with_data_root(root.clone(), false).unwrap();
+            assert!(!status_from_config(first.config.lock().unwrap().as_ref()).configured);
+            first.set_provider(input("sk-persist-secret-1")).unwrap();
+        }
+        // A new process: the settings and the key come back without being typed again.
+        let second = AgentRuntime::with_data_root(root.clone(), false).unwrap();
+        {
+            let config = second.config.lock().unwrap();
+            let config = config.as_ref().expect("saved provider is loaded at startup");
+            assert_eq!((config.model.as_str(), config.api_key.as_str()), ("gpt-test", "sk-persist-secret-1"));
+        }
+        // Saving again with the key field empty keeps the stored key instead of failing.
+        second.set_provider(input("")).unwrap();
+        assert_eq!(second.config.lock().unwrap().as_ref().unwrap().api_key, "sk-persist-secret-1");
+        assert!(!std::fs::read_to_string(root.join("provider.json")).unwrap().contains("sk-persist-secret-1"));
+        crate::vault::clear(&root);
+        let third = AgentRuntime::with_data_root(root.clone(), false).unwrap();
+        assert!(third.config.lock().unwrap().is_none(), "clearing deletes the saved settings");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_moved_target_is_noticed_and_a_present_one_is_not() {
         let target = |label: &str, kind: &str, x: i32, y: i32| ExpectedTarget { x, y, label: label.to_owned(), kind: kind.to_owned() };

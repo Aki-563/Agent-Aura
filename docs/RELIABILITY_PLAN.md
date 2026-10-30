@@ -58,7 +58,7 @@ The following are ticked in `PROGRESS_TRACKER.md` but exist only in the unwired 
 **Status 2026-10-30:** the confirmation gate now exists as an Allow/Deny card, a humility path exists (`ask_user` plus a stuck-streak guard), and screenshots sent to the model are JPEG (traces keep PNG). Still missing: action batching, the Tier 3 vector cache, Triple-Lock snapping, distillation beyond plain-language recipes, a fast radar and a real Direct2D overlay.
 
 ### 2.3 Real strengths to keep
-Typed action grammar (no `exec`), `SendInput` with virtual-desktop normalization, multi-monitor origins, UIA + Windows OCR candidates, the kill-switch hook, the HUD, memory-only API keys, persisted runs and trajectories, the review modal and scrubber UI, and a single Rust binary.
+Typed action grammar (no `exec`), `SendInput` with virtual-desktop normalization, multi-monitor origins, UIA + Windows OCR candidates, the kill-switch hook, the HUD, DPAPI-encrypted saved API keys, persisted runs and trajectories, the review modal and scrubber UI, and a single Rust binary.
 
 ### 2.4 Local test environment (current)
 - **Model server:** LM Studio on the LAN (`http://10.103.7.32:1234/v1` on 2026-10-30; the address changes, ask the user). Models seen: `google/gemma-4-e2b` (the test model), plus others the user may name. LM Studio rejects `response_format: {"type":"json_object"}` (HTTP 400); `json_schema` works and constrains the output.

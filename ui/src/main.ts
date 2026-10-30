@@ -118,7 +118,7 @@ app.innerHTML = `
       <div class="section-heading">
         <div>
           <h2>Model connection</h2>
-          <p>The API key is held only in Rust process memory and is cleared when the app exits.</p>
+          <p>Settings are saved on this computer. The API key is encrypted with Windows (only your Windows account can read it) and is never written to logs.</p>
         </div>
         <button id="clear-provider" class="button ghost" type="button">Clear</button>
       </div>
@@ -141,7 +141,7 @@ app.innerHTML = `
         </label>
         <label class="wide">
           <span id="api-key-label">OpenAI API key</span>
-          <input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Stored in memory only" />
+          <input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Saved encrypted on this computer" />
         </label>
       </div>
 
@@ -256,7 +256,7 @@ function updateProtocolFields(): void {
   if (protocol.value === "open_ai_responses") {
     baseUrl.value = "https://api.openai.com/v1";
     apiKeyLabel.textContent = "OpenAI API key";
-    apiKey.placeholder = "Required; stored in memory only";
+    apiKey.placeholder = "Required; saved encrypted on this computer";
   } else {
     if (baseUrl.value === "https://api.openai.com/v1" || baseUrl.value.trim() === "") {
       baseUrl.value = "http://localhost:11434/v1";
@@ -302,7 +302,7 @@ async function clearProvider(): Promise<void> {
     renderProviderStatus(await invoke<ProviderStatus>("clear_provider"));
     apiKey.value = "";
     clearPlan();
-    log("info", "Provider credentials and pending plan cleared from memory.");
+    log("info", "Saved provider settings, the stored API key and the pending plan were deleted.");
   } catch (error) {
     log("error", toMessage(error));
   }
@@ -737,9 +737,14 @@ function renderProviderStatus(status: ProviderStatus): void {
   }
   badge.className = "badge ready";
   badge.innerHTML = "<span></span>Configured";
-  if (status.protocol) protocol.value = status.protocol;
+  if (status.protocol) {
+    protocol.value = status.protocol;
+    updateProtocolFields();
+  }
   if (status.baseUrl) baseUrl.value = status.baseUrl;
   if (status.model) model.value = status.model;
+  // The key itself never comes back to the page; the field only says whether one is saved.
+  if (status.hasApiKey) apiKey.placeholder = "Key saved (encrypted). Leave empty to keep it, or type a new one";
 }
 
 function renderStep(thought: string, actions: Record<string, unknown>[]): void {

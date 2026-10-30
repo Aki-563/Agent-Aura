@@ -26,6 +26,7 @@ pub mod settings;
 pub mod sound;
 pub mod testlog;
 pub mod trace;
+pub mod vault;
 pub mod voice;
 
 /// Per-monitor DPI awareness must be set before any window is created or any screen metric is

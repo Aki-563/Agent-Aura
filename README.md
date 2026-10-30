@@ -51,4 +51,4 @@ Launch `dist/agent-aura.exe`.
 
 While a run is active the screen edge glows and a banner at the top centre says what the agent is doing (taking a screenshot, thinking, working). A sound plays when a task starts and when it finishes; set the environment variable `AURA_MUTE=1` to silence it.
 
-API keys are kept only in Rust process memory. They are not written to SQLite, browser storage, logs, or repository files. Press **Esc** while actions are executing to trigger the emergency stop.
+Provider settings are saved in `%LOCALAPPDATA%\AgentAura\provider.json`; the API key in it is encrypted with Windows DPAPI, so only your Windows account on this computer can read it. It is never written to SQLite, browser storage, logs, traces or repository files. "Clear" in the app deletes the saved file. Press **Esc** while actions are executing to trigger the emergency stop.
