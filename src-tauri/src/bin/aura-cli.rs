@@ -129,7 +129,7 @@ fn usage() -> String {
 #[tokio::main]
 async fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
-    if matches!(raw.first().map(String::as_str), Some("look") | Some("do") | Some("demo")) {
+    if matches!(raw.first().map(String::as_str), Some("look") | Some("do") | Some("demo") | Some("serve")) {
         agent_aura_lib::make_process_dpi_aware();
         if let Err(error) = KillSwitch::start_monitoring() {
             eprintln!("warning: the Esc kill switch could not be installed: {error}");

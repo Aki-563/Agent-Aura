@@ -148,8 +148,12 @@ pub fn select_elements(
         let center = ((item.left + item.right) / 2, (item.top + item.bottom) / 2);
         chosen.iter().any(|kept| {
             let inside = center.0 >= kept.left && center.0 <= kept.right && center.1 >= kept.top && center.1 <= kept.bottom;
+            // Only a control about one line tall (a button, a field, a list row) owns the text inside
+            // it. A page or pane does not: when an app exposes nothing but a bare container, its
+            // words exist only as OCR lines and must stay visible.
+            let line_sized = (kept.bottom - kept.top) <= 3 * (item.bottom - item.top).max(8);
             // OCR text sitting inside a chosen control, or two near-identical boxes.
-            (item.priority >= 1 && inside) || same_box(item, kept)
+            (item.priority >= 1 && inside && line_sized) || same_box(item, kept)
         })
     };
 
@@ -379,6 +383,26 @@ mod tests {
     // Monitor 1920x1080 at origin 0,0; screenshot 1280x720 (scale 2/3).
     fn select(candidates: &[GroundingCandidate], max: usize) -> Vec<Element> {
         select_elements(candidates, (0, 0), (1920, 1080), (1280, 720), max, "")
+    }
+
+    #[test]
+    fn text_inside_a_bare_page_container_stays_visible() {
+        // A browser whose page exposes no accessibility children: UI Automation reports one big
+        // document, and the page's words exist only as OCR lines inside it (seen 2026-10-30 in a
+        // fresh Chrome instance: "Double-click me" vanished from the numbered elements).
+        let candidates = vec![
+            candidate(CandidateSource::UiAutomation, "Aura Fixture Mouse", Some("Document"), 19, 120, 1317, 1002),
+            candidate(CandidateSource::Ocr, "Double-click me", None, 160, 422, 336, 443),
+            candidate(CandidateSource::Ocr, "Right-click me", None, 527, 422, 682, 449),
+            // A real button and its own label read by OCR: the label is still a duplicate.
+            candidate(CandidateSource::UiAutomation, "Save", Some("Button"), 900, 500, 1000, 540),
+            candidate(CandidateSource::Ocr, "Save", None, 930, 510, 970, 530),
+        ];
+        let elements = select(&candidates, MAX_MARKS);
+        let labels: Vec<&str> = elements.iter().map(|e| e.label.as_str()).collect();
+        assert!(labels.contains(&"Double-click me"), "page text must be numbered: {labels:?}");
+        assert!(labels.contains(&"Right-click me"), "page text must be numbered: {labels:?}");
+        assert_eq!(labels.iter().filter(|l| **l == "Save").count(), 1, "a button's own label is not listed twice: {labels:?}");
     }
 
     #[test]

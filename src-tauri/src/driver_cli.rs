@@ -137,8 +137,29 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "demo" => demo(),
+        "serve" => serve(args),
         _ => Err(usage()),
     }
+}
+
+/// `aura-cli serve [--browser chrome|edge] [--page /lab] [--seconds N]`: runs the test-page server
+/// (so `look` and `do` can be tried on the fixture pages) and opens the page in an isolated
+/// browser instance with a throwaway profile, never in the user's own browser.
+fn serve(args: &[String]) -> Result<(), String> {
+    let value = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+    let seconds: u64 = value("--seconds").and_then(|s| s.parse().ok()).unwrap_or(900);
+    if !crate::eval_fixture::start() {
+        return Err("the test page server could not start (port busy)".into());
+    }
+    let page = value("--page").unwrap_or_else(|| "/lab".to_owned());
+    let url = format!("http://127.0.0.1:{}{page}", crate::eval_fixture::PORT);
+    println!("serving the test pages at http://127.0.0.1:{} for {seconds} s", crate::eval_fixture::PORT);
+    if let Some(browser) = value("--browser") {
+        crate::conformance::open_in_new_browser_window(&browser, &url)?;
+        println!("opened {url} in an isolated {browser} window");
+    }
+    std::thread::sleep(Duration::from_secs(seconds));
+    Ok(())
 }
 
 /// Shows the HUD states with their top-centre labels, glides the pointer between a few points and

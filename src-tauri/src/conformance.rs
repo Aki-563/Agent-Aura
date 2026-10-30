@@ -946,7 +946,14 @@ fn trail_text() -> String {
 
 fn open_page(path: &str, title: &str) -> Result<(), String> {
     fx::clear();
-    act(A::OpenUrl { url: format!("http://127.0.0.1:{}{path}", fx::PORT) })?;
+    let url = format!("http://127.0.0.1:{}{path}", fx::PORT);
+    match BROWSER.lock().ok().and_then(|b| b.clone()) {
+        // Reuse the tab only when it is one of our test pages; otherwise start the isolated browser,
+        // so a browser window the user owns is never navigated.
+        Some(_) if desktop_target::foreground_title().contains("Aura Fixture") => act(A::OpenUrl { url })?,
+        Some(program) => open_in_new_browser_window(&program, &url)?,
+        None => act(A::OpenUrl { url })?,
+    }
     if wait_until(20_000, || fx::saw(&format!("load:Aura Fixture {title}"))) {
         std::thread::sleep(Duration::from_millis(900));
         // Edge may show a "Restore pages" bubble that takes the keyboard focus: Escape closes it.
@@ -1431,7 +1438,7 @@ pub fn set_browser(program: Option<String>) {
 /// Opens `url` in a separate browser instance with its own throwaway profile. A plain
 /// `--new-window` joins the user's running browser, so closing the test window could end their
 /// whole browser (2026-10-30: the user's Chrome exited the moment the test closed its window).
-fn open_in_new_browser_window(program: &str, url: &str) -> Result<(), String> {
+pub fn open_in_new_browser_window(program: &str, url: &str) -> Result<(), String> {
     let exe = match program.to_lowercase().as_str() {
         "chrome" => "chrome.exe",
         "edge" | "msedge" => "msedge.exe",
