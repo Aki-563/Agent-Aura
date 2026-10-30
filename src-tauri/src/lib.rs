@@ -26,6 +26,7 @@ pub mod settings;
 pub mod schedule;
 pub mod schedule_cli;
 pub mod sound;
+pub mod system_state;
 pub mod testlog;
 pub mod trace;
 pub mod vault;

@@ -117,6 +117,11 @@ pub async fn run_daemon(runtime: AgentRuntime, host: Host) {
         Arc::new(move |s: Schedule| {
             let (runtime, host) = (Arc::clone(&runtime), Arc::clone(&host));
             Box::pin(async move {
+                // A locked PC or a UAC prompt cannot be driven: skip this run (no capture, no model call).
+                if tokio::task::spawn_blocking(crate::system_state::secure_desktop_active).await.unwrap_or(false) {
+                    println!("[schedule {}] skipped: the PC is locked or showing a security prompt", s.id);
+                    return RunReport { summary: "skipped: the PC was locked".to_owned(), screen_hash: None };
+                }
                 println!("[schedule {}] starting: {}", s.id, s.task);
                 let outcome = execute_run(&runtime, &host, schedule::task_with_state(&s), 40).await;
                 let summary = match outcome {

@@ -764,6 +764,8 @@ pub async fn execute_run(
     let _ = state.pending.lock().map(|mut pending| *pending = None);
     crate::input::killswitch::KillSwitch::reset();
     crate::control::begin_run();
+    // The Shift-five-times Sticky Keys pop-up must not appear mid-run (restored when this drops).
+    let _shortcuts = crate::system_state::ShortcutGuard::engage();
     // The pointer looks different while the agent drives it (put back when the run ends).
     crate::overlay::cursor::show_working_cursor();
     crate::control::set_yield_to_user(crate::settings::get().yield_to_user);
@@ -1495,6 +1497,24 @@ async fn autonomous_loop(
             tokio::task::spawn_blocking(move || crate::voice::announce(&sentence)).await.ok();
         }
 
+        // A UAC prompt or the lock screen owns the keyboard and mouse: nothing sent now would
+        // arrive, and no program may click "Yes" for the user. Hand over, then look again.
+        if tokio::task::spawn_blocking(crate::system_state::secure_desktop_active).await.unwrap_or(false) {
+            trace.event(step_number, "secure_desktop_handoff", json!({}));
+            set_hud(state, HudState::Settling);
+            emit_status(window, "confirm", step_number, "A Windows security prompt needs you");
+            let id = format!("{run_id}-{step_number}-uac");
+            let helped = request_confirmation(window, state, &id, "Windows is showing a security prompt (UAC) or the lock screen. Aura cannot and will not answer it. Please deal with it yourself, then press \"Done, continue\".", "help").await;
+            set_hud(state, HudState::Thinking);
+            if crate::input::killswitch::is_killed() {
+                return Ok(stopped_response(executed_steps));
+            }
+            if !helped {
+                return Ok(AutonomousResponse { completed: false, stopped: false, steps_executed: executed_steps, message: "Stopped: Windows showed a security prompt that needed you.".to_owned() });
+            }
+            settled_capture = None;
+            continue;
+        }
         let baseline_window_id = desktop_target::effective_foreground().map_or(0, |hwnd| hwnd as isize);
         let windows_before = desktop_target::window_titles();
         let typed = matches!(final_action, ActionPrimitive::TypeText { .. } | ActionPrimitive::TypeWith { .. });
@@ -2246,7 +2266,10 @@ STUCK WARNING: your last {} actions changed nothing on screen. Do NOT repeat the
         .flatten()
         .unwrap_or_else(|| "not reported by this app".to_owned());
     let proposal_prompt = build_proposal_prompt(capture.width, capture.height);
-    let control_text = session.control_text();
+    let mut control_text = session.control_text();
+    if let Some(note) = crate::system_state::accessibility().prompt_note() {
+        control_text = format!("{control_text}\n{note}").trim().to_owned();
+    }
     let control_section = if control_text.is_empty() { String::new() } else { format!("\n\n{control_text}") };
     // The window-state block goes with every screenshot (HARNESS_COMPLETION_PLAN.md §H3): the
     // model always knows how many windows exist, which is active, and what the image covers.
@@ -2288,6 +2311,8 @@ USER:
     let proposal_text = extract_model_text(&proposal_value, config.protocol)?;
     trace.text(&format!("proposal_raw_{retry_attempt}.txt"), &proposal_text);
     let mut proposal: ActionProposal = model_schema::parse_proposal_with(&proposal_text, &resolve_element)?;
+    let coordinate_scale = crate::settings::get().coordinate_scale;
+    proposal.action = from_model_scale(proposal.action.clone(), &coordinate_scale, capture.width, capture.height, &capture.elements)?;
 
     // Grounding modes (HARNESS_COMPLETION_PLAN.md H4). A = the proposal's own coordinates. B = a
     // second call on the SAME screenshot points at the described target. C = no extra call; the
@@ -2402,7 +2427,10 @@ USER:
         .await?;
         let verification_text = extract_model_text(&verification_value, config.protocol)?;
         trace.text(&format!("verification_raw_{retry_attempt}.txt"), &verification_text);
-        let verification: VerifiedAction = model_schema::parse_verification_with(&verification_text, &resolve_element)?;
+        let mut verification: VerifiedAction = model_schema::parse_verification_with(&verification_text, &resolve_element)?;
+        if let Some(action) = verification.final_action.take() {
+            verification.final_action = Some(from_model_scale(action, &coordinate_scale, capture.width, capture.height, &capture.elements)?);
+        }
         let canvas_action = match verification.verdict {
             VerificationVerdict::Accept => verification
                 .final_action
@@ -2871,6 +2899,18 @@ fn capture_screen() -> Result<EncodedCapture, String> {
         }
         Err(error) => return Err(error.to_string()),
     };
+    // Some surfaces come back black from desktop duplication (protected or hardware-overlay
+    // content, a driver hiccup). A GDI grab of the same rectangle often has the pixels.
+    let mut frame = frame;
+    if crate::system_state::frame_is_black(&frame.data) {
+        if let Ok(other) = crate::capture::gdi::capture_rect(origin_x, origin_y, capture.width(), capture.height()) {
+            let recovered = !crate::system_state::frame_is_black(&other.data);
+            crate::testlog::record("capture", "black_frame", json!({"recovered_with_gdi": recovered}));
+            if recovered {
+                frame = other;
+            }
+        }
+    }
     let candidates = collect_candidates(
         &frame.data,
         frame.width,
@@ -3053,9 +3093,13 @@ fn describe_effect(
 }
 
 fn build_proposal_prompt(width: u32, height: u32) -> String {
+    let coordinate_line = match crate::settings::get().coordinate_scale.as_str() {
+        "norm1000" => format!("The screenshot is {width}x{height} pixels. Every x,y you output is on a 0 to 1000 grid over THIS image (0,0 is the top-left corner, 1000,1000 the bottom-right), so x=500 is the middle."),
+        _ => format!("The screenshot is exactly {width}x{height} pixels; every x,y you output is a pixel in THIS image, measured from its top-left corner."),
+    };
     format!(
         "You are Agent Aura's desktop operator. You control a Windows computer through one action at a time.\n\
-The screenshot is exactly {width}x{height} pixels; every x,y you output is a pixel in THIS image, measured from its top-left corner.\n\
+{coordinate_line}\n\
 \n\
 How to work:\n\
 1. Look at RECENT TRAJECTORY. Each past step has a measured `effect` (what the screen really did after that action, measured by software, not guessed). If it says NO VISIBLE EFFECT, that action did not work: do NOT repeat it, choose a different approach (another control, a keyboard shortcut, scrolling, waiting).\n\
@@ -3174,6 +3218,26 @@ fn terminal_outcome(actions: &[ActionPrimitive]) -> Option<(bool, String)> {
         ActionPrimitive::Done { summary } => Some((true, summary.clone())),
         ActionPrimitive::Fail { reason } => Some((false, reason.clone())),
         _ => None,
+    })
+}
+
+/// Converts the model's raw points to screenshot pixels. Some models answer on a 0..1000 grid
+/// ("norm1000", e.g. Qwen-VL) or 0..1 ("norm1"); settings say which. Points that came from an
+/// element number (an element centre) are already pixels and stay as they are.
+fn from_model_scale(action: ActionPrimitive, scale: &str, width: u32, height: u32, elements: &[Element]) -> Result<ActionPrimitive, String> {
+    let (div_x, div_y) = match scale {
+        "norm1000" => (1000.0, 1000.0),
+        "norm1" => (1.0, 1.0),
+        _ => return Ok(action),
+    };
+    let is_centre = |x: i32, y: i32| elements.iter().any(|e| e.center() == (x, y));
+    action.map_points(&|x, y| {
+        if is_centre(x, y) {
+            return Ok((x, y));
+        }
+        let px = (f64::from(x) / div_x * f64::from(width)).round() as i32;
+        let py = (f64::from(y) / div_y * f64::from(height)).round() as i32;
+        Ok((px.clamp(0, width as i32 - 1), py.clamp(0, height as i32 - 1)))
     })
 }
 
@@ -3717,6 +3781,20 @@ fn truncate(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_coordinates_on_a_thousand_grid_become_screenshot_pixels() {
+        let click = |x, y| ActionPrimitive::Click { x, y, button: Default::default(), clicks: 1, hold_keys: Vec::new() };
+        let elements = [Element { id: 1, label: "ok".into(), kind: "Button".into(), left: 10, top: 10, right: 30, bottom: 20 }];
+        let converted = from_model_scale(click(500, 250), "norm1000", 1280, 720, &elements).unwrap();
+        assert!(matches!(converted, ActionPrimitive::Click { x: 640, y: 180, .. }), "{converted:?}");
+        let edge = from_model_scale(click(1000, 1000), "norm1000", 1280, 720, &elements).unwrap();
+        assert!(matches!(edge, ActionPrimitive::Click { x: 1279, y: 719, .. }));
+        let element_centre = from_model_scale(click(20, 15), "norm1000", 1280, 720, &elements).unwrap();
+        assert!(matches!(element_centre, ActionPrimitive::Click { x: 20, y: 15, .. }), "an element's centre is already pixels");
+        let untouched = from_model_scale(click(500, 250), "pixels", 1280, 720, &elements).unwrap();
+        assert!(matches!(untouched, ActionPrimitive::Click { x: 500, y: 250, .. }));
+    }
+
     #[test]
     fn provider_settings_and_key_survive_a_restart_and_an_empty_key_field_keeps_the_key() {
         let root = std::env::temp_dir().join(format!("aura-persist-{}", std::process::id()));
