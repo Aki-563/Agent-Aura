@@ -222,3 +222,17 @@ body.running .run-view {
 }
 
 @keyframes row-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+/* Schedules */
+.schedule-panel { margin-top: 16px; }
+label.check { display: flex; align-items: center; gap: 10px; }
+label.check > input { width: auto; margin: 0; }
+label.check > span { margin: 0; }
+.inline-error { color: #ff8f8f; font-size: 12px; margin-right: auto; align-self: center; }
+.sched-list { margin-top: 14px; display: grid; gap: 8px; }
+.sched-item { display: flex; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: #0d1119; transition: opacity .35s var(--ease), border-color .35s var(--ease); }
+.sched-item.off { opacity: .55; }
+.sched-text { flex: 1; min-width: 0; }
+.sched-title { font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sched-meta { color: #98a3b8; font-size: 12px; margin-top: 3px; }
+.sched-empty { color: #98a3b8; font-size: 13px; padding: 6px 2px; }

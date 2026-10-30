@@ -25,6 +25,7 @@ pub mod reliability;
 pub mod settle;
 pub mod settings;
 pub mod schedule;
+pub mod schedule_app;
 pub mod schedule_cli;
 pub mod sound;
 pub mod system_state;
@@ -86,6 +87,10 @@ pub fn run() {
             agent::answer_confirmation,
             agent::get_last_task_run,
             agent::submit_task_review,
+            schedule_app::list_schedules,
+            schedule_app::add_schedule,
+            schedule_app::remove_schedule,
+            schedule_app::set_schedule_enabled,
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {
@@ -113,6 +118,9 @@ pub fn run() {
 
             crate::input::killswitch::KillSwitch::start_monitoring()
                 .map_err(std::io::Error::other)?;
+
+            // Saved schedules run while the app is open (idle between runs: nothing captured).
+            schedule_app::start(app.handle().clone());
 
             Ok(())
         })

@@ -364,6 +364,31 @@ mod tests {
         tx
     }
 
+    /// Real Windows speech (audible): run with `cargo test --lib real_speech -- --ignored`.
+    /// Checks the engine starts a sentence, finishes it, and a stop cuts a long one quickly.
+    #[test]
+    #[ignore = "speaks out loud"]
+    fn real_speech_starts_finishes_and_stops() {
+        let mut voice = super::sapi::SapiVoice::new().expect("Windows speech is available");
+        voice.configure(&VoiceSettings { volume: 60, ..Default::default() }).expect("configure");
+        voice.speak("Agent Aura voice check.", true).expect("speak");
+        let begun = Instant::now();
+        while !voice.is_speaking() && begun.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(voice.is_speaking(), "speech did not start within 2 s (no audio device or voice?)");
+        voice.wait_done(Duration::from_secs(8));
+        assert!(!voice.is_speaking(), "the sentence did not finish");
+        voice.speak("This is a long sentence that should be cut off by the stop command long before it ends, because it keeps going and going.", true).expect("speak long");
+        std::thread::sleep(Duration::from_millis(500));
+        let stopped = Instant::now();
+        voice.stop();
+        while voice.is_speaking() && stopped.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!voice.is_speaking() && stopped.elapsed() < Duration::from_millis(500), "stop took {:?}", stopped.elapsed());
+    }
+
     #[test]
     fn the_model_sentence_is_spoken_and_a_phrase_is_made_when_it_is_missing() {
         let click = ActionPrimitive::Click { x: 842, y: 517, button: Default::default(), clicks: 1, hold_keys: vec![] };

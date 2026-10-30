@@ -704,6 +704,32 @@ impl HostBackend for TauriBackend {
     }
 }
 
+/// The app window as a host for scheduled runs: events still go to the UI, but nobody is asked
+/// anything (risky actions and help requests are declined), because the user may be away.
+struct UnattendedBackend(TauriBackend);
+
+impl HostBackend for UnattendedBackend {
+    fn emit_value(&self, event: &str, payload: Value) {
+        self.0.emit_value(event, payload);
+    }
+    fn enter_run_mode(&self) {
+        self.0.enter_run_mode();
+    }
+    fn leave_run_mode(&self) {
+        self.0.leave_run_mode();
+    }
+    fn move_panel_away(&self, points: &[(i32, i32)]) -> bool {
+        self.0.move_panel_away(points)
+    }
+    fn auto_answer(&self) -> Option<bool> {
+        Some(false)
+    }
+}
+
+pub fn unattended_host(window: WebviewWindow) -> Host {
+    Host::new(UnattendedBackend(TauriBackend { window, saved_layout: Mutex::new(None) }))
+}
+
 #[tauri::command]
 pub async fn run_autonomous_task(
     window: WebviewWindow,

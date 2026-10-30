@@ -359,6 +359,69 @@ async fn pause_then_resume_looks_again_and_tells_the_model() {
     assert!(proposals.iter().all(|p| !p.contains("STALE")), "the answer from before the pause was dropped");
 }
 
+/// T3: a long pause (10 minutes by default; `AURA_PAUSE_SECS` shortens it). While paused the run
+/// asks the model nothing, and after the resume it carries on with a fresh look. Run with
+/// `cargo test --lib long_pause -- --ignored`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "takes 10 minutes"]
+async fn long_pause_makes_no_requests_and_resumes_cleanly() {
+    static AT_PAUSE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static AT_RESUME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn pause() {
+        crate::control::pause("long pause test");
+        // Give the run a moment to settle into the paused state, then start measuring.
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        AT_PAUSE.store(process_cpu_ms(), std::sync::atomic::Ordering::SeqCst);
+    }
+    fn resume() {
+        AT_RESUME.store(process_cpu_ms(), std::sync::atomic::Ordering::SeqCst);
+        crate::control::resume();
+    }
+    let seconds: u64 = std::env::var("AURA_PAUSE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(600);
+    let cpu_before = process_cpu_ms();
+    let started = std::time::Instant::now();
+    if std::env::var("AURA_PAUSE_TRACE").is_ok() {
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            eprintln!("t={:>3}s cpu={} ms", started.elapsed().as_secs(), process_cpu_ms().saturating_sub(cpu_before));
+        });
+    }
+    let (outcome, _) = run_with_control(
+        "remember then finish",
+        6,
+        vec![
+            ("aura_proposal", format!("@delay:1500|{}", replies::proposal(note("STALE"), "old"))),
+            ("aura_proposal", replies::proposal(done("done"), "finish")),
+            ("aura_done_check", replies::done_check(true, "")),
+        ],
+        vec![
+            ControlEvent { kind: "aura_proposal", nth: 1, after_ms: 300, act: pause },
+            ControlEvent { kind: "aura_proposal", nth: 1, after_ms: seconds * 1000, act: resume },
+        ],
+    )
+    .await;
+    assert!(outcome.response.completed, "{}", outcome.response.message);
+    assert!(started.elapsed() >= std::time::Duration::from_secs(seconds));
+    assert_eq!(outcome.server.requests_of("aura_proposal").len(), 2, "no model request while paused");
+    // Idle means idle: while paused the process may use only a little CPU (polling every 100 ms).
+    use std::sync::atomic::Ordering::SeqCst;
+    let cpu_used = AT_RESUME.load(SeqCst).saturating_sub(AT_PAUSE.load(SeqCst));
+    assert!(cpu_used < 200 + seconds * 10, "{cpu_used} ms of CPU while paused for {seconds} s");
+    let _ = cpu_before;
+    crate::testlog::record("pause", "long", json!({"seconds": seconds, "cpu_ms": cpu_used}));
+}
+
+fn process_cpu_ms() -> u64 {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    unsafe {
+        let (mut create, mut exit, mut kernel, mut user) = (std::mem::zeroed::<FILETIME>(), std::mem::zeroed::<FILETIME>(), std::mem::zeroed::<FILETIME>(), std::mem::zeroed::<FILETIME>());
+        GetProcessTimes(GetCurrentProcess(), &mut create, &mut exit, &mut kernel, &mut user);
+        let to_u64 = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime);
+        (to_u64(kernel) + to_u64(user)) / 10_000
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stop_racing_the_model_answer_never_lets_the_answer_run() {
     // The answer arrives 400 ms after the request; stop lands from 60 ms before to 30 ms after.

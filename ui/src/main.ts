@@ -194,6 +194,56 @@ app.innerHTML = `
       </aside>
     </section>
 
+    <section class="panel schedule-panel">
+      <div class="section-heading">
+        <div>
+          <h2>Schedules</h2>
+          <p>Repeat a task on a timer while Aura is open. Between runs nothing is captured and the model is not called. Scheduled runs never ask you anything: risky actions are declined.</p>
+        </div>
+      </div>
+      <div class="form-grid">
+        <label class="wide">
+          <span>Task</span>
+          <input id="sched-task" autocomplete="off" placeholder="For example: check the build page and note if anything is red" />
+        </label>
+        <label>
+          <span>Repeat</span>
+          <select id="sched-mode">
+            <option value="every">Every…</option>
+            <option value="daily">Every day at…</option>
+          </select>
+        </label>
+        <label>
+          <span id="sched-value-label">Interval (30s, 5m, 2h)</span>
+          <input id="sched-value" autocomplete="off" value="30m" />
+        </label>
+        <label>
+          <span>If the last run is still going</span>
+          <select id="sched-overlap">
+            <option value="skip">Skip this run</option>
+            <option value="queue">Run it right after</option>
+            <option value="cancel">Stop the old one</option>
+          </select>
+        </label>
+        <label>
+          <span>If the PC was asleep</span>
+          <select id="sched-missed">
+            <option value="run">Run once when it wakes</option>
+            <option value="skip">Skip the missed runs</option>
+          </select>
+        </label>
+        <label class="wide check">
+          <input id="sched-changed" type="checkbox" />
+          <span>Only run when the screen changed since the last run</span>
+        </label>
+      </div>
+      <div class="button-row">
+        <span id="sched-error" class="inline-error"></span>
+        <button id="sched-add" class="button primary" type="button">Add schedule</button>
+      </div>
+      <div id="sched-list" class="sched-list" aria-live="polite"></div>
+    </section>
+
     <section class="panel activity-panel">
       <div class="section-heading">
         <div>
@@ -800,3 +850,103 @@ function toMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   try { return JSON.stringify(error); } catch { return "Unknown error"; }
 }
+
+// ---- Schedules --------------------------------------------------------------------------------
+
+interface ScheduleRow {
+  id: string;
+  task: string;
+  when: string;
+  enabled: boolean;
+  nextInSeconds: number;
+  overlap: string;
+  missed: string;
+  onlyIfChanged: boolean;
+  lastSummary: string;
+}
+
+const schedMode = element<HTMLSelectElement>("sched-mode");
+const schedValue = element<HTMLInputElement>("sched-value");
+const schedValueLabel = element<HTMLElement>("sched-value-label");
+const schedList = element<HTMLElement>("sched-list");
+const schedError = element<HTMLElement>("sched-error");
+
+schedMode.addEventListener("change", () => {
+  const daily = schedMode.value === "daily";
+  schedValueLabel.textContent = daily ? "Times (09:00, 17:30)" : "Interval (30s, 5m, 2h)";
+  schedValue.value = daily ? "09:00" : "30m";
+});
+
+element<HTMLButtonElement>("sched-add").addEventListener("click", async () => {
+  schedError.textContent = "";
+  try {
+    await invoke("add_schedule", {
+      task: element<HTMLInputElement>("sched-task").value,
+      mode: schedMode.value,
+      value: schedValue.value,
+      overlap: element<HTMLSelectElement>("sched-overlap").value,
+      missed: element<HTMLSelectElement>("sched-missed").value,
+      onlyIfChanged: element<HTMLInputElement>("sched-changed").checked,
+    });
+    element<HTMLInputElement>("sched-task").value = "";
+    await refreshSchedules();
+  } catch (error) {
+    schedError.textContent = toMessage(error);
+  }
+});
+
+function countdown(seconds: number): string {
+  if (seconds < 90) return `in ${seconds} s`;
+  if (seconds < 5400) return `in ${Math.round(seconds / 60)} min`;
+  if (seconds < 172800) return `in ${Math.round(seconds / 3600)} h`;
+  return `in ${Math.round(seconds / 86400)} days`;
+}
+
+async function refreshSchedules(): Promise<void> {
+  const rows = await invoke<ScheduleRow[]>("list_schedules");
+  schedList.replaceChildren();
+  if (rows.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "sched-empty";
+    empty.textContent = "No schedules yet.";
+    schedList.append(empty);
+    return;
+  }
+  for (const row of rows) {
+    const item = document.createElement("div");
+    item.className = `sched-item${row.enabled ? "" : " off"}`;
+    const text = document.createElement("div");
+    text.className = "sched-text";
+    const title = document.createElement("div");
+    title.className = "sched-title";
+    title.textContent = row.task;
+    const meta = document.createElement("div");
+    meta.className = "sched-meta";
+    const parts = [row.when, row.enabled ? `next run ${countdown(row.nextInSeconds)}` : "paused"];
+    if (row.onlyIfChanged) parts.push("only when the screen changed");
+    if (row.lastSummary) parts.push(`last: ${row.lastSummary}`);
+    meta.textContent = parts.join(" · ");
+    text.append(title, meta);
+    const toggle = document.createElement("button");
+    toggle.className = "button ghost";
+    toggle.type = "button";
+    toggle.textContent = row.enabled ? "Pause" : "Resume";
+    toggle.addEventListener("click", async () => {
+      await invoke("set_schedule_enabled", { id: row.id, enabled: !row.enabled }).catch((e) => log("error", toMessage(e)));
+      await refreshSchedules();
+    });
+    const remove = document.createElement("button");
+    remove.className = "button ghost";
+    remove.type = "button";
+    remove.textContent = "Delete";
+    remove.addEventListener("click", async () => {
+      await invoke("remove_schedule", { id: row.id }).catch((e) => log("error", toMessage(e)));
+      await refreshSchedules();
+    });
+    item.append(text, toggle, remove);
+    schedList.append(item);
+  }
+}
+
+void refreshSchedules();
+window.setInterval(() => void refreshSchedules(), 30_000);
