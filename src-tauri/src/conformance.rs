@@ -2140,6 +2140,183 @@ fn explorer_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
     ]
 }
 
+// ----------------------------------------------------------------------------- orders (brain to body)
+//
+// A scripted model gives orders the way real models write them (element numbers, raw pixels,
+// other models' coordinate dialects, several steps in a row) and the WHOLE agent loop runs them:
+// HTTP, parsing, verification, guards, input, settle, the completion check. The test page then
+// says whether the order arrived. This is the harness's main promise: an order that is clear in
+// intent is executed exactly.
+
+struct SilentHost;
+
+impl crate::agent::HostBackend for SilentHost {
+    fn emit_value(&self, _event: &str, _payload: serde_json::Value) {}
+    fn auto_answer(&self) -> Option<bool> {
+        Some(true)
+    }
+}
+
+/// Runs `task` through the real loop with a scripted model that answers `actions` one per step,
+/// then `done`. Returns the run's final message.
+fn run_scripted(task: &str, actions: Vec<serde_json::Value>) -> Result<String, String> {
+    use crate::mock_server::{replies, MockServer};
+    let mut script: Vec<(&str, String)> = actions.into_iter().map(|a| ("aura_proposal", replies::proposal(a, "scripted order"))).collect();
+    script.push(("aura_proposal", replies::proposal(serde_json::json!({"type": "done", "summary": "done"}), "finish")));
+    script.push(("aura_verification", replies::accept_verification()));
+    script.push(("aura_done_check", replies::done_check(true, "")));
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|e| e.to_string())?;
+    let steps = script.len() as u32 + 2;
+    runtime.block_on(async move {
+        let server = MockServer::start(script).await.map_err(|e| e.to_string())?;
+        let root = std::env::temp_dir().join(format!("aura-orders-{}", std::process::id()));
+        let state = crate::agent::AgentRuntime::with_data_root(root, false)?;
+        state.set_provider(crate::agent::ProviderConfigInput {
+            protocol: crate::agent::ApiProtocol::OpenAiCompatibleChat,
+            base_url: server.base_url.clone(),
+            model: "scripted-orders".into(),
+            api_key: String::new(),
+        })?;
+        let host = crate::agent::Host::new(SilentHost);
+        let response = crate::agent::execute_run(&state, &host, task.to_owned(), steps).await?;
+        if response.completed {
+            Ok(response.message)
+        } else {
+            Err(format!("the run did not complete: {}", response.message))
+        }
+    })
+}
+
+/// Screenshot position and element number of a labelled thing, seen exactly as the loop will see it.
+fn seen(task: &str, label: &str) -> Result<(u32, i32, i32), String> {
+    let observation = driver::observe(task)?;
+    let element = observation.find(label).ok_or_else(|| format!("'{label}' is not among the numbered elements"))?;
+    let (x, y) = element.center();
+    Ok((element.id, x, y))
+}
+
+const ORDERS_TASK: &str = "do what the test page asks";
+
+fn orders_click_by_element_number(_lab: &Lab) -> Result<(), String> {
+    open_page("/click", "Click")?;
+    let (id, _, _) = seen(ORDERS_TASK, "Beta")?;
+    run_scripted(ORDERS_TASK, vec![serde_json::json!({"type": "click", "element": id})])?;
+    expect_event("click:beta")?;
+    expect_no_event("click:alpha")
+}
+
+fn orders_click_by_pixels(_lab: &Lab) -> Result<(), String> {
+    open_page("/click", "Click")?;
+    let (_, x, y) = seen(ORDERS_TASK, "Beta")?;
+    run_scripted(ORDERS_TASK, vec![serde_json::json!({"type": "click", "x": x, "y": y})])?;
+    expect_event("click:beta")
+}
+
+fn orders_click_in_other_models_dialects(_lab: &Lab) -> Result<(), String> {
+    open_page("/click", "Click")?;
+    let (_, x, y) = seen(ORDERS_TASK, "Gamma")?;
+    run_scripted(ORDERS_TASK, vec![serde_json::json!({"action": "left_click", "coordinate": [x, y]})])?;
+    expect_event("click:gamma")?;
+    fx::clear();
+    let (_, x, y) = seen(ORDERS_TASK, "Alpha")?;
+    run_scripted(ORDERS_TASK, vec![serde_json::json!({"type": "Click", "bbox": [x - 6, y - 4, x + 6, y + 4]})])?;
+    expect_event("click:alpha")?;
+    fx::clear();
+    let (id, _, _) = seen(ORDERS_TASK, "Beta")?;
+    run_scripted(ORDERS_TASK, vec![serde_json::json!({"type": "click", "element": format!("#{id}")})])?;
+    expect_event("click:beta")
+}
+
+fn orders_double_and_right_click(_lab: &Lab) -> Result<(), String> {
+    open_page("/mouse", "Mouse")?;
+    let (double, _, _) = seen(ORDERS_TASK, "Double-click me")?;
+    let (right, _, _) = seen(ORDERS_TASK, "Right-click me")?;
+    run_scripted(ORDERS_TASK, vec![
+        serde_json::json!({"type": "double_click", "element": double}),
+        serde_json::json!({"type": "click", "element": right, "button": "right"}),
+    ])?;
+    expect_event("dblclick:left")?;
+    expect_event("rightclick:right")
+}
+
+fn orders_fill_and_submit_a_form_in_six_steps(_lab: &Lab) -> Result<(), String> {
+    open_page("/form", "Form")?;
+    // Pixels from one look: the page does not move while it is filled in.
+    let (_, nx, ny) = seen(ORDERS_TASK, "Name")?;
+    let (_, ax, ay) = seen(ORDERS_TASK, "I agree")?;
+    let (_, sx, sy) = seen(ORDERS_TASK, "Submit form")?;
+    run_scripted(ORDERS_TASK, vec![
+        serde_json::json!({"type": "click", "x": nx, "y": ny}),
+        serde_json::json!({"type": "type_text", "text": "Jane"}),
+        serde_json::json!({"type": "hotkey", "keys": "ctrl+a"}),
+        serde_json::json!({"type": "type_text", "content": "Jane Doe"}),
+        serde_json::json!({"type": "key_press", "key": "tab"}),
+        serde_json::json!({"type": "key_press", "key": "b"}),
+        serde_json::json!({"type": "click", "x": ax, "y": ay}),
+        serde_json::json!({"type": "click", "coordinate": [sx, sy]}),
+    ])?;
+    expect_event("form:name=Jane Doe;color=blue;agree=true")
+}
+
+fn orders_drag_between_elements(_lab: &Lab) -> Result<(), String> {
+    open_page("/drag", "Drag")?;
+    let (from, _, _) = seen(ORDERS_TASK, "Drag me")?;
+    let (to, _, _) = seen(ORDERS_TASK, "Drop here")?;
+    run_scripted(ORDERS_TASK, vec![serde_json::json!({"type": "drag_and_drop", "from_element": from, "to_element": to})])?;
+    expect_event("drop:ok")
+}
+
+fn orders_scroll_then_click_what_appeared(_lab: &Lab) -> Result<(), String> {
+    open_page("/scroll", "Scroll")?;
+    run_scripted(ORDERS_TASK, vec![serde_json::json!({"type": "scroll", "clicks": -60})])?;
+    std::thread::sleep(Duration::from_millis(600));
+    let (id, _, _) = seen(ORDERS_TASK, "Finish")?;
+    run_scripted(ORDERS_TASK, vec![serde_json::json!({"type": "click", "element": id})])?;
+    expect_event("click:finish")
+}
+
+fn orders_a_miscounted_element_is_corrected_by_its_name(_lab: &Lab) -> Result<(), String> {
+    open_page("/click", "Click")?;
+    let (alpha, _, _) = seen(ORDERS_TASK, "Alpha")?;
+    // The model says "Beta" but gives Alpha's number (small models miscount).
+    let script_action = serde_json::json!({"type": "click", "element": alpha});
+    use crate::mock_server::{replies, MockServer};
+    let proposal = serde_json::json!({
+        "previousOutcome": "not_applicable", "reflection": "r", "thought": "click Beta",
+        "target": {"description": "the Beta button", "visibleText": "Beta"},
+        "expectedOutcome": "Beta is clicked", "action": script_action, "impact": "routine"
+    })
+    .to_string();
+    let script = vec![
+        ("aura_proposal", proposal),
+        ("aura_proposal", replies::proposal(serde_json::json!({"type": "done", "summary": "done"}), "finish")),
+        ("aura_verification", replies::accept_verification()),
+        ("aura_done_check", replies::done_check(true, "")),
+    ];
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|e| e.to_string())?;
+    runtime.block_on(async move {
+        let server = MockServer::start(script).await.map_err(|e| e.to_string())?;
+        let state = crate::agent::AgentRuntime::with_data_root(std::env::temp_dir().join("aura-orders-mis"), false)?;
+        state.set_provider(crate::agent::ProviderConfigInput { protocol: crate::agent::ApiProtocol::OpenAiCompatibleChat, base_url: server.base_url.clone(), model: "scripted-orders".into(), api_key: String::new() })?;
+        crate::agent::execute_run(&state, &crate::agent::Host::new(SilentHost), ORDERS_TASK.to_owned(), 4).await.map(|_| ())
+    })?;
+    expect_event("click:beta")?;
+    expect_no_event("click:alpha")
+}
+
+fn orders_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
+    vec![
+        ("orders", "click by element number", orders_click_by_element_number),
+        ("orders", "click by pixels", orders_click_by_pixels),
+        ("orders", "click in other models' dialects", orders_click_in_other_models_dialects),
+        ("orders", "double-click and right-click", orders_double_and_right_click),
+        ("orders", "fill and submit a form in eight steps", orders_fill_and_submit_a_form_in_six_steps),
+        ("orders", "drag between elements", orders_drag_between_elements),
+        ("orders", "scroll, then click what appeared", orders_scroll_then_click_what_appeared),
+        ("orders", "a miscounted element is corrected by its name", orders_a_miscounted_element_is_corrected_by_its_name),
+    ]
+}
+
 // ----------------------------------------------------------------------------- system (T3)
 
 /// Whether the window is on the virtual desktop the user is looking at.
@@ -2635,7 +2812,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
         None => true,
     };
     let lab_cases: Vec<_> = cases().into_iter().filter(|(g, n, _)| selected(g, n)).collect();
-    let driver_selected: Vec<_> = driver_cases().into_iter().chain(draw_cases()).chain(load_cases()).chain(windows_cases()).chain(safety_cases()).chain(system_cases()).chain(obstruct_cases()).chain(explorer_cases()).filter(|(g, n, _)| selected(g, n)).collect();
+    let driver_selected: Vec<_> = driver_cases().into_iter().chain(draw_cases()).chain(load_cases()).chain(windows_cases()).chain(safety_cases()).chain(system_cases()).chain(obstruct_cases()).chain(explorer_cases()).chain(orders_cases()).filter(|(g, n, _)| selected(g, n)).collect();
     let app_cases: Vec<_> = driver_selected.into_iter().chain(body_cases().into_iter().filter(|(g, n, _)| selected(g, n))).chain(native_cases().into_iter().filter(|(g, n, _)| selected(g, n))).collect();
     if lab_cases.is_empty() && app_cases.is_empty() {
         return Err("no case matches that filter".into());
@@ -2659,7 +2836,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
     let mut results = Vec::new();
     let mut lab_open = !lab_cases.is_empty();
     for (group, name, case) in lab_cases.into_iter().chain(app_cases) {
-        if group != "native" && group != "driver" && group != "body" && group != "draw" && group != "load" && group != "windows" && group != "safety" && group != "system" && group != "obstruct" && group != "explorer" {
+        if group != "native" && group != "driver" && group != "body" && group != "draw" && group != "load" && group != "windows" && group != "safety" && group != "system" && group != "obstruct" && group != "explorer" && group != "orders" {
             // lab case: nothing to close
         } else if lab_open {
             // Close the lab tab before the real-application cases.
@@ -2673,8 +2850,8 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
             trail.clear();
         }
         let started = Instant::now();
-        let outcome = if group == "native" || group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" || group == "obstruct" || group == "explorer" { case(&lab) } else { lab.reset().and_then(|_| case(&lab)) };
-        if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" || group == "obstruct" || group == "explorer" {
+        let outcome = if group == "native" || group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" || group == "obstruct" || group == "explorer" || group == "orders" { case(&lab) } else { lab.reset().and_then(|_| case(&lab)) };
+        if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" || group == "obstruct" || group == "explorer" || group == "orders" {
             let _ = press("escape");
             close_fixture_tab();
         }
@@ -2686,7 +2863,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
             millis: started.elapsed().as_millis(),
             detail: outcome
                 .err()
-                .map(|e| if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" || group == "obstruct" || group == "explorer" { format!("{e} [orders: {}]", trail_text()) } else { e })
+                .map(|e| if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" || group == "obstruct" || group == "explorer" || group == "orders" { format!("{e} [orders: {}]", trail_text()) } else { e })
                 .unwrap_or_default(),
         };
         progress(&result);

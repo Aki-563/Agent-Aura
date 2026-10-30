@@ -337,6 +337,14 @@ pub fn quick_open_target(task: &str) -> Option<String> {
     Some(rest.join(" "))
 }
 
+/// "open notepad and type hello" -> "notepad": the first clause of a compound task that starts by
+/// opening an app. That first step needs no model call; the model takes over from step 2.
+pub fn quick_open_first(task: &str) -> Option<String> {
+    let lower = task.to_lowercase();
+    let cut = [" and then ", " and ", " then ", ", "].iter().filter_map(|sep| lower.find(sep)).min()?;
+    quick_open_target(&task[..cut])
+}
+
 pub fn normalize_intent(task: &str) -> String {
     task.to_lowercase()
         .split(|ch: char| !ch.is_alphanumeric())
@@ -640,6 +648,15 @@ mod tests {
             target_window: None,
         };
         assert_eq!(effective_impact(&proposal), ImpactClass::Destructive);
+    }
+
+    #[test]
+    fn a_compound_task_starting_with_open_gets_the_app() {
+        assert_eq!(quick_open_first("open notepad and type the sentence hello from aura").as_deref(), Some("notepad"));
+        assert_eq!(quick_open_first("Open Calculator, then work out 12 plus 30").as_deref(), Some("Calculator"));
+        assert_eq!(quick_open_first("open the file report.docx and print it"), None);
+        assert_eq!(quick_open_first("type hello and press enter"), None);
+        assert_eq!(quick_open_first("open notepad"), None, "a plain open is quick_open_target's job");
     }
 
     #[test]

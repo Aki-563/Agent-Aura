@@ -261,6 +261,34 @@ pub fn refine_action_to_target(elements: &[Element], target_text: &str, action: 
     (action, fit)
 }
 
+fn normalized(text: &str) -> String {
+    let lower = text.to_lowercase();
+    let lower = lower.strip_prefix("taskbar ").unwrap_or(&lower).to_owned();
+    lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ")
+}
+
+/// Whether an element's label is plausibly the thing named `wanted` (one contains the other).
+pub fn label_agrees(label: &str, wanted: &str) -> bool {
+    let (label, wanted) = (normalized(label), normalized(wanted));
+    !label.is_empty() && !wanted.is_empty() && (label.contains(&wanted) || wanted.contains(&label))
+}
+
+/// The one element whose label is exactly `wanted` (ignoring case, punctuation and a "taskbar"
+/// prefix). None when there is no such element or more than one.
+pub fn exactly_named<'a>(elements: &'a [Element], wanted: &str) -> Option<&'a Element> {
+    let wanted = normalized(wanted);
+    let matches: Vec<&Element> = elements.iter().filter(|e| normalized(&e.label) == wanted).collect();
+    let first = *matches.first()?;
+    // A button and the text read inside it are the same target: when every match overlaps the
+    // others, take the largest (the control). Separate places with the same name stay ambiguous.
+    let overlaps = |a: &Element, b: &Element| a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+    if matches.iter().all(|m| overlaps(m, first)) {
+        let area = |e: &Element| ((e.right - e.left) as i64) * ((e.bottom - e.top) as i64);
+        return matches.into_iter().max_by_key(|e| area(e));
+    }
+    None
+}
+
 /// Applies `refine_point` to every raw point in a pointer action.
 pub fn refine_action(model: &str, elements: &[Element], size: (u32, u32), action: ActionPrimitive) -> ActionPrimitive {
     let mut action = action;
@@ -286,6 +314,22 @@ mod tests {
 
     fn element(id: u32, left: i32, top: i32, right: i32, bottom: i32) -> Element {
         Element { id, label: format!("e{id}"), kind: "Button".into(), left, top, right, bottom }
+    }
+
+    #[test]
+    fn a_miscounted_element_number_is_caught_by_its_name() {
+        let elements = [element(1, 0, 0, 10, 10), element(2, 20, 0, 30, 10)];
+        let mut named = elements.to_vec();
+        named[0].label = "Antigravity - Settings".into();
+        named[1].label = "taskbar Search".into();
+        assert!(!label_agrees(&named[0].label, "Search"));
+        assert!(label_agrees(&named[1].label, "Search"));
+        assert_eq!(exactly_named(&named, "Search").map(|e| e.id), Some(2));
+        assert!(label_agrees("Save As...", "save as"));
+        named.push(Element { id: 3, label: "Search".into(), kind: "Text".into(), left: 22, top: 2, right: 28, bottom: 8 });
+        assert_eq!(exactly_named(&named, "Search").map(|e| e.id), Some(2), "a label inside its button is the same target");
+        named.push(Element { id: 4, label: "Search".into(), kind: "Edit".into(), left: 500, top: 500, right: 540, bottom: 520 });
+        assert_eq!(exactly_named(&named, "Search"), None, "two separate things called Search: no guessing");
     }
 
     #[test]

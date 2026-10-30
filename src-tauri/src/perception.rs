@@ -138,9 +138,13 @@ pub fn collect_candidates(
     let hwnd = window.hwnd;
     std::thread::scope(|scope| {
         let uia = scope.spawn(move || collect_uia_candidates(process_id, hwnd, origin_x, origin_y, width, height));
+        // The taskbar (Start, Search, the running and pinned apps) is always worth offering: a model
+        // that wants to start or switch to an app looks there first.
+        let taskbar = scope.spawn(move || taskbar_candidates(hwnd, origin_x, origin_y, width, height));
         let mut text_lines = collect_ocr_candidates(rgba, width, height, origin_x, origin_y);
         text_lines.retain(|line| keep_text_on_active_program(line, window));
         let mut combined = uia.join().unwrap_or_default();
+        combined.append(&mut taskbar.join().unwrap_or_default());
         combined.append(&mut text_lines);
         combined
     })
@@ -313,6 +317,25 @@ fn keep_text_on_active_program(line: &GroundingCandidate, window: &WindowContext
         Some((root, pid)) => root as isize == window.hwnd || pid == window.process_id || crate::desktop::target::is_shell_window(root),
         None => true,
     }
+}
+
+/// Buttons of the Windows taskbar, labelled "taskbar ..." so the model can tell them from the
+/// app's own controls. Skipped when the taskbar is what is being looked at already.
+fn taskbar_candidates(active: isize, origin_x: i32, origin_y: i32, width: u32, height: u32) -> Vec<GroundingCandidate> {
+    let class: Vec<u16> = "Shell_TrayWnd".encode_utf16().chain(std::iter::once(0)).collect();
+    let tray = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(class.as_ptr(), std::ptr::null()) };
+    if tray.is_null() || tray as isize == active {
+        return Vec::new();
+    }
+    let mut pid = 0u32;
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(tray, &mut pid) };
+    let mut found = collect_uia_candidates(pid, tray as isize, origin_x, origin_y, width, height);
+    found.retain(|c| matches!(c.control_type.as_deref().map(str::to_lowercase).as_deref(), Some("button") | Some("splitbutton") | Some("menuitem") | Some("listitem") | Some("edit")));
+    for candidate in &mut found {
+        candidate.label = format!("taskbar {}", candidate.label.trim());
+    }
+    found.truncate(24);
+    found
 }
 
 fn collect_uia_candidates(

@@ -1251,7 +1251,7 @@ async fn autonomous_loop(
         // Any stop, pause or steer after this point makes the model's answer stale (control.rs).
         let request_epoch = crate::control::epoch();
         // Fast path: a plain "open <app>" task starts the app directly, with no model call.
-        let fast_open = quick_open_target(task).filter(|_| step_number == 1 && session.history.is_empty());
+        let fast_open = quick_open_target(task).or_else(|| crate::reliability::quick_open_first(task)).filter(|_| step_number == 1 && session.history.is_empty());
         let PlannedAction { proposal, verification, physical: final_action, canvas: canvas_action, .. } = if let Some(app) = fast_open {
             trace.event(step_number, "fast_path", json!({"openApp": &app}));
             let action = ActionPrimitive::OpenApp { name: app.clone() };
@@ -2358,7 +2358,12 @@ async fn propose_and_verify(
     let element_count = capture.elements.len();
     // Element number -> centre of its box, in screenshot pixels. Unknown numbers produce an
     // error that goes back to the model on the retry.
+    // Element numbers the model used, in order (checked against what it said it was aiming at).
+    let requested_elements: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
     let resolve_element = |id: u32| -> Result<(i32, i32), String> {
+        if let Ok(mut ids) = requested_elements.lock() {
+            ids.push(id);
+        }
         if element_count == 0 {
             return Err(format!("Element {id} is not available; no elements were detected, use x and y."));
         }
@@ -2452,6 +2457,28 @@ USER:
     let mut grounding_calls = 0u32;
     let mut grounding_note = String::new();
     let mut force_verify = false;
+    // The model picked an element by number but named a different thing ("element 48" while the
+    // target says "Search"): small models often miscount. If exactly one element carries that name,
+    // aim there; if none does, let the verifier look before anything is clicked.
+    let proposal_elements = std::mem::take(&mut *requested_elements.lock().unwrap_or_else(|e| e.into_inner()));
+    if let (Some(&id), Some(wanted)) = (proposal_elements.first(), proposal.target.visible_text.clone().filter(|t| !t.trim().is_empty())) {
+        if let Some(chosen) = capture.elements.iter().find(|e| e.id == id) {
+            if !crate::coords::label_agrees(&chosen.label, &wanted) {
+                let note = match crate::coords::exactly_named(&capture.elements, &wanted) {
+                    Some(better) => {
+                        set_first_point(&mut proposal.action, better.center());
+                        format!("element {id} is '{}', not '{wanted}'; aimed at element {} '{}' instead", chosen.label, better.id, better.label)
+                    }
+                    None => {
+                        force_verify = true;
+                        format!("element {id} is '{}', not '{wanted}', and no element is named '{wanted}'; the verifier checks the target", chosen.label)
+                    }
+                };
+                trace.json("element_check.json", &json!({"note": &note}));
+                crate::testlog::record("grounding", "element_check", json!({"note": &note}));
+            }
+        }
+    }
     let target_text = proposal.target.visible_text.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| proposal.target.description.clone());
     let raw_point = first_raw_point(&proposal.action).filter(|p| !capture.elements.iter().any(|e| e.center() == *p));
     if let (Some(point), false) = (raw_point, target_text.trim().is_empty()) {

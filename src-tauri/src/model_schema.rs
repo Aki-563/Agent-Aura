@@ -389,6 +389,155 @@ pub fn extract_json_object(raw: &str) -> Option<&str> {
     None
 }
 
+/// Numbers out of whatever a model wrote for a point: `[x, y]`, `"(x, y)"`, `"x,y"`,
+/// `"<point>x y</point>"`, `{"x":..,"y":..}`. Four numbers are a box `[x1, y1, x2, y2]`.
+fn numbers_in(value: &Value) -> Vec<f64> {
+    match value {
+        Value::Array(items) => items.iter().flat_map(numbers_in).collect(),
+        Value::Number(n) => n.as_f64().into_iter().collect(),
+        Value::Object(map) => ["x", "y"].iter().filter_map(|k| map.get(*k)).flat_map(numbers_in).collect(),
+        Value::String(text) => text
+            .split(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+            .filter(|t| !t.is_empty() && *t != "-" && *t != ".")
+            .filter_map(|t| t.parse::<f64>().ok())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A point from 2 numbers, or the centre of a box from 4.
+fn point_of(value: &Value) -> Option<(f64, f64)> {
+    match numbers_in(value).as_slice() {
+        [x, y] => Some((*x, *y)),
+        [x1, y1, x2, y2] => Some(((x1 + x2) / 2.0, (y1 + y2) / 2.0)),
+        _ => None,
+    }
+}
+
+/// Rewrites the action-object dialects that vision models commonly use into this schema's
+/// fields, so an order that is clear in intent is executed instead of rejected:
+/// `{"action": "click"}` for `type`, `coordinate`/`point`/`position`/`start_box`/`bbox` for x/y,
+/// `start_*`/`end_*`/`from`/`to` for drags, `"keys": "ctrl+a"` for a key list, `content`/`value`
+/// for typed text, `"element": "#7"` or `"[7]"` for a number. Fields already in the schema win.
+pub fn normalize_action_dialect(value: &mut Value) {
+    let Value::Object(map) = value else { return };
+    if !map.contains_key("type") {
+        for alias in ["action", "action_type", "actionType", "kind", "op"] {
+            if let Some(Value::String(name)) = map.get(alias).cloned() {
+                map.insert("type".into(), Value::String(name));
+                break;
+            }
+        }
+    }
+    if let Some(Value::String(kind)) = map.get("type").cloned() {
+        let lowered = kind.trim().to_lowercase().replace([' ', '-'], "_");
+        map.insert("type".into(), Value::String(lowered));
+    }
+    if !(map.contains_key("x") && map.contains_key("y")) {
+        for alias in ["coordinate", "coordinates", "point", "position", "pos", "coords", "start_box", "click_point", "location", "xy", "bbox", "box", "bounding_box", "target_point"] {
+            if let Some((x, y)) = map.get(alias).and_then(point_of) {
+                map.insert("x".into(), Value::from(x));
+                map.insert("y".into(), Value::from(y));
+                break;
+            }
+        }
+    }
+    if !(map.contains_key("from_x") && map.contains_key("to_x")) {
+        let from = ["start_coordinate", "start", "from", "start_point", "start_box", "source"].iter().find_map(|k| map.get(*k).and_then(point_of));
+        let to = ["end_coordinate", "end", "to", "end_point", "end_box", "target", "destination"].iter().find_map(|k| map.get(*k).and_then(point_of));
+        if let (Some(from), Some(to)) = (from, to) {
+            map.insert("from_x".into(), Value::from(from.0));
+            map.insert("from_y".into(), Value::from(from.1));
+            map.insert("to_x".into(), Value::from(to.0));
+            map.insert("to_y".into(), Value::from(to.1));
+        }
+    }
+    // "keys": "ctrl+a" or "ctrl a"; "key": "ctrl+s" on a hotkey.
+    if let Some(Value::String(text)) = map.get("keys").cloned() {
+        let keys: Vec<Value> = text.split(['+', ' ', ',']).map(str::trim).filter(|k| !k.is_empty()).map(|k| Value::String(k.to_owned())).collect();
+        map.insert("keys".into(), Value::Array(keys));
+    }
+    let kind = map.get("type").and_then(Value::as_str).unwrap_or_default().to_owned();
+    if !map.contains_key("keys") {
+        if let Some(Value::String(text)) = map.get("key").cloned() {
+            if text.contains('+') && text.trim().len() > 1 {
+                let keys: Vec<Value> = text.split('+').map(str::trim).filter(|k| !k.is_empty()).map(|k| Value::String(k.to_owned())).collect();
+                map.insert("keys".into(), Value::Array(keys));
+                if kind == "key_press" || kind == "key" || kind == "press" {
+                    map.insert("type".into(), Value::String("hotkey".into()));
+                }
+            }
+        }
+    }
+    if !map.contains_key("text") {
+        for alias in ["content", "value", "input", "string", "text_to_type"] {
+            if let Some(Value::String(text)) = map.get(alias).cloned() {
+                map.insert("text".into(), Value::String(text));
+                break;
+            }
+        }
+    }
+    for key in ["element", "from_element", "to_element"] {
+        if let Some(Value::String(text)) = map.get(key).cloned() {
+            let digits: String = text.chars().filter(char::is_ascii_digit).collect();
+            if let Ok(number) = digits.parse::<u32>() {
+                map.insert(key.into(), Value::from(number));
+            }
+        }
+    }
+    // Remove dialect-only keys so strict deserialisation does not trip over them.
+    for alias in [
+        "action", "action_type", "actionType", "op", "kind", "coordinate", "coordinates", "point", "position", "pos", "coords", "start_box", "click_point", "location", "xy",
+        "bbox", "box", "bounding_box", "target_point", "start_coordinate", "end_coordinate", "start", "end", "from", "to", "start_point", "end_point", "end_box",
+        "source", "destination", "content", "value", "input", "string", "text_to_type",
+    ] {
+        map.remove(alias);
+    }
+}
+
+/// The proposal-level dialects: a list of actions (`"actions": [...]`, the first is taken), or the
+/// action fields written at the top level instead of inside `"action"`.
+fn normalize_proposal_dialect(value: &mut Value) {
+    let Value::Object(map) = value else { return };
+    if !map.contains_key("action") {
+        if let Some(Value::Array(list)) = map.get("actions").cloned() {
+            if let Some(first) = list.into_iter().next() {
+                map.insert("action".into(), first);
+            }
+        } else if map.contains_key("type") || map.contains_key("action_type") {
+            let mut action = serde_json::Map::new();
+            for key in map.keys().cloned().collect::<Vec<_>>() {
+                if !["previousOutcome", "reflection", "thought", "target", "expectedOutcome", "confidence", "impact", "voice_command", "voiceCommand", "stepId"].contains(&key.as_str()) {
+                    if let Some(v) = map.remove(&key) {
+                        action.insert(key, v);
+                    }
+                }
+            }
+            map.insert("action".into(), Value::Object(action));
+        }
+    } else if let Some(Value::String(name)) = map.get("action").cloned() {
+        // {"action": "click", "coordinate": [..]} at the top level.
+        let mut action = serde_json::Map::new();
+        action.insert("type".into(), Value::String(name));
+        for key in map.keys().cloned().collect::<Vec<_>>() {
+            if !["previousOutcome", "reflection", "thought", "target", "expectedOutcome", "confidence", "impact", "voice_command", "voiceCommand", "stepId", "action"].contains(&key.as_str()) {
+                if let Some(v) = map.remove(&key) {
+                    action.insert(key, v);
+                }
+            }
+        }
+        map.insert("action".into(), Value::Object(action));
+    }
+    map.remove("actions");
+    if let Some(action) = map.get_mut("action") {
+        normalize_action_dialect(action);
+    }
+    // `target` given as plain text.
+    if let Some(Value::String(text)) = map.get("target").cloned() {
+        map.insert("target".into(), serde_json::json!({"description": text, "visibleText": text}));
+    }
+}
+
 /// Parses model text into `T`, tolerating surrounding prose and markdown fences.
 pub fn parse_lenient<T: for<'de> Deserialize<'de>>(raw: &str, label: &str) -> Result<T, String> {
     let json_text = extract_json_object(raw).ok_or_else(|| {
@@ -399,6 +548,12 @@ pub fn parse_lenient<T: for<'de> Deserialize<'de>>(raw: &str, label: &str) -> Re
         }
     })?;
     let mut value: Value = serde_json::from_str(json_text).map_err(|error| format!("Your {label} JSON had the wrong shape: {error}"))?;
+    if label == "action proposal" {
+        normalize_proposal_dialect(&mut value);
+    }
+    if let Some(action) = value.get_mut("final_action").or_else(|| None) {
+        normalize_action_dialect(action);
+    }
     coerce_scalars(&mut value);
     serde_json::from_value(value).map_err(|error| format!("Your {label} JSON had the wrong shape: {error}"))
 }
@@ -1273,6 +1428,41 @@ mod tests {
         assert!(!sloppy.complete, "a reply without an explicit yes must not count as complete");
         assert!(parse_done_check("no json").is_err());
         assert_eq!(done_check_schema(0)["required"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn the_coordinate_dialects_of_common_vision_models_are_understood() {
+        let take = |action: &str| {
+            let raw = format!(r#"{{"previousOutcome":"not_applicable","reflection":"r","thought":"t","target":{{"description":"Save"}},"expectedOutcome":"e","impact":"routine","action":{action}}}"#);
+            parse_proposal(&raw).map(|p| p.action)
+        };
+        let at = |a: Result<ActionPrimitive, String>| match a {
+            Ok(ActionPrimitive::Click { x, y, .. }) => (x, y),
+            other => panic!("not a click: {other:?}"),
+        };
+        assert_eq!(at(take(r#"{"type":"click","coordinate":[120,80]}"#)), (120, 80));
+        assert_eq!(at(take(r#"{"action":"click","point":"(120, 80)"}"#)), (120, 80));
+        assert_eq!(at(take(r#"{"type":"left_click","start_box":"<|box_start|>(120,80)<|box_end|>"}"#)), (120, 80));
+        assert_eq!(at(take(r#"{"type":"Click","bbox":[100,60,140,100]}"#)), (120, 80));
+        assert_eq!(at(take(r#"{"action_type":"click","position":{"x":"120","y":"80"}}"#)), (120, 80));
+        assert!(matches!(take(r#"{"type":"hotkey","keys":"ctrl+s"}"#), Ok(ActionPrimitive::Hotkey { keys }) if keys == ["ctrl", "s"]));
+        assert!(matches!(take(r#"{"type":"key_press","key":"ctrl+shift+n"}"#), Ok(ActionPrimitive::Hotkey { keys }) if keys.len() == 3));
+        assert!(matches!(take(r#"{"type":"type_text","content":"hello"}"#), Ok(ActionPrimitive::TypeText { text, .. }) if text == "hello"));
+        match take(r#"{"type":"drag_and_drop","start_coordinate":[10,20],"end_coordinate":[300,400]}"#) {
+            Ok(ActionPrimitive::DragAndDrop { from_x, from_y, to_x, to_y, .. }) => assert_eq!((from_x, from_y, to_x, to_y), (10, 20, 300, 400)),
+            other => panic!("{other:?}"),
+        }
+        // Whole-proposal dialects: a list of actions, and the action written at the top level.
+        let list = r#"{"thought":"t","target":"Save button","actions":[{"type":"click","x":5,"y":6},{"type":"click","x":7,"y":8}]}"#;
+        let p = parse_proposal(list).unwrap();
+        assert!(matches!(p.action, ActionPrimitive::Click { x: 5, y: 6, .. }));
+        assert_eq!(p.target.visible_text.as_deref(), Some("Save button"));
+        let flat = r#"{"thought":"t","action":"click","coordinate":[9,10]}"#;
+        assert!(matches!(parse_proposal(flat).unwrap().action, ActionPrimitive::Click { x: 9, y: 10, .. }));
+        let top = r#"{"thought":"t","type":"type_text","text":"hi"}"#;
+        assert!(matches!(parse_proposal(top).unwrap().action, ActionPrimitive::TypeText { .. }));
+        // The schema's own fields win over a dialect field.
+        assert_eq!(at(take(r#"{"type":"click","x":1,"y":2,"coordinate":[120,80]}"#)), (1, 2));
     }
 
     #[test]
