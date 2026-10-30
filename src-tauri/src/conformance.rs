@@ -1962,6 +1962,140 @@ fn obstruct_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
     ]
 }
 
+// ----------------------------------------------------------------------------- explorer (sandboxed)
+
+const SANDBOX_NAME: &str = "aura-explorer-sandbox";
+
+/// A throwaway folder under %TEMP% with a few small files. Everything the explorer cases do
+/// happens inside it; the window title must be the folder's name before any key is pressed.
+struct Sandbox {
+    dir: std::path::PathBuf,
+}
+
+impl Sandbox {
+    fn create() -> Result<Sandbox, String> {
+        let dir = std::env::temp_dir().join(SANDBOX_NAME);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        for name in ["aura-a.txt", "aura-b.txt", "aura-delete-me.txt"] {
+            std::fs::write(dir.join(name), format!("sandbox file {name}")).map_err(|e| e.to_string())?;
+        }
+        std::process::Command::new("explorer.exe").arg(&dir).spawn().map_err(|e| format!("could not open Explorer: {e}"))?;
+        if !wait_until(15_000, || desktop_target::find_window_by_name(SANDBOX_NAME).is_some()) {
+            return Err("the sandbox Explorer window never opened".into());
+        }
+        let window = desktop_target::find_window_by_name(SANDBOX_NAME).ok_or("no sandbox window")?;
+        desktop_target::bring_to_front(window);
+        std::thread::sleep(Duration::from_millis(1200));
+        Ok(Sandbox { dir })
+    }
+
+    /// Refuses to continue unless the sandbox window is the one in front.
+    fn guard(&self) -> Result<(), String> {
+        if desktop_target::foreground_title().contains(SANDBOX_NAME) {
+            return Ok(());
+        }
+        if let Some(window) = desktop_target::find_window_by_name(SANDBOX_NAME) {
+            desktop_target::bring_to_front(window);
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        if desktop_target::foreground_title().contains(SANDBOX_NAME) {
+            Ok(())
+        } else {
+            Err(format!("the sandbox window is not in front (front: '{}'); no key was pressed", desktop_target::foreground_title()))
+        }
+    }
+
+    fn exists(&self, name: &str) -> bool {
+        self.dir.join(name).exists()
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        // Close only the window whose title is the sandbox folder, then delete only that folder.
+        for _ in 0..8 {
+            let Some(window) = desktop_target::find_window_by_name(SANDBOX_NAME) else { break };
+            if !desktop_target::title_of(window).starts_with(SANDBOX_NAME) {
+                break;
+            }
+            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(window, windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE, 0, 0) };
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        std::thread::sleep(Duration::from_millis(800));
+        if self.dir.file_name().and_then(|n| n.to_str()) == Some(SANDBOX_NAME) && self.dir.starts_with(std::env::temp_dir()) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+fn explorer_rename_a_file(_lab: &Lab) -> Result<(), String> {
+    let sandbox = Sandbox::create()?;
+    sandbox.guard()?;
+    go(Order::Click("aura-a"))?;
+    press("f2")?;
+    std::thread::sleep(Duration::from_millis(500));
+    // F2 selects the name without its extension, so typing replaces just the name.
+    type_text("aura-renamed")?;
+    press("enter")?;
+    if !wait_until(4000, || sandbox.exists("aura-renamed.txt") && !sandbox.exists("aura-a.txt")) {
+        return Err("the file was not renamed on disk".into());
+    }
+    Ok(())
+}
+
+fn explorer_new_folder(_lab: &Lab) -> Result<(), String> {
+    let sandbox = Sandbox::create()?;
+    sandbox.guard()?;
+    hotkey(&["ctrl", "shift", "n"])?;
+    std::thread::sleep(Duration::from_millis(900));
+    type_text("aura-new-folder")?;
+    press("enter")?;
+    if !wait_until(4000, || sandbox.exists("aura-new-folder")) {
+        return Err("the new folder was not created".into());
+    }
+    Ok(())
+}
+
+fn explorer_copy_and_paste(_lab: &Lab) -> Result<(), String> {
+    let sandbox = Sandbox::create()?;
+    sandbox.guard()?;
+    go(Order::Click("aura-b"))?;
+    hotkey(&["ctrl", "c"])?;
+    std::thread::sleep(Duration::from_millis(300));
+    hotkey(&["ctrl", "v"])?;
+    let pasted = || std::fs::read_dir(&sandbox.dir).map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("aura-b")).count() >= 2).unwrap_or(false);
+    if !wait_until(5000, pasted) {
+        return Err("the pasted copy did not appear in the folder".into());
+    }
+    Ok(())
+}
+
+fn explorer_delete_one_selected_file(_lab: &Lab) -> Result<(), String> {
+    let sandbox = Sandbox::create()?;
+    sandbox.guard()?;
+    // Exactly one file is selected by a click, and the title is checked again before Delete.
+    go(Order::Click("aura-delete-me"))?;
+    sandbox.guard()?;
+    press("delete")?;
+    if !wait_until(5000, || !sandbox.exists("aura-delete-me.txt")) {
+        return Err("the selected file was not deleted".into());
+    }
+    if !sandbox.exists("aura-b.txt") {
+        return Err("a file that was not selected disappeared".into());
+    }
+    Ok(())
+}
+
+fn explorer_cases() -> Vec<(&'static str, &'static str, CaseFn)> {
+    vec![
+        ("explorer", "rename a file with F2", explorer_rename_a_file),
+        ("explorer", "new folder with ctrl+shift+n", explorer_new_folder),
+        ("explorer", "copy and paste a file", explorer_copy_and_paste),
+        ("explorer", "delete one selected file", explorer_delete_one_selected_file),
+    ]
+}
+
 // ----------------------------------------------------------------------------- system (T3)
 
 /// Whether the window is on the virtual desktop the user is looking at.
@@ -2446,6 +2580,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
         // The system group changes things outside the test page (virtual desktops, CPU load), so it
         // runs only when asked for by name.
         _ if group == "system" && !matches!(filter, Some(w) if w.to_lowercase().contains("system")) => false,
+        _ if group == "explorer" && !matches!(filter, Some(w) if w.to_lowercase().contains("explorer")) => false,
         Some(wanted) if wanted.starts_with("group:") => wanted["group:".len()..].split(',').any(|g| g.trim().eq_ignore_ascii_case(group)),
         Some(wanted) => {
             let wanted = wanted.to_lowercase();
@@ -2454,7 +2589,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
         None => true,
     };
     let lab_cases: Vec<_> = cases().into_iter().filter(|(g, n, _)| selected(g, n)).collect();
-    let driver_selected: Vec<_> = driver_cases().into_iter().chain(draw_cases()).chain(load_cases()).chain(windows_cases()).chain(safety_cases()).chain(system_cases()).chain(obstruct_cases()).filter(|(g, n, _)| selected(g, n)).collect();
+    let driver_selected: Vec<_> = driver_cases().into_iter().chain(draw_cases()).chain(load_cases()).chain(windows_cases()).chain(safety_cases()).chain(system_cases()).chain(obstruct_cases()).chain(explorer_cases()).filter(|(g, n, _)| selected(g, n)).collect();
     let app_cases: Vec<_> = driver_selected.into_iter().chain(body_cases().into_iter().filter(|(g, n, _)| selected(g, n))).chain(native_cases().into_iter().filter(|(g, n, _)| selected(g, n))).collect();
     if lab_cases.is_empty() && app_cases.is_empty() {
         return Err("no case matches that filter".into());
@@ -2478,7 +2613,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
     let mut results = Vec::new();
     let mut lab_open = !lab_cases.is_empty();
     for (group, name, case) in lab_cases.into_iter().chain(app_cases) {
-        if group != "native" && group != "driver" && group != "body" && group != "draw" && group != "load" && group != "windows" && group != "safety" && group != "system" && group != "obstruct" {
+        if group != "native" && group != "driver" && group != "body" && group != "draw" && group != "load" && group != "windows" && group != "safety" && group != "system" && group != "obstruct" && group != "explorer" {
             // lab case: nothing to close
         } else if lab_open {
             // Close the lab tab before the real-application cases.
@@ -2492,8 +2627,8 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
             trail.clear();
         }
         let started = Instant::now();
-        let outcome = if group == "native" || group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" || group == "obstruct" { case(&lab) } else { lab.reset().and_then(|_| case(&lab)) };
-        if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" || group == "obstruct" {
+        let outcome = if group == "native" || group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" || group == "obstruct" || group == "explorer" { case(&lab) } else { lab.reset().and_then(|_| case(&lab)) };
+        if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" || group == "obstruct" || group == "explorer" {
             let _ = press("escape");
             close_fixture_tab();
         }
@@ -2505,7 +2640,7 @@ pub fn run(filter: Option<&str>, mut progress: impl FnMut(&CaseResult)) -> Resul
             millis: started.elapsed().as_millis(),
             detail: outcome
                 .err()
-                .map(|e| if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" || group == "obstruct" { format!("{e} [orders: {}]", trail_text()) } else { e })
+                .map(|e| if group == "driver" || group == "body" || group == "draw" || group == "load" || group == "windows" || group == "safety" || group == "system" || group == "obstruct" || group == "explorer" { format!("{e} [orders: {}]", trail_text()) } else { e })
                 .unwrap_or_default(),
         };
         progress(&result);
