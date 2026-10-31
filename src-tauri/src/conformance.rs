@@ -1397,9 +1397,15 @@ fn driver_open_dialog_navigation(_lab: &Lab) -> Result<(), String> {
     let file = folder.join("aura-nav-target.txt");
     std::fs::write(&file, "navigated ok").map_err(|e| e.to_string())?;
     hotkey(&["ctrl", "o"])?;
-    std::thread::sleep(Duration::from_millis(1500));
-    // Typing a folder into the file-name box and pressing Enter walks the dialog into that folder.
-    go(Order::Type { text: &folder.display().to_string(), enter: true, overwrite: false })?;
+    // Wait for the dialog itself before typing: keys sent while it is still opening reach the
+    // file-name box half-way, together with the name it remembers from an earlier dialog.
+    if !wait_until(6000, || desktop_target::foreground_title().eq_ignore_ascii_case("open")) {
+        return Err(format!("the Open dialog did not appear (front window: '{}')", desktop_target::foreground_title()));
+    }
+    std::thread::sleep(Duration::from_millis(600));
+    // Typing a folder into the file-name box (replacing what it holds) and pressing Enter walks
+    // the dialog into that folder.
+    go(Order::Type { text: &folder.display().to_string(), enter: true, overwrite: true })?;
     std::thread::sleep(Duration::from_millis(1000));
     let outcome = go(Order::DoubleClick("aura-nav-target"));
     let opened = outcome.is_ok() && wait_until(8000, || desktop_target::foreground_title().to_lowercase().contains("aura-nav-target"));
@@ -1416,6 +1422,14 @@ fn driver_open_dialog_navigation(_lab: &Lab) -> Result<(), String> {
         Ok(())
     };
     let front = desktop_target::foreground_title();
+    // A dialog left open (or its "File not found" box) would hold the foreground for every later case.
+    for _ in 0..3 {
+        let title = desktop_target::foreground_title().to_lowercase();
+        if title == "open" {
+            let _ = InputActuator::execute_action(&A::KeyPress { key: "escape".into() });
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
     close_tab_if_front_is(&["notepad", "aura-nav-target"]);
     std::thread::sleep(Duration::from_millis(500));
     let _ = std::fs::remove_file(&file);
@@ -2225,7 +2239,13 @@ fn run_scripted(task: &str, actions: Vec<serde_json::Value>) -> Result<String, S
 
 /// Screenshot position and element number of a labelled thing, seen exactly as the loop will see it.
 fn seen(task: &str, label: &str) -> Result<(u32, i32, i32), String> {
-    let observation = driver::observe(task)?;
+    let mut observation = driver::observe(task)?;
+    if observation.find(label).is_none() {
+        // A page in a Chrome that has just started can have its title before its first paint (and
+        // before Chrome builds its accessibility tree): look once more before calling it missing.
+        std::thread::sleep(Duration::from_millis(900));
+        observation = driver::observe(task)?;
+    }
     let element = observation.find(label).ok_or_else(|| format!("'{label}' is not among the numbered elements"))?;
     let (x, y) = element.center();
     Ok((element.id, x, y))

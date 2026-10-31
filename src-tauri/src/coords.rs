@@ -194,16 +194,45 @@ fn scale_store() -> Option<std::path::PathBuf> {
 
 /// The coordinate convention measured for this model by `aura-cli calibrate` ("pixels",
 /// "norm1000" or "norm1"), if any.
-pub fn model_scale(model: &str) -> Option<String> {
-    let text = std::fs::read_to_string(scale_store()?).ok()?;
-    let map: HashMap<String, String> = serde_json::from_str(&text).ok()?;
-    map.get(model).cloned()
+/// The key a measurement is stored under: the same model name on another server (or another
+/// quantization behind another server) can answer differently, so the server is part of it.
+pub fn scale_key(base_url: &str, model: &str) -> String {
+    format!("{model} @ {}", base_url.trim_end_matches('/').to_ascii_lowercase())
 }
 
-pub fn save_model_scale(model: &str, scale: &str) -> Result<(), String> {
+fn scale_map() -> HashMap<String, String> {
+    scale_store().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+/// The measured convention for this model on this server ("pixels", "norm1000", "norm1"). A value
+/// saved by older versions under the bare model name still counts.
+pub fn model_scale(base_url: &str, model: &str) -> Option<String> {
+    let map = scale_map();
+    [scale_key(base_url, model), model.to_owned()]
+        .iter()
+        .filter_map(|key| map.get(key))
+        .find(|value| matches!(value.as_str(), "pixels" | "norm1000" | "norm1"))
+        .cloned()
+}
+
+/// Whether an automatic calibration of this model already failed (it is not retried by itself;
+/// the settings sheet can still run it again).
+pub fn calibration_failed(base_url: &str, model: &str) -> bool {
+    scale_map().get(&scale_key(base_url, model)).is_some_and(|v| v == "failed")
+}
+
+pub fn note_calibration_failed(base_url: &str, model: &str) -> Result<(), String> {
+    write_scale(&scale_key(base_url, model), "failed")
+}
+
+pub fn save_model_scale(base_url: &str, model: &str, scale: &str) -> Result<(), String> {
+    write_scale(&scale_key(base_url, model), scale)
+}
+
+fn write_scale(key: &str, scale: &str) -> Result<(), String> {
     let path = scale_store().ok_or("no LOCALAPPDATA")?;
-    let mut map: HashMap<String, String> = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-    map.insert(model.to_owned(), scale.to_owned());
+    let mut map = scale_map();
+    map.insert(key.to_owned(), scale.to_owned());
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }

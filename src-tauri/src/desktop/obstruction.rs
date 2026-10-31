@@ -136,9 +136,27 @@ pub fn restore_raised() {
             unsafe { SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) };
         }
     }
+    crate::recovery::clear_raised();
+}
+
+/// Recovery after a crash: un-raises `hwnd` only if it still belongs to process `pid` (window
+/// handles are reused, so another program's window is never touched).
+pub fn unraise_if_owned(hwnd: isize, pid: u32) {
+    let hwnd = hwnd as HWND;
+    if !is_alive(hwnd) {
+        return;
+    }
+    let mut owner = 0u32;
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(hwnd, &mut owner) };
+    if owner == pid {
+        unsafe { SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) };
+    }
 }
 
 fn raise_above_overlays(target: HWND) {
+    let mut pid = 0u32;
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(target, &mut pid) };
+    crate::recovery::note_raised(target as isize, pid);
     unsafe { SetWindowPos(target, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) };
     let mut raised = RAISED.lock().unwrap_or_else(|e| e.into_inner());
     if !raised.contains(&(target as isize)) {

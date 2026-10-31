@@ -22,9 +22,11 @@ pub mod perception;
 pub mod profiles;
 pub mod radar;
 pub mod recipe;
+pub mod recovery;
 pub mod reliability;
 pub mod settle;
 pub mod settings;
+pub mod single_instance;
 pub mod soak;
 pub mod schedule;
 pub mod schedule_app;
@@ -52,18 +54,37 @@ pub fn make_process_dpi_aware() {
     }
 }
 
+fn data_root() -> std::path::PathBuf {
+    std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir).join("AgentAura")
+}
+
+/// The window title, also used to find the open copy when the app is started a second time.
+const WINDOW_TITLE: &str = "Agent Aura";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     make_process_dpi_aware();
 
-    // Install global panic hook to capture any fatal panics to file and console
+    // One copy of the app per data folder: a second one would run every schedule again and fight
+    // the first over the mouse. Starting it again brings the open window forward instead.
+    let Some(_only_app) = single_instance::try_acquire("app", &data_root()) else {
+        single_instance::show_existing_window(WINDOW_TITLE);
+        return;
+    };
+
+    // A panic puts the cursor, the accessibility shortcuts and raised windows back at once, and
+    // is logged next to the database.
     std::panic::set_hook(Box::new(|info| {
+        recovery::undo_own();
         let err_msg = format!("Agent Aura Fatal Error: {}\nLocation: {:?}\n", info, info.location());
-        let _ = std::fs::write("agent-aura-crash.log", &err_msg);
+        let _ = std::fs::create_dir_all(data_root());
+        let _ = std::fs::write(data_root().join("agent-aura-crash.log"), &err_msg);
         eprintln!("{}", err_msg);
     }));
 
-    // A previous run killed mid-way may have left the working cursor behind.
+    // What a crashed or force-closed copy left behind (cursor, shortcuts, raised windows, display
+    // scale) is put back; a previous run killed mid-way may also have left the working cursor.
+    recovery::recover_leftovers();
     overlay::cursor::restore();
 
     let agent_runtime = agent::AgentRuntime::new().expect("failed to initialize Agent Aura runtime");
@@ -74,7 +95,6 @@ pub fn run() {
             agent::configure_provider,
             agent::get_provider_status,
             agent::clear_provider,
-            agent::test_provider,
             agent::plan_next_step,
             agent::execute_pending_step,
             agent::discard_pending_step,
@@ -89,7 +109,6 @@ pub fn run() {
             agent::set_mini_height,
             agent::keep_run_panel_on_top,
             agent::answer_confirmation,
-            agent::get_last_task_run,
             agent::submit_task_review,
             schedule_app::list_schedules,
             schedule_app::add_schedule,
@@ -107,7 +126,18 @@ pub fn run() {
             agent::app::start_window_drag,
             agent::app::list_task_runs,
             agent::app::get_task_run_detail,
+            agent::app::get_step_screenshot,
         ])
+        // Closing the window while schedules are on keeps Aura running in the tray, so they
+        // still happen; with no schedules, closing quits as usual.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" && schedule_app::has_enabled_schedules() {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -124,6 +154,8 @@ pub fn run() {
                 // Keep Aura's own UI out of every screenshot the model sees.
                 match window.hwnd() {
                     Ok(hwnd) => {
+                        // Touching the mini player is not the user taking the computer back.
+                        input::takeover::set_own_window(hwnd.0 as isize);
                         if let Err(error) = desktop::affinity::exclude_from_capture(hwnd.0 as _) {
                             eprintln!("[aura] main window could not be excluded from capture: {error}");
                         }
@@ -134,11 +166,17 @@ pub fn run() {
 
             crate::input::killswitch::KillSwitch::start_monitoring()
                 .map_err(std::io::Error::other)?;
+            // In the app, Esc / Pause / Ctrl+Alt+Space only act while a task runs.
+            crate::input::killswitch::keys_only_during_runs(true);
+
+            build_tray(app)?;
 
             // Saved schedules run while the app is open (idle between runs: nothing captured).
             schedule_app::start(app.handle().clone());
 
-            // Self-test: run one task through the same path as the Run button and log what happens.
+            // Self-test (debug builds only): run one task through the same path as the Run button
+            // and log what happens.
+            #[cfg(debug_assertions)]
             if let Ok(task) = std::env::var("AURA_SELFTEST_TASK") {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
@@ -182,4 +220,41 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while building tauri application");
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+/// The tray icon: click to open the window, right-click for Open / Quit. It is how Aura is reached
+/// while it keeps schedules running with the window closed.
+fn build_tray(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+    let open = MenuItem::with_id(app, "open", "Open Agent Aura", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open, &quit])?;
+    let mut tray = TrayIconBuilder::with_id("aura")
+        .tooltip("Agent Aura")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "open" => show_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                show_main_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.build(app)?;
+    Ok(())
 }

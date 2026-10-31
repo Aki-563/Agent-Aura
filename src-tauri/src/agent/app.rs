@@ -41,7 +41,7 @@ pub fn default_preset_name(protocol: ApiProtocol, base_url: &str, model: &str) -
 fn view(preset: crate::db::ModelPreset, active: Option<&ProviderConfig>) -> PresetView {
     let is_active = active.is_some_and(|c| protocol_name(c.protocol) == preset.protocol && c.base_url == preset.base_url && c.model == preset.model);
     PresetView {
-        coordinates: crate::coords::model_scale(&preset.model),
+        coordinates: crate::coords::model_scale(&preset.base_url, &preset.model),
         has_api_key: !preset.api_key_encrypted.is_empty(),
         active: is_active,
         id: preset.id,
@@ -52,13 +52,37 @@ fn view(preset: crate::db::ModelPreset, active: Option<&ProviderConfig>) -> Pres
     }
 }
 
-/// Stores the active connection as a preset (key encrypted the same way as `provider.json`).
+/// Stores the active connection as a preset. The key is kept (encrypted) only there:
+/// `provider.json` then just points at the preset.
 fn save_active_as_preset(state: &AgentRuntime, name: Option<&str>) -> Result<String, String> {
     let config = cloned_config(state)?;
     let encrypted = crate::vault::encrypt(&config.api_key)?;
     let name = name.map(str::trim).filter(|n| !n.is_empty()).map(str::to_owned).unwrap_or_else(|| default_preset_name(config.protocol, &config.base_url, &config.model));
-    let mut db = state.db.lock().map_err(|_| "Database lock was poisoned.".to_owned())?;
-    db.save_model_preset(&name, protocol_name(config.protocol), &config.base_url, &config.model, &encrypted).map_err(|e| e.to_string())
+    let id = {
+        let mut db = state.db.lock().map_err(|_| "Database lock was poisoned.".to_owned())?;
+        db.save_model_preset(&name, protocol_name(config.protocol), &config.base_url, &config.model, &encrypted).map_err(|e| e.to_string())?
+    };
+    point_provider_file_at(state, &config, &id);
+    Ok(id)
+}
+
+fn point_provider_file_at(state: &AgentRuntime, config: &ProviderConfig, preset_id: &str) {
+    if let Err(error) = crate::vault::save_reference(&state.data_root, protocol_name(config.protocol), &config.base_url, &config.model, preset_id) {
+        log::warn!("provider settings were not saved: {error}");
+    }
+}
+
+/// Puts the connection that was active before a failed Connect back (memory and disk).
+fn restore_config(state: &AgentRuntime, previous: Option<ProviderConfig>, previous_file: Option<String>) {
+    match previous_file {
+        Some(text) => {
+            let _ = std::fs::write(state.data_root.join("provider.json"), text);
+        }
+        None => crate::vault::clear(&state.data_root),
+    }
+    if let Ok(mut config) = state.config.lock() {
+        *config = previous;
+    }
 }
 
 #[tauri::command]
@@ -77,11 +101,16 @@ pub fn list_model_presets(state: State<'_, AgentRuntime>) -> Result<Vec<PresetVi
 /// whose coordinate convention is unknown is calibrated in the background afterwards.
 #[tauri::command]
 pub async fn connect_model(app: AppHandle, state: State<'_, AgentRuntime>, input: ProviderConfigInput, name: Option<String>) -> Result<PresetView, String> {
+    // A connection that fails its test must not replace the one that works.
+    let previous = state.config.lock().map_err(|_| "Provider configuration lock was poisoned.".to_owned())?.clone();
+    let previous_file = std::fs::read_to_string(state.data_root.join("provider.json")).ok();
     configure_provider_inner(&state, input)?;
-    check_connection(&state).await?;
+    if let Err(error) = check_connection(&state).await {
+        restore_config(&state, previous, previous_file);
+        return Err(error);
+    }
     let id = save_active_as_preset(&state, name.as_deref())?;
-    let config = cloned_config(&state)?;
-    calibrate_in_background(app, config.model.clone());
+    calibrate_in_background(app, cloned_config(&state)?);
     preset_view(&state, &id)
 }
 
@@ -97,7 +126,9 @@ pub async fn use_model_preset(app: AppHandle, state: State<'_, AgentRuntime>, id
     if let Ok(mut db) = state.db.lock() {
         let _ = db.touch_model_preset(&id);
     }
-    calibrate_in_background(app, preset.model.clone());
+    let config = cloned_config(&state)?;
+    point_provider_file_at(&state, &config, &id);
+    calibrate_in_background(app, config);
     preset_view(&state, &id)
 }
 
@@ -223,14 +254,16 @@ pub fn calibration_image() -> Result<Vec<u8>, String> {
 
 /// Asks the active model to point at each target on `image` and decides its coordinate
 /// convention. Returns (scale, mean miss in pixels, a line per answer).
-pub async fn calibrate_on_image(state: &AgentRuntime, image: &str, size: (u32, u32), targets: &[(String, (i32, i32))]) -> Result<(&'static str, f64, Vec<String>), String> {
-    let config = cloned_config(state)?;
+///
+/// `config` stays the same for the whole calibration, so switching models meanwhile cannot mix
+/// answers from two models or save one model's result under another's name.
+pub(super) async fn calibrate_on_image(state: &AgentRuntime, config: &ProviderConfig, image: &str, size: (u32, u32), targets: &[(String, (i32, i32))]) -> Result<(&'static str, f64, Vec<String>), String> {
     let mut answers = Vec::new();
     let mut lines = Vec::new();
     for (label, truth) in targets {
         let prompt = "You point at things on a screenshot. Reply with JSON only: {\"found\": true, \"x\": X, \"y\": Y} for the centre of the named thing, using your usual coordinate convention.";
         let input = format!("Point at the centre of: {label}");
-        let value = request_plan(&state.client, &config, prompt, &input, image, model_schema::GROUNDING).await?;
+        let value = request_plan(&state.client, config, prompt, &input, image, model_schema::GROUNDING).await?;
         let text = extract_model_text(&value, config.protocol)?;
         let reply: Value = serde_json::from_str(model_schema::extract_json_object(&text).unwrap_or("{}")).unwrap_or_default();
         let number = |k: &str| reply.get(k).and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())));
@@ -249,31 +282,43 @@ pub async fn calibrate_on_image(state: &AgentRuntime, image: &str, size: (u32, u
     Ok((scale, error, lines))
 }
 
-/// Calibrates the active model on the generated picture and saves the result.
-pub async fn calibrate_active_model(state: &AgentRuntime) -> Result<(String, f64), String> {
-    let model = cloned_config(state)?.model.clone();
+/// Calibrates `config`'s model on the generated picture and saves the result under that model
+/// and server.
+async fn calibrate_model_config(state: &AgentRuntime, config: &ProviderConfig) -> Result<(String, f64), String> {
     let png = tokio::task::spawn_blocking(calibration_image).await.map_err(|e| e.to_string())??;
     let image = format!("data:image/png;base64,{}", BASE64.encode(&png));
-    let (scale, error, _) = calibrate_on_image(state, &image, CALIBRATION_SIZE, &calibration_targets()).await?;
+    let (scale, error, _) = calibrate_on_image(state, config, &image, CALIBRATION_SIZE, &calibration_targets()).await?;
     // A model that cannot point at big labelled buttons at all is not given a convention.
     if error > 120.0 {
         return Err(format!("the model's answers were too far off to tell (mean miss {error:.0} px)"));
     }
-    crate::coords::save_model_scale(&model, scale)?;
+    crate::coords::save_model_scale(&config.base_url, &config.model, scale)?;
     Ok((scale.to_owned(), error))
 }
 
-fn calibrate_in_background(app: AppHandle, model: String) {
-    if crate::coords::model_scale(&model).is_some() {
+/// Whether a newly connected model is calibrated by itself: not when it is already measured, not
+/// again after it failed once, and not on the paid OpenAI API (four image requests cost money;
+/// those models answer in pixels, the default). The settings sheet can still run it by hand.
+pub fn calibrates_automatically(protocol: ApiProtocol, measured: bool, failed_before: bool) -> bool {
+    protocol != ApiProtocol::OpenAiResponses && !measured && !failed_before
+}
+
+fn calibrate_in_background(app: AppHandle, config: ProviderConfig) {
+    let measured = crate::coords::model_scale(&config.base_url, &config.model).is_some();
+    if !calibrates_automatically(config.protocol, measured, crate::coords::calibration_failed(&config.base_url, &config.model)) {
         return;
     }
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AgentRuntime>();
+        let model = config.model.clone();
         queue_event("model-calibration", &json!({"model": model, "state": "running"}));
-        let outcome = calibrate_active_model(&state).await;
+        let outcome = calibrate_model_config(&state, &config).await;
         let payload = match outcome {
             Ok((scale, error)) => json!({"model": model, "state": "done", "coordinates": scale, "missPx": error.round()}),
-            Err(error) => json!({"model": model, "state": "failed", "message": error}),
+            Err(error) => {
+                let _ = crate::coords::note_calibration_failed(&config.base_url, &config.model);
+                json!({"model": model, "state": "failed", "message": error})
+            }
         };
         queue_event("model-calibration", &payload);
     });
@@ -282,7 +327,8 @@ fn calibrate_in_background(app: AppHandle, model: String) {
 /// Runs the calibration again for the active model (settings sheet).
 #[tauri::command]
 pub async fn calibrate_model(state: State<'_, AgentRuntime>) -> Result<Value, String> {
-    let (scale, error) = calibrate_active_model(&state).await?;
+    let config = cloned_config(&state)?;
+    let (scale, error) = calibrate_model_config(&state, &config).await?;
     Ok(json!({"coordinates": scale, "missPx": error.round()}))
 }
 
@@ -295,6 +341,7 @@ pub fn get_voice_enabled() -> bool {
 
 #[tauri::command]
 pub fn set_voice_enabled(enabled: bool) -> Result<bool, String> {
+    crate::settings::voice_chosen_by_user();
     let mut settings = crate::settings::get();
     settings.voice.enabled = enabled;
     crate::settings::set(settings)?;
@@ -310,16 +357,25 @@ pub fn set_voice_enabled(enabled: bool) -> Result<bool, String> {
 pub fn start_window_drag(window: WebviewWindow) -> Result<(), String> {
     window.start_dragging().map_err(|e| e.to_string())?;
     std::thread::spawn(move || {
-        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SWAPBUTTON};
+        let button = drag_button(unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0);
         let started = Instant::now();
         // Wait for the release (the drag loop runs until then), at most a minute.
-        while started.elapsed() < Duration::from_secs(60) && unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } as u16 & 0x8000 != 0 {
+        while started.elapsed() < Duration::from_secs(60) && unsafe { GetAsyncKeyState(button as i32) } as u16 & 0x8000 != 0 {
             std::thread::sleep(Duration::from_millis(30));
         }
         std::thread::sleep(Duration::from_millis(60));
         panel::remember_position(&window);
     });
     Ok(())
+}
+
+/// `GetAsyncKeyState` reads the *physical* buttons. The drag uses the logical left button, which is
+/// the physical right one when the buttons are swapped (the left-handed mouse setting).
+pub fn drag_button(swapped: bool) -> u16 {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LBUTTON, VK_RBUTTON};
+    if swapped { VK_RBUTTON } else { VK_LBUTTON }
 }
 
 // ---- Activity ----------------------------------------------------------------------------------
@@ -330,12 +386,13 @@ pub fn list_task_runs(state: State<'_, AgentRuntime>, limit: Option<u32>) -> Res
     db.recent_task_runs(limit.unwrap_or(30).clamp(1, 200)).map_err(|e| e.to_string())
 }
 
-/// One run with its steps in order: what the model meant, what was done, how it ended, and the
-/// screenshot it looked at.
+/// One run with its steps in order: what the model meant, what was done and how it ended. The
+/// screenshots are fetched one at a time with `get_step_screenshot`, so a long run does not send
+/// tens of megabytes through one call.
 #[tauri::command]
 pub fn get_task_run_detail(state: State<'_, AgentRuntime>, id: String) -> Result<Value, String> {
     let db = state.db.lock().map_err(|_| "Database lock was poisoned.".to_owned())?;
-    let summary = db.recent_task_runs(500).map_err(|e| e.to_string())?.into_iter().find(|r| r.id == id).ok_or("That run is no longer stored.")?;
+    let summary = db.task_run_summary(&id).map_err(|e| e.to_string())?.ok_or("That run is no longer stored.")?;
     let steps: Vec<Value> = db
         .get_trajectory_steps(&id)
         .map_err(|e| e.to_string())?
@@ -351,21 +408,30 @@ pub fn get_task_run_detail(state: State<'_, AgentRuntime>, id: String) -> Result
                 "action": action,
                 "outcome": step.outcome,
                 "window": step.window_title.unwrap_or_default(),
-                "screenshot": step.screenshot_webp.map(|bytes| format!("data:{};base64,{}", image_mime(&bytes), BASE64.encode(bytes))),
+                "hasScreenshot": step.screenshot_webp.is_some(),
             })
         })
         .collect();
     Ok(json!({"run": summary, "steps": steps}))
 }
 
-fn image_mime(bytes: &[u8]) -> &'static str {
-    if bytes.starts_with(&[0xFF, 0xD8]) {
-        "image/jpeg"
-    } else if bytes.starts_with(b"RIFF") {
-        "image/webp"
-    } else {
-        "image/png"
-    }
+/// Widest screenshot the activity view is sent; its cards are far smaller than that.
+const ACTIVITY_IMAGE_WIDTH: u32 = 960;
+
+/// One step's screenshot as a small JPEG data URL (None when that step has none).
+#[tauri::command]
+pub async fn get_step_screenshot(state: State<'_, AgentRuntime>, id: String, index: i32) -> Result<Option<String>, String> {
+    let bytes = state.db.lock().map_err(|_| "Database lock was poisoned.".to_owned())?.step_screenshot(&id, index).map_err(|e| e.to_string())?;
+    let Some(bytes) = bytes else { return Ok(None) };
+    tokio::task::spawn_blocking(move || activity_thumbnail(&bytes)).await.map_err(|e| e.to_string())?.map(Some)
+}
+
+pub fn activity_thumbnail(bytes: &[u8]) -> Result<String, String> {
+    let image = image::load_from_memory(bytes).map_err(|e| format!("the screenshot could not be read: {e}"))?;
+    let image = if image.width() > ACTIVITY_IMAGE_WIDTH { image.resize(ACTIVITY_IMAGE_WIDTH, u32::MAX, image::imageops::FilterType::Triangle) } else { image };
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 78).encode_image(&image.to_rgb8()).map_err(|e| e.to_string())?;
+    Ok(format!("data:image/jpeg;base64,{}", BASE64.encode(jpeg)))
 }
 
 #[cfg(test)]
@@ -376,6 +442,32 @@ mod tests {
     fn preset_names_are_short_and_say_where() {
         assert_eq!(default_preset_name(ApiProtocol::OpenAiCompatibleChat, "http://10.103.7.32:1234/v1", "qwen/qwen3-vl-4b"), "qwen3-vl-4b · 10.103.7.32");
         assert_eq!(default_preset_name(ApiProtocol::OpenAiResponses, "https://api.openai.com/v1", "gpt-x"), "gpt-x");
+    }
+
+    #[test]
+    fn activity_screenshots_are_small_jpegs() {
+        let png = calibration_image().unwrap();
+        let url = activity_thumbnail(&png).unwrap();
+        assert!(url.starts_with("data:image/jpeg;base64,"));
+        let jpeg = BASE64.decode(url.trim_start_matches("data:image/jpeg;base64,")).unwrap();
+        let image = image::load_from_memory(&jpeg).unwrap();
+        assert_eq!((image.width(), image.height()), (960, 600));
+        assert!(jpeg.len() < png.len(), "{} vs {}", jpeg.len(), png.len());
+    }
+
+    #[test]
+    fn only_free_unmeasured_models_are_calibrated_by_themselves() {
+        assert!(calibrates_automatically(ApiProtocol::OpenAiCompatibleChat, false, false));
+        assert!(!calibrates_automatically(ApiProtocol::OpenAiResponses, false, false), "paid API: never by itself");
+        assert!(!calibrates_automatically(ApiProtocol::OpenAiCompatibleChat, true, false), "already measured");
+        assert!(!calibrates_automatically(ApiProtocol::OpenAiCompatibleChat, false, true), "failed once: not on every connect");
+    }
+
+    #[test]
+    fn the_drag_watches_the_physical_button_that_is_the_logical_left() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LBUTTON, VK_RBUTTON};
+        assert_eq!(drag_button(false), VK_LBUTTON);
+        assert_eq!(drag_button(true), VK_RBUTTON);
     }
 
     #[test]

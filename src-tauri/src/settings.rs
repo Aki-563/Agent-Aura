@@ -86,6 +86,13 @@ impl Default for HarnessSettings {
 }
 
 static CURRENT: Mutex<Option<HarnessSettings>> = Mutex::new(None);
+/// Set once the user flips the step-reader switch: their choice then wins over `AURA_MUTE` /
+/// `AURA_VOICE=0`, so the switch never shows "off" right after being turned on.
+static VOICE_CHOSEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn voice_chosen_by_user() {
+    VOICE_CHOSEN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
 
 pub fn path() -> std::path::PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
@@ -100,7 +107,8 @@ pub fn get() -> HarnessSettings {
         *current = Some(loaded);
     }
     let mut settings = current.clone().unwrap_or_default();
-    if cfg!(test) || std::env::var_os("AURA_MUTE").is_some() || std::env::var("AURA_VOICE").map(|v| v == "0").unwrap_or(false) {
+    let env_mute = std::env::var_os("AURA_MUTE").is_some() || std::env::var("AURA_VOICE").map(|v| v == "0").unwrap_or(false);
+    if cfg!(test) || (env_mute && !VOICE_CHOSEN.load(std::sync::atomic::Ordering::SeqCst)) {
         settings.voice.enabled = false;
     }
     settings

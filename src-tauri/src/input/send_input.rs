@@ -828,9 +828,11 @@ impl InputActuator {
             if t >= 1.0 {
                 break Ok(());
             }
-            // The bow may lean past a screen edge when the move runs along it: keep it on screen.
+            // The bow may lean past a screen edge when the move runs along it, and with monitors of
+            // different sizes the path can cross a corner no screen covers: keep every point on
+            // the nearest monitor.
             let (px, py) = glide_point((start.x, start.y), (x, y), t);
-            let point = (px.clamp(bounds.x, bounds.x + bounds.width - 1), py.clamp(bounds.y, bounds.y + bounds.height - 1));
+            let point = on_nearest_monitor((px.clamp(bounds.x, bounds.x + bounds.width - 1), py.clamp(bounds.y, bounds.y + bounds.height - 1)));
             if point != last {
                 if let Err(error) = Self::move_to(point.0, point.1) {
                     break Err(error);
@@ -1633,6 +1635,21 @@ pub fn glide_duration(distance: f64) -> Option<Duration> {
 pub fn ease_in_out(t: f64) -> f64 {
     let t = t.clamp(0.0, 1.0);
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
+/// `point` if a monitor shows it, otherwise the closest point on the nearest monitor.
+pub fn on_nearest_monitor(point: (i32, i32)) -> (i32, i32) {
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    unsafe {
+        let monitor = MonitorFromPoint(windows_sys::Win32::Foundation::POINT { x: point.0, y: point.1 }, MONITOR_DEFAULTTONEAREST);
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if monitor.is_null() || GetMonitorInfoW(monitor, &mut info) == 0 {
+            return point;
+        }
+        let r = info.rcMonitor;
+        (point.0.clamp(r.left, r.right - 1), point.1.clamp(r.top, r.bottom - 1))
+    }
 }
 
 /// The pointer position `t` (0..1) of the way along a glide: eased along the line, bowed slightly

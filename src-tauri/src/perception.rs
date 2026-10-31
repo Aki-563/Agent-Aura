@@ -338,6 +338,35 @@ fn taskbar_candidates(active: isize, origin_x: i32, origin_y: i32, width: u32, h
     found
 }
 
+/// The English accessible name of a Windows Calculator key, from its language-independent
+/// automation id.
+pub fn calculator_key_name(automation_id: &str) -> Option<&'static str> {
+    Some(match automation_id {
+        "num0Button" => "Zero",
+        "num1Button" => "One",
+        "num2Button" => "Two",
+        "num3Button" => "Three",
+        "num4Button" => "Four",
+        "num5Button" => "Five",
+        "num6Button" => "Six",
+        "num7Button" => "Seven",
+        "num8Button" => "Eight",
+        "num9Button" => "Nine",
+        "plusButton" => "Plus",
+        "minusButton" => "Minus",
+        "multiplyButton" => "Multiply by",
+        "divideButton" => "Divide by",
+        "equalButton" => "Equals",
+        "decimalSeparatorButton" => "Decimal separator",
+        "clearEntryButton" => "Clear entry",
+        "clearButton" => "Clear",
+        "percentButton" => "Percent",
+        "backSpaceButton" => "Backspace",
+        "negateButton" => "Positive negative",
+        _ => return None,
+    })
+}
+
 fn collect_uia_candidates(
     process_id: u32,
     hwnd: isize,
@@ -381,10 +410,17 @@ fn collect_uia_candidates(
 
     let screen_right = origin_x.saturating_add(width as i32);
     let screen_bottom = origin_y.saturating_add(height as i32);
+    // Calculator names its keys in the Windows display language ("Eins", "Plus", "Effacer
+    // l'entrée"); its automation ids are the same everywhere, so its keypad gets one set of names
+    // whatever the language, and "1", "+" or "CE" read off a key cap always match.
+    let ids: Vec<String> = elements.iter().map(|e| e.get_automation_id().unwrap_or_default()).collect();
+    let calculator = ids.iter().any(|i| i == "num1Button") && ids.iter().any(|i| i == "equalButton");
     elements
         .into_iter()
-        .filter_map(|element| {
-            let name = element.get_name().ok()?.trim().to_owned();
+        .zip(ids)
+        .filter_map(|(element, id)| {
+            let localized = element.get_name().ok()?.trim().to_owned();
+            let name = calculator.then(|| calculator_key_name(&id)).flatten().map(str::to_owned).unwrap_or(localized);
             if name.is_empty() {
                 return None;
             }
@@ -495,6 +531,17 @@ pub fn token_overlap_score(query: &str, candidate: &str) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calculator_keys_get_the_same_names_in_every_language() {
+        assert_eq!(calculator_key_name("num7Button"), Some("Seven"));
+        assert_eq!(calculator_key_name("clearEntryButton"), Some("Clear entry"));
+        assert_eq!(calculator_key_name("searchBox"), None);
+        // And those names match what a model reads off the key caps.
+        let key = |label: &str| crate::marks::Element { id: 1, label: label.into(), kind: "Button".into(), left: 0, top: 0, right: 10, bottom: 10 };
+        assert!(crate::coords::exactly_named(&[key(calculator_key_name("plusButton").unwrap())], "+").is_some());
+        assert!(crate::coords::exactly_named(&[key(calculator_key_name("clearEntryButton").unwrap())], "CE").is_some());
+    }
 
     #[test]
     fn overlap_prefers_semantic_match() {

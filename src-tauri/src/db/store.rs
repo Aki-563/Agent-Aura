@@ -195,7 +195,7 @@ impl DbStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO VisualAnchors (id, skill_id, step_index, crop_blob, coords_x, coords_y)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, skill_id, step_index, crop_blob, coords_x, coords_y],
+            params![id, skill_id, step_index, crate::vault::seal_bytes(crop_blob), coords_x, coords_y],
         )?;
         Ok(())
     }
@@ -212,7 +212,7 @@ impl DbStore {
                 id: row.get(0)?,
                 skill_id: row.get(1)?,
                 step_index: row.get(2)?,
-                crop_blob: row.get(3)?,
+                crop_blob: crate::vault::open_bytes(row.get(3)?).unwrap_or_default(),
                 coords_x: row.get(4)?,
                 coords_y: row.get(5)?,
             })
@@ -348,7 +348,7 @@ impl DbStore {
             "INSERT OR REPLACE INTO TrajectorySteps
              (run_id, step_index, proposal_json, verification_json, final_action_json, outcome, expected_outcome, screenshot_webp, window_title)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![run_id, step_index, proposal_json, verification_json, final_action_json, outcome, expected_outcome, screenshot_webp, window_title],
+            params![run_id, step_index, proposal_json, verification_json, final_action_json, outcome, expected_outcome, screenshot_webp.map(crate::vault::seal_bytes), window_title],
         )?;
         Ok(())
     }
@@ -377,7 +377,7 @@ impl DbStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO TaskStepAnchors (run_id, step_index, crop_blob, coords_x, coords_y)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![run_id, step_index, crop_blob, coords_x, coords_y],
+            params![run_id, step_index, crate::vault::seal_bytes(crop_blob), coords_x, coords_y],
         )?;
         Ok(())
     }
@@ -389,7 +389,7 @@ impl DbStore {
         let rows = stmt.query_map(params![run_id], |row| {
             Ok(TaskStepAnchor {
                 step_index: row.get(0)?,
-                crop_blob: row.get(1)?,
+                crop_blob: crate::vault::open_bytes(row.get(1)?).unwrap_or_default(),
                 coords_x: row.get(2)?,
                 coords_y: row.get(3)?,
             })
@@ -430,11 +430,54 @@ impl DbStore {
                 final_action_json: row.get(4)?,
                 outcome: row.get(5)?,
                 expected_outcome: row.get(6)?,
-                screenshot_webp: row.get(7)?,
+                screenshot_webp: row.get::<_, Option<Vec<u8>>>(7)?.and_then(crate::vault::open_bytes),
                 window_title: row.get(8)?,
             })
         })?;
         rows.collect()
+    }
+
+    /// One step's screenshot (decrypted), for the activity view that loads them one at a time.
+    pub fn step_screenshot(&self, run_id: &str, step_index: i32) -> Result<Option<Vec<u8>>> {
+        let stored: Option<Option<Vec<u8>>> = self
+            .conn
+            .query_row("SELECT screenshot_webp FROM TrajectorySteps WHERE run_id = ?1 AND step_index = ?2", params![run_id, step_index], |row| row.get(0))
+            .optional()?;
+        Ok(stored.flatten().and_then(crate::vault::open_bytes))
+    }
+
+    /// One run's summary, however old.
+    pub fn task_run_summary(&self, id: &str) -> Result<Option<TaskRunSummary>> {
+        self.conn
+            .query_row(
+                "SELECT r.id, r.prompt, r.status, r.summary, r.started_at, r.completed_at,
+                        (SELECT COUNT(*) FROM TrajectorySteps s WHERE s.run_id = r.id)
+                 FROM TaskRuns r WHERE r.id = ?1",
+                params![id],
+                |row| Ok(TaskRunSummary { id: row.get(0)?, prompt: row.get(1)?, status: row.get(2)?, summary: row.get(3)?, started_at: row.get(4)?, completed_at: row.get(5)?, steps: row.get(6)? }),
+            )
+            .optional()
+    }
+
+    /// Deletes runs beyond the newest `keep_runs` or older than `keep_days`, with their steps,
+    /// screenshots and crops (learned skills are separate and stay). Returns how many runs went.
+    pub fn prune_history(&mut self, keep_runs: u32, keep_days: u32) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let doomed = "SELECT id FROM TaskRuns WHERE status <> 'running' AND (
+                id NOT IN (SELECT id FROM TaskRuns ORDER BY started_at DESC, rowid DESC LIMIT ?1)
+                OR started_at < datetime('now', '-' || ?2 || ' days'))";
+        tx.execute(&format!("DELETE FROM TrajectorySteps WHERE run_id IN ({doomed})"), params![keep_runs, keep_days])?;
+        tx.execute(&format!("DELETE FROM TaskStepAnchors WHERE run_id IN ({doomed})"), params![keep_runs, keep_days])?;
+        let removed = tx.execute(&format!("DELETE FROM TaskRuns WHERE id IN ({doomed})"), params![keep_runs, keep_days])?;
+        tx.commit()?;
+        // Give the space back once a fair amount is free, so the file does not only grow.
+        if removed > 0 {
+            let free: i64 = self.conn.query_row("PRAGMA freelist_count", [], |row| row.get(0)).unwrap_or(0);
+            if free > 4096 {
+                let _ = self.conn.execute_batch("VACUUM");
+            }
+        }
+        Ok(removed)
     }
 
     pub fn find_approved_skill(&self, normalized_intent: &str) -> Result<Option<Skill>> {
@@ -619,6 +662,40 @@ mod tests {
         assert!(store.delete_model_preset(&a).unwrap());
         assert!(!store.delete_model_preset(&a).unwrap());
         assert_eq!(store.list_model_presets().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn old_runs_are_pruned_with_their_screenshots_and_the_newest_stay() {
+        let mut store = DbStore::open_in_memory().unwrap();
+        for i in 0..5 {
+            let id = format!("r{i}");
+            store.start_task_run(&id, "t", "t").unwrap();
+            store.save_trajectory_step(&id, 1, "{}", "{}", "{}", "succeeded", "", Some(&[1, 2, 3]), "").unwrap();
+            store.save_task_step_anchor(&id, 1, &[9, 9], 1, 1).unwrap();
+            store.finish_task_run(&id, "completed", "").unwrap();
+        }
+        // r0 is very old.
+        store.conn.execute("UPDATE TaskRuns SET started_at = datetime('now', '-90 days') WHERE id = 'r0'", []).unwrap();
+        // A run still going is never removed.
+        store.start_task_run("live", "t", "t").unwrap();
+        let removed = store.prune_history(3, 30).unwrap();
+        let left: Vec<String> = store.recent_task_runs(10).unwrap().into_iter().map(|r| r.id).collect();
+        assert_eq!(removed, 3, "{left:?}");
+        assert!(left.contains(&"live".to_owned()) && left.contains(&"r4".to_owned()) && !left.contains(&"r0".to_owned()), "{left:?}");
+        assert!(store.get_trajectory_steps("r1").unwrap().is_empty() && store.get_task_step_anchors("r1").unwrap().is_empty());
+        assert_eq!(store.step_screenshot("r4", 1).unwrap(), Some(vec![1, 2, 3]), "kept screenshots still open");
+        assert_eq!(store.task_run_summary("r4").unwrap().unwrap().steps, 1);
+    }
+
+    #[test]
+    fn screenshots_are_not_stored_in_the_clear() {
+        let mut store = DbStore::open_in_memory().unwrap();
+        store.start_task_run("r", "t", "t").unwrap();
+        let secret = b"PRIVATE-SCREEN-CONTENT-123".to_vec();
+        store.save_trajectory_step("r", 1, "{}", "{}", "{}", "succeeded", "", Some(&secret), "").unwrap();
+        let raw: Vec<u8> = store.conn.query_row("SELECT screenshot_webp FROM TrajectorySteps", [], |row| row.get(0)).unwrap();
+        assert!(!raw.windows(secret.len()).any(|w| w == secret.as_slice()));
+        assert_eq!(store.get_trajectory_steps("r").unwrap()[0].screenshot_webp.as_deref(), Some(secret.as_slice()));
     }
 
     #[test]

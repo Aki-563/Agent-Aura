@@ -57,6 +57,8 @@ pub struct SavedLayout {
     position: PhysicalPosition<i32>,
     size: PhysicalSize<u32>,
     was_maximized: bool,
+    /// Closed to the tray when a scheduled run started: hidden again afterwards.
+    was_hidden: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,6 +115,7 @@ pub fn corner_avoiding(
     })
 }
 
+#[derive(Clone, Copy)]
 struct MonitorGeometry {
     position: (i32, i32),
     size: (u32, u32),
@@ -125,6 +128,16 @@ fn monitor_of(window: &WebviewWindow) -> Option<MonitorGeometry> {
         position: (monitor.position().x, monitor.position().y),
         size: (monitor.size().width, monitor.size().height),
         scale: monitor.scale_factor(),
+    })
+}
+
+/// The monitor that contains `point` (where the player was dropped), or None when that monitor is
+/// gone. The remembered place is only used on its own monitor, so a changed layout or mixed
+/// scaling never puts the player somewhere odd.
+fn monitor_at(window: &WebviewWindow, point: (i32, i32)) -> Option<MonitorGeometry> {
+    window.available_monitors().ok()?.into_iter().find_map(|m| {
+        let (pos, size) = ((m.position().x, m.position().y), (m.size().width, m.size().height));
+        rect_contains(pos, size, point).then(|| MonitorGeometry { position: pos, size, scale: m.scale_factor() })
     })
 }
 
@@ -157,12 +170,20 @@ pub fn enter_run_mode(window: &WebviewWindow) -> Option<SavedLayout> {
     if window.is_minimized().unwrap_or(false) {
         let _ = window.unminimize();
     }
+    let was_hidden = !window.is_visible().unwrap_or(true);
     let saved = SavedLayout {
         position: window.outer_position().ok()?,
         size: window.outer_size().ok()?,
         was_maximized: window.is_maximized().unwrap_or(false),
+        was_hidden,
     };
-    let monitor = monitor_of(window)?;
+    // The remembered place is used on the monitor it was saved on; otherwise the top-right corner
+    // of the window's own monitor.
+    let remembered = user_position().and_then(|point| monitor_at(window, point).map(|monitor| (point, monitor)));
+    let monitor = match &remembered {
+        Some((_, monitor)) => *monitor,
+        None => monitor_of(window)?,
+    };
     let margin = (MARGIN_DIP * monitor.scale) as i32;
     if saved.was_maximized {
         let _ = window.unmaximize();
@@ -176,14 +197,18 @@ pub fn enter_run_mode(window: &WebviewWindow) -> Option<SavedLayout> {
     let _ = window.set_decorations(false);
     let _ = window.set_shadow(false);
     let _ = window.set_skip_taskbar(true);
-    let _ = window.set_size(PhysicalSize::new(panel.0, panel.1));
-    let (x, y) = match user_position() {
-        Some(point) => clamp_to_monitor(point, monitor.position, monitor.size, panel),
+    let (x, y) = match remembered {
+        Some((point, _)) => clamp_to_monitor(point, monitor.position, monitor.size, panel),
         None => corner_position(Corner::TopRight, monitor.position, monitor.size, panel, margin),
     };
+    // Moved first, then sized: on a monitor with another scale the size is then right.
     let _ = window.set_position(PhysicalPosition::new(x, y));
+    let _ = window.set_size(PhysicalSize::new(panel.0, panel.1));
     let _ = window.set_always_on_top(true);
     let _ = window.set_focusable(false);
+    if was_hidden {
+        let _ = window.show();
+    }
     Some(saved)
 }
 
@@ -196,6 +221,7 @@ pub fn leave_run_mode(window: &WebviewWindow, saved: Option<SavedLayout>) {
     let _ = window.set_resizable(true);
     let _ = window.set_skip_taskbar(false);
     let _ = window.set_min_size(Some(tauri::Size::Logical(tauri::LogicalSize::new(640.0, 480.0))));
+    let was_hidden = saved.as_ref().is_some_and(|s| s.was_hidden);
     if let Some(saved) = saved.filter(|s| s.size.width >= 400 && s.size.height >= 300) {
         let _ = window.set_size(saved.size);
         let _ = window.set_position(saved.position);
@@ -206,7 +232,76 @@ pub fn leave_run_mode(window: &WebviewWindow, saved: Option<SavedLayout>) {
         let _ = window.set_size(tauri::LogicalSize::new(1040.0, 720.0));
         let _ = window.center();
     }
+    if was_hidden {
+        // A scheduled run while Aura sat in the tray: back to the tray, not onto the screen.
+        let _ = window.hide();
+        return;
+    }
     let _ = window.set_focus();
+}
+
+/// Called every few seconds during a run: when a menu or pop-up of the app being worked on opens
+/// under the player, the player moves to a corner clear of it instead of staying on top of it.
+pub fn keep_clear_of_popups(window: &WebviewWindow) {
+    let (Ok(position), Ok(size)) = (window.outer_position(), window.outer_size()) else { return };
+    let panel = (position.x, position.y, position.x + size.width as i32, position.y + size.height as i32);
+    let popups = popup_rects_over(panel);
+    if popups.is_empty() {
+        return;
+    }
+    // Avoid the whole pop-up: its corners, edges' middles and centre.
+    let points: Vec<(i32, i32)> = popups
+        .iter()
+        .flat_map(|&(l, t, r, b)| {
+            let (cx, cy) = ((l + r) / 2, (t + b) / 2);
+            [(l, t), (r, t), (l, b), (r, b), (cx, t), (cx, b), (l, cy), (r, cy), (cx, cy)]
+        })
+        .collect();
+    move_away_from(window, &points);
+}
+
+/// Screen rectangles of visible menus and pop-up windows of other programs that overlap `panel`.
+fn popup_rects_over(panel: (i32, i32, i32, i32)) -> Vec<(i32, i32, i32, i32)> {
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetClassNameW, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, GWL_STYLE, WS_POPUP};
+    struct Search {
+        panel: (i32, i32, i32, i32),
+        found: Vec<(i32, i32, i32, i32)>,
+    }
+    unsafe extern "system" fn each(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let search = &mut *(lparam as *mut Search);
+        if IsWindowVisible(hwnd) == 0 {
+            return 1;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == std::process::id() {
+            return 1;
+        }
+        let mut class = [0u16; 32];
+        let n = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32).max(0) as usize;
+        let is_menu = String::from_utf16_lossy(&class[..n]) == "#32768";
+        let is_popup = GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_POPUP != 0;
+        if !(is_menu || is_popup) {
+            return 1;
+        }
+        let mut r: RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd, &mut r) == 0 {
+            return 1;
+        }
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        // Small enough to be a menu, list or tooltip-like pop-up (not a full-screen overlay).
+        let sized = w > 20 && h > 12 && w < 1600 && h < 1200;
+        let (pl, pt, pr, pb) = search.panel;
+        let overlaps = r.left < pr && r.right > pl && r.top < pb && r.bottom > pt;
+        if sized && overlaps && (is_menu || crate::input::takeover::belongs_to_foreground_app(pid)) {
+            search.found.push((r.left, r.top, r.right, r.bottom));
+        }
+        1
+    }
+    let mut search = Search { panel, found: Vec::new() };
+    unsafe { EnumWindows(Some(each), &mut search as *mut Search as LPARAM) };
+    search.found
 }
 
 /// Moves the panel to a corner that does not cover any of `points` (screen coordinates).

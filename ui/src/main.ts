@@ -7,6 +7,7 @@ import "./styles/app.css";
 type Handler<T> = (payload: T) => void;
 const handlers = new Map<string, Handler<any>[]>();
 let lastEventSeq = 0;
+let lastEventAt = 0;
 let polling = false;
 function on<T>(name: string, handler: Handler<T>): void {
   handlers.set(name, [...(handlers.get(name) ?? []), handler]);
@@ -18,6 +19,7 @@ async function pollEvents(): Promise<void> {
     const reply = await invoke<{ last: number; events: { seq: number; event: string; payload: unknown }[] }>("poll_events", { after: lastEventSeq });
     // A restarted queue (smaller counter) starts over.
     lastEventSeq = reply.last < lastEventSeq ? 0 : reply.last;
+    if (reply.events.length) lastEventAt = Date.now();
     for (const item of reply.events) for (const handler of handlers.get(item.event) ?? []) handler(item.payload);
   } catch {
     // The app is busy or closing; the next poll tries again.
@@ -25,7 +27,15 @@ async function pollEvents(): Promise<void> {
     polling = false;
   }
 }
-window.setInterval(() => void pollEvents(), 150);
+// Quick while a task runs or events are arriving; once a second when the app is idle.
+function pollDelay(): number {
+  return document.body.classList.contains("running") || Date.now() - lastEventAt < 5000 ? 150 : 1000;
+}
+async function pollLoop(): Promise<void> {
+  await pollEvents();
+  window.setTimeout(() => void pollLoop(), pollDelay());
+}
+void pollLoop();
 
 // ---- Types -------------------------------------------------------------------------------------
 
@@ -68,7 +78,7 @@ interface RunStep {
   action: Record<string, unknown> | null;
   outcome: string;
   window: string;
-  screenshot: string | null;
+  hasScreenshot: boolean;
 }
 
 interface Schedule {
@@ -1059,6 +1069,27 @@ const STATUS_LABEL: Record<string, string> = { completed: "Done", stopped: "Stop
 
 let mistakeStep: number | null = null;
 
+// Step screenshots load one by one as their cards scroll into view, as small JPEGs.
+const shotLoader = new IntersectionObserver(
+  (entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      const card = entry.target as HTMLElement & { stepRef?: { id: string; index: number } };
+      shotLoader.unobserve(card);
+      const ref = card.stepRef;
+      const img = card.querySelector("img");
+      if (!ref || !img) continue;
+      void invoke<string | null>("get_step_screenshot", { id: ref.id, index: ref.index })
+        .then((url) => {
+          if (url) img.src = url;
+          else img.remove();
+        })
+        .catch(() => img.remove());
+    }
+  },
+  { rootMargin: "0px 400px" },
+);
+
 async function showRun(id: string): Promise<void> {
   const host = $("run-detail");
   let detail: { run: RunSummary; steps: RunStep[] };
@@ -1094,9 +1125,10 @@ async function showRun(id: string): Promise<void> {
     card.style.animationDelay = `${Math.min(i, 10) * 35}ms`;
     const kind = outcomeKind(step.outcome);
     card.innerHTML = `
-      <div class="step-shot">${step.screenshot ? `<img loading="lazy" alt="" />` : ""}<span class="num">${step.index}</span><span class="result ${kind}">${OUTCOME_LABEL[kind]}</span></div>
+      <div class="step-shot">${step.hasScreenshot ? `<img alt="" />` : ""}<span class="num">${step.index}</span><span class="result ${kind}">${OUTCOME_LABEL[kind]}</span></div>
       <div class="step-body"><div class="step-action"></div><div class="step-thought"></div></div>`;
-    if (step.screenshot) card.querySelector("img")!.src = step.screenshot;
+    if (step.hasScreenshot) shotLoader.observe(card);
+    (card as HTMLElement & { stepRef?: { id: string; index: number } }).stepRef = { id, index: step.index };
     const target = step.target ? ` · ${step.target}` : "";
     const what = describeAction(step.action);
     card.querySelector(".step-action")!.textContent = `${what.charAt(0).toUpperCase()}${what.slice(1)}${target}`;
@@ -1145,7 +1177,13 @@ async function review(input: Record<string, unknown>): Promise<void> {
 autosize();
 void loadVoice();
 void loadPresets().then(checkConnection);
-window.setInterval(() => {
-  if (!running && document.visibilityState === "visible") void checkConnection();
-}, 120_000);
+// The status is checked when the app opens and again when it comes back to the front after a
+// while, not on a timer, so the server (and the API key) is not contacted all day for nothing.
+let lastConnectionCheck = Date.now();
+window.addEventListener("focus", () => {
+  if (!running && Date.now() - lastConnectionCheck > 5 * 60_000) {
+    lastConnectionCheck = Date.now();
+    void checkConnection();
+  }
+});
 task.focus();

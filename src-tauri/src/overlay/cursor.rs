@@ -71,8 +71,20 @@ pub fn arrow_pixels(size: i32) -> Vec<[u8; 4]> {
         .collect()
 }
 
+/// The cursor size for the main monitor's *current* scale. `GetSystemMetrics` answers for the scale
+/// Windows had at sign-in, so after the user changes the scale it would be too small or too big.
 fn cursor_size() -> i32 {
-    let size = unsafe { GetSystemMetrics(SM_CXCURSOR) };
+    use windows_sys::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
+    use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI};
+    let size = unsafe {
+        let (mut dx, mut dy) = (0u32, 0u32);
+        let monitor = MonitorFromPoint(windows_sys::Win32::Foundation::POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) == 0 && dx > 0 {
+            GetSystemMetricsForDpi(SM_CXCURSOR, dx)
+        } else {
+            GetSystemMetrics(SM_CXCURSOR)
+        }
+    };
     if (16..=256).contains(&size) { size } else { 32 }
 }
 
@@ -123,6 +135,7 @@ pub fn show_working_cursor() {
         REPLACED.store(false, Ordering::SeqCst);
         return;
     };
+    crate::recovery::note_cursor(true);
     unsafe {
         for id in [OCR_NORMAL, OCR_IBEAM, OCR_HAND] {
             // SetSystemCursor takes ownership of the handle it is given, so each gets a copy.
@@ -144,6 +157,7 @@ pub fn restore() {
     unsafe {
         SystemParametersInfoW(SPI_SETCURSORS, 0, std::ptr::null_mut(), SPIF_SENDCHANGE);
     }
+    crate::recovery::note_cursor(false);
 }
 
 /// Restores the cursors when dropped, so an early return or panic cannot leave the working pointer behind.

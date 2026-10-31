@@ -8,7 +8,7 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
-use crate::schedule::When;
+use crate::schedule::{local_to_utc, Tz, When};
 
 /// A prompt split into the task and when it should run.
 #[derive(Debug, Clone, PartialEq)]
@@ -139,21 +139,29 @@ fn phrases() -> &'static [(&'static str, Regex, bool)] {
 
 const DAY_MS: u64 = 86_400_000;
 
-/// The next time (Unix ms) the local clock shows `minutes`, today or tomorrow.
-fn next_local(minutes: u32, now_ms: u64, tz_offset_min: i32, tomorrow: bool) -> u64 {
-    let offset = tz_offset_min as i64 * 60_000;
-    let local_now = now_ms as i64 + offset;
+/// The next time (Unix ms) the local clock shows `minutes`, today or tomorrow (with the offset in
+/// force on that day, so a daylight-saving change overnight does not shift it by an hour).
+fn next_local(minutes: u32, now_ms: u64, tz: Tz, tomorrow: bool) -> u64 {
+    let local_now = now_ms as i64 + tz.offset_at(now_ms as i64) as i64 * 60_000;
     let day_start = local_now - local_now.rem_euclid(DAY_MS as i64);
-    let mut at = day_start + minutes as i64 * 60_000 - offset;
-    if tomorrow {
-        at += DAY_MS as i64;
-    } else if at <= now_ms as i64 {
-        at += DAY_MS as i64;
+    let mut local = day_start + minutes as i64 * 60_000;
+    if tomorrow || local_to_utc(local, tz) <= now_ms as i64 {
+        local += DAY_MS as i64;
     }
-    at.max(0) as u64
+    local_to_utc(local, tz).max(0) as u64
 }
 
-fn when_of(name: &str, caps: &regex::Captures, now_ms: u64, tz: i32) -> Option<When> {
+/// Words that make a time at the end of a prompt part of the task itself: "book a meeting in
+/// 2 hours" books it now, for later; "remind me in an hour" sets a reminder now.
+fn time_belongs_to_the_task(task: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:book|booking|schedule|reschedule|remind|reminder|meeting|appointment|alarm|timer|event|calendar|reserve|reservation|deadline|due|invite|invitation|countdown)\b").expect("task words")
+    })
+    .is_match(task)
+}
+
+fn when_of(name: &str, caps: &regex::Captures, now_ms: u64, tz: Tz) -> Option<When> {
     let get = |k: &str| caps.name(k).map(|m| m.as_str().to_owned());
     match name {
         "daily_at" | "at_daily" => {
@@ -200,7 +208,8 @@ fn tidy(task: &str) -> String {
 }
 
 /// Splits `prompt` into a task and its schedule, or None when it names no schedule.
-pub fn parse(prompt: &str, now_ms: u64, tz_offset_min: i32) -> Option<Scheduled> {
+pub fn parse(prompt: &str, now_ms: u64, tz: impl Into<Tz>) -> Option<Scheduled> {
+    let tz = tz.into();
     let prompt = prompt.trim();
     // Word boundaries where the phrase may end (start of prompt) or begin (end of prompt).
     let cut_points: Vec<usize> = prompt
@@ -215,7 +224,7 @@ pub fn parse(prompt: &str, now_ms: u64, tz_offset_min: i32) -> Option<Scheduled>
             if let Some(caps) = re.captures(head.trim()) {
                 let task = tidy(tail);
                 if usable(&task) {
-                    if let Some(when) = when_of(name, &caps, now_ms, tz_offset_min) {
+                    if let Some(when) = when_of(name, &caps, now_ms, tz) {
                         return Some(Scheduled { task, when });
                     }
                 }
@@ -229,8 +238,10 @@ pub fn parse(prompt: &str, now_ms: u64, tz_offset_min: i32) -> Option<Scheduled>
             let phrase = tail.trim_matches(|c: char| c.is_whitespace() || ",;:.!".contains(c));
             if let Some(caps) = re.captures(phrase) {
                 let task = tidy(head);
-                if usable(&task) {
-                    if let Some(when) = when_of(name, &caps, now_ms, tz_offset_min) {
+                // A one-off time at the end of a booking or reminder task is the task's own time.
+                let one_off = !name.starts_with("every") && !name.contains("daily");
+                if usable(&task) && !(one_off && time_belongs_to_the_task(&task)) {
+                    if let Some(when) = when_of(name, &caps, now_ms, tz) {
                         return Some(Scheduled { task, when });
                     }
                 }
@@ -328,9 +339,9 @@ mod tests {
         assert_eq!(s.task, "open notepad and type hello");
         assert_eq!(s.when, When::Once { at_ms: NOW + 600_000 });
 
-        let s = p("remind me to stretch in an hour").unwrap();
+        let s = p("in an hour, close the browser").unwrap();
         assert_eq!(s.when, When::Once { at_ms: NOW + 3_600_000 });
-        assert_eq!(s.task, "remind me to stretch");
+        assert_eq!(s.task, "close the browser");
 
         // Local 15:30 now: "at 5pm" is today at 17:00 local = 11:30 UTC.
         let s = p("At 5pm, open the timesheet").unwrap();
@@ -353,6 +364,10 @@ mod tests {
             "open calculator and compute 12 + 30",
             "every",
             "every day at 9am",
+            "book a meeting with Sam in 2 hours",
+            "remind me to stretch in an hour",
+            "set a timer for the oven in 20 minutes",
+            "schedule the review call tomorrow at 10am",
         ] {
             assert_eq!(p(text), None, "{text}");
         }

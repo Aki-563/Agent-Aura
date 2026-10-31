@@ -154,6 +154,10 @@ fn usage() -> String {
 #[tokio::main]
 async fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
+    // Undo what a killed Aura process left behind (display scale, cursor, shortcuts), and undo
+    // this one's own changes on Ctrl+C or when the console window is closed.
+    agent_aura_lib::recovery::recover_leftovers();
+    agent_aura_lib::recovery::undo_on_console_close();
     if raw.first().map(String::as_str) == Some("schedule") {
         std::process::exit(agent_aura_lib::schedule_cli::schedule_command(&raw[1..]));
     }

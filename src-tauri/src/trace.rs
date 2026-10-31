@@ -59,6 +59,22 @@ pub fn mask_secrets(text: &str) -> String {
             }
         }
     }
+    // Password-like words typed outside a password field: letters, digits and a symbol together
+    // ("Summer2026!"), or upper and lower case with digits ("Xk9fLq2Wz"). Paths and links are not.
+    let is_delimiter = |c: char| c.is_whitespace() || "\"'`,;{}[]()<>|".contains(c);
+    let mut start = None;
+    for (i, ch) in text.char_indices().chain(std::iter::once((text.len(), ' '))) {
+        match (start, is_delimiter(ch)) {
+            (None, false) => start = Some(i),
+            (Some(from), true) => {
+                if looks_like_password(&text[from..i]) {
+                    hidden[from..i].iter_mut().for_each(|f| *f = true);
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
     let mut out = String::with_capacity(text.len());
     let mut in_hidden = false;
     for (i, ch) in text.char_indices() {
@@ -73,6 +89,18 @@ pub fn mask_secrets(text: &str) -> String {
         }
     }
     out
+}
+
+fn looks_like_password(word: &str) -> bool {
+    let word = word.trim_end_matches(['.', ':']);
+    if !(6..=64).contains(&word.chars().count()) || word.contains("://") || word.contains('/') || word.contains('\\') {
+        return false;
+    }
+    let digit = word.chars().any(|c| c.is_ascii_digit());
+    let lower = word.chars().any(|c| c.is_ascii_lowercase());
+    let upper = word.chars().any(|c| c.is_ascii_uppercase());
+    let symbol = word.chars().any(|c| "!@#$%^&*?~".contains(c));
+    digit && (lower || upper) && (symbol || (lower && upper && word.len() >= 8))
 }
 
 /// How many run folders to keep; older ones are deleted when a new run starts.
@@ -231,6 +259,19 @@ mod tests {
         assert!(!long_token.contains("AbCdEf") && long_token.ends_with(" end"), "{long_token}");
         assert_eq!(mask_secrets("a window title with ünïcode 日本語"), "a window title with ünïcode 日本語");
         assert_eq!(mask_secrets(r#"{"model":"gui-owl-1.5-2b-instruct-mlx"}"#), r#"{"model":"gui-owl-1.5-2b-instruct-mlx"}"#);
+    }
+
+    #[test]
+    fn password_like_words_are_hidden_even_without_the_word_password() {
+        let masked = mask_secrets(r#"{"type":"type_text","text":"Summer2026!"} then Xk9fLq2Wzp in the box"#);
+        assert!(!masked.contains("Summer2026") && !masked.contains("Xk9fLq2Wzp"), "{masked}");
+        for plain in [
+            "open https://example.com/a1b2?x=3 and C:\\Users\\nbz14\\file2.txt",
+            "press Ctrl+F4, then type 12:30pm and Q3-2024 report",
+            "iphone15 pro costs $1,299.99",
+        ] {
+            assert_eq!(mask_secrets(plain), plain);
+        }
     }
 
     #[test]

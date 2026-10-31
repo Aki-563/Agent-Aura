@@ -266,6 +266,12 @@ impl GlowRenderer {
             let mut last_frame = Instant::now();
             let mut hidden = true;
             let mut last_topmost = Instant::now();
+            // Only what was drawn is cleared each frame (the edge bands, the pill strip, ripples),
+            // not the whole screen-sized buffer: the middle of the screen is never drawn on.
+            let mut drawn_spots: Vec<(i32, i32, i32, i32)> = Vec::new();
+            let mut cleared_all = false;
+            let mut ui = Self::ui_scale();
+            let mut ui_checked = Instant::now();
 
             while running.load(Ordering::SeqCst) {
                 let frame_start = Instant::now();
@@ -348,10 +354,26 @@ impl GlowRenderer {
                     }
                 }
 
-                // Clear premultiplied ARGB buffer to zero
-                unsafe {
-                    ptr::write_bytes(bits, 0, pixel_count * 4);
+                if ui_checked.elapsed() >= Duration::from_secs(2) {
+                    ui_checked = Instant::now();
+                    let now = Self::ui_scale();
+                    if (now - ui).abs() > 0.01 {
+                        ui = now;
+                        last_label_text = None;
+                        cleared_all = false;
+                    }
                 }
+                // Clear what the last frame drew (the whole buffer only the first time).
+                if !cleared_all {
+                    unsafe { ptr::write_bytes(bits, 0, pixel_count * 4) };
+                    cleared_all = true;
+                } else {
+                    let buffer_slice = unsafe { std::slice::from_raw_parts_mut(bits as *mut u32, pixel_count) };
+                    for rect in Self::fixed_regions(width, height, -window.bounds().1, ui).into_iter().chain(drawn_spots.drain(..)) {
+                        Self::clear_rect(buffer_slice, width, height, rect);
+                    }
+                }
+                let mut calm = true;
 
                 {
                     let buffer_slice = unsafe {
@@ -387,7 +409,7 @@ impl GlowRenderer {
                     if let Some(text) = current_state.label() {
                         if last_label_text != Some(text) {
                             label_prev = label_cur.take().map(|(_, mask)| mask);
-                            label_cur = Self::render_label_mask(text).map(|mask| (text, mask));
+                            label_cur = Self::render_label_mask(text, ui).map(|mask| (text, mask));
                             label_changed = Instant::now();
                             last_label_text = Some(text);
                         }
@@ -401,15 +423,15 @@ impl GlowRenderer {
                         if swap >= 1.0 {
                             label_prev = None;
                         }
-                        let target_w = (mask.width + PILL_CHROME) as f32;
+                        let target_w = mask.width as f32 + PILL_CHROME as f32 * ui;
                         if pill_w_disp < 1.0 || just_shown {
                             pill_w_disp = target_w;
                         } else {
                             pill_w_disp += (target_w - pill_w_disp) * (1.0 - (-dt / 0.10).exp());
                         }
                         let scale = 0.90 + 0.10 * master;
-                        let (pill_w, pill_h) = (pill_w_disp * scale, 44.0 * scale);
-                        let top = -vy + 22 - ((1.0 - master) * 12.0) as i32;
+                        let (pill_w, pill_h) = (pill_w_disp * scale, 44.0 * ui * scale);
+                        let top = -vy + (22.0 * ui) as i32 - ((1.0 - master) * 12.0 * ui) as i32;
                         let has_prev = label_prev.is_some();
                         let mut lines: Vec<(&LabelMask, f32, f32)> = Vec::new();
                         if let Some(prev) = label_prev.as_ref() {
@@ -417,7 +439,11 @@ impl GlowRenderer {
                         }
                         lines.push((mask, if has_prev { swap } else { 1.0 }, if has_prev { 6.0 * (1.0 - swap) } else { 0.0 }));
                         let dot_pulse = 0.85 + 0.15 * (elapsed_secs * 3.0).sin();
-                        Self::render_label_pill(buffer_slice, width, height, center_x, top, pill_w, pill_h, &lines, &color_cur, master, dot_pulse);
+                        Self::render_label_pill(buffer_slice, width, height, center_x, top, pill_w, pill_h, &lines, &color_cur, master, dot_pulse, ui);
+                    }
+
+                    if label_prev.is_some() || (pill_w_disp - label_cur.as_ref().map(|(_, m)| m.width as f32 + PILL_CHROME as f32 * ui).unwrap_or(pill_w_disp)).abs() > 0.5 {
+                        calm = false;
                     }
 
                     // 3. Render Glowing Halo Cursor
@@ -432,6 +458,8 @@ impl GlowRenderer {
 
                         if cx >= 0 && cx < width && cy >= 0 && cy < height {
                             Self::render_halo_cursor(buffer_slice, width, height, cx, cy, &color, 0.85 * master);
+                            drawn_spots.push((cx - 24, cy - 24, cx + 24, cy + 24));
+                            calm = false;
                         }
                     }
 
@@ -443,6 +471,9 @@ impl GlowRenderer {
 
                         let radius = 10.0 + (ripple.max_radius - 10.0) * progress;
                         let ripple_alpha = (1.0 - ease_out(progress)) * 0.9 * master;
+                        let reach = ripple.max_radius.ceil() as i32 + 8;
+                        drawn_spots.push((ripple.center_x - reach, ripple.center_y - reach, ripple.center_x + reach, ripple.center_y + reach));
+                        calm = false;
 
                         Self::render_ripple_ring(
                             buffer_slice,
@@ -482,9 +513,13 @@ impl GlowRenderer {
                     );
                 }
 
+                // Fades, colour changes, word swaps and ripples run at 60 fps; a steady glow whose
+                // only motion is the slow drift and breathing looks the same at 30 and costs half.
+                let changing = master_p < 1.0 || color_started.elapsed().as_secs_f32() < COLOR_TRANSITION_SECS || !active;
+                let frame_dur = if calm && !changing { target_frame_dur * 2 } else { target_frame_dur };
                 let elapsed_frame = frame_start.elapsed();
-                if elapsed_frame < target_frame_dur {
-                    thread::sleep(target_frame_dur - elapsed_frame);
+                if elapsed_frame < frame_dur {
+                    thread::sleep(frame_dur - elapsed_frame);
                 }
             }
 
@@ -557,6 +592,41 @@ impl GlowRenderer {
 
             SelectObject(hdc_mem, hbmp);
             Ok((hdc_mem, hbmp, bits as *mut u8))
+        }
+    }
+
+    /// The parts of the overlay drawn on every frame: the four edge bands and the strip at the top
+    /// that holds the status pill. Everything else stays transparent unless a ripple is drawn.
+    fn fixed_regions(width: i32, height: i32, pill_origin_y: i32, ui: f32) -> [(i32, i32, i32, i32); 5] {
+        let g = Self::glow_depth(height).min(width / 2).min(height / 2).max(1);
+        let strip = ((22.0 + 44.0) * ui + 24.0) as i32;
+        [(0, 0, width, g), (0, height - g, width, height), (0, 0, g, height), (width - g, 0, width, height), (0, pill_origin_y - 16, width, pill_origin_y + strip)]
+    }
+
+    /// Display scale of the main monitor (1.0 at 100 %, 1.5 at 150 %): the status pill is drawn
+    /// at that size, so it is as readable on a 4K screen as on a 1080p one.
+    fn ui_scale() -> f32 {
+        use windows_sys::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
+        use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+        let (mut dx, mut dy) = (96u32, 96u32);
+        unsafe {
+            let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+            if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) != 0 {
+                return 1.0;
+            }
+        }
+        (dx as f32 / 96.0).clamp(1.0, 3.0)
+    }
+
+    fn clear_rect(buffer: &mut [u32], width: i32, height: i32, (x0, y0, x1, y1): (i32, i32, i32, i32)) {
+        let (x0, x1) = (x0.clamp(0, width), x1.clamp(0, width));
+        let (y0, y1) = (y0.clamp(0, height), y1.clamp(0, height));
+        if x0 >= x1 {
+            return;
+        }
+        for y in y0..y1 {
+            let row = (y * width) as usize;
+            buffer[row + x0 as usize..row + x1 as usize].fill(0);
         }
     }
 
@@ -690,7 +760,7 @@ impl GlowRenderer {
 
     /// Draws `text` with GDI (Segoe UI, anti-aliased) into a white-on-black bitmap and keeps the
     /// brightness as a coverage mask, because GDI cannot write the alpha channel itself.
-    fn render_label_mask(text: &str) -> Option<LabelMask> {
+    fn render_label_mask(text: &str, ui: f32) -> Option<LabelMask> {
         use windows_sys::Win32::Graphics::Gdi::{
             CreateFontW, GetTextExtentPoint32W, SetBkMode, SetTextColor, TextOutW, ANTIALIASED_QUALITY, FW_SEMIBOLD,
         };
@@ -702,7 +772,7 @@ impl GlowRenderer {
             if hdc.is_null() {
                 return None;
             }
-            let font = CreateFontW(-20, 0, 0, 0, FW_SEMIBOLD as i32, 0, 0, 0, 1, 0, 0, ANTIALIASED_QUALITY as u32, 0, face.as_ptr());
+            let font = CreateFontW(-(20.0 * ui).round() as i32, 0, 0, 0, FW_SEMIBOLD as i32, 0, 0, 0, 1, 0, 0, ANTIALIASED_QUALITY as u32, 0, face.as_ptr());
             let old_font = SelectObject(hdc, font);
             let mut size = SIZE { cx: 0, cy: 0 };
             GetTextExtentPoint32W(hdc, wide.as_ptr(), wide.len() as i32, &mut size);
@@ -751,6 +821,7 @@ impl GlowRenderer {
         color: &[f32; 3],
         opacity: f32,
         dot_pulse: f32,
+        ui: f32,
     ) {
         if opacity <= 0.003 || pill_w < 4.0 {
             return;
@@ -759,9 +830,9 @@ impl GlowRenderer {
         let top_f = top as f32;
         let radius = pill_h / 2.0;
         let (cx, cy) = (center_x as f32, top_f + pill_h / 2.0);
-        let dot_cx = left_f + 24.0;
-        let text_area_left = left_f + 24.0 + 14.0;
-        let text_area_w = (pill_w - (24.0 + 14.0) - 22.0).max(1.0);
+        let dot_cx = left_f + 24.0 * ui;
+        let text_area_left = left_f + (24.0 + 14.0) * ui;
+        let text_area_w = (pill_w - (24.0 + 14.0) * ui - 22.0 * ui).max(1.0);
         let tint_line = [255.0 * 0.7 + color[0] * 0.3, 255.0 * 0.7 + color[1] * 0.3, 255.0 * 0.7 + color[2] * 0.3];
 
         let x0 = (left_f.floor() as i32 - 2).max(0);
@@ -792,9 +863,9 @@ impl GlowRenderer {
                 let ddx = x as f32 + 0.5 - dot_cx;
                 let ddy = y as f32 + 0.5 - cy;
                 let dd = ddx.hypot(ddy);
-                if dd < 11.0 {
-                    let core = (5.5 - dd).clamp(0.0, 1.0);
-                    let halo = (1.0 - (dd / 11.0)).clamp(0.0, 1.0).powi(2) * 0.38 * dot_pulse;
+                if dd < 11.0 * ui {
+                    let core = (5.5 * ui - dd).clamp(0.0, 1.0);
+                    let halo = (1.0 - (dd / (11.0 * ui))).clamp(0.0, 1.0).powi(2) * 0.38 * dot_pulse;
                     let cover = (core * (0.55 + 0.45 * dot_pulse) + halo).clamp(0.0, 1.0);
                     r = r * (1.0 - cover) + color[0] * cover;
                     g = g * (1.0 - cover) + color[1] * cover;
@@ -813,7 +884,7 @@ impl GlowRenderer {
                     if tx >= 0 && ty >= 0 && tx < mask.width && ty < mask.height && (tx as f32) < text_area_w + 4.0 {
                         // While the capsule is still narrower than its words (it is growing), the
                         // words fade at the edge instead of being cut; at full width nothing fades.
-                        let tail = ((text_area_w + 4.0 - tx as f32) / 8.0).clamp(0.0, 1.0);
+                        let tail = ((text_area_w + 4.0 - tx as f32) / (8.0 * ui)).clamp(0.0, 1.0);
                         let cover = mask.coverage[(ty * mask.width + tx) as usize] as f32 / 255.0 * line_opacity * opacity * tail;
                         r = r * (1.0 - cover) + 255.0 * cover;
                         g = g * (1.0 - cover) + 255.0 * cover;
@@ -914,7 +985,7 @@ mod tests {
 
     #[test]
     fn the_label_text_is_drawn_into_a_mask_and_the_pill_paints_pixels() {
-        let Some(mask) = GlowRenderer::render_label_mask("Taking screenshot") else {
+        let Some(mask) = GlowRenderer::render_label_mask("Taking screenshot", 1.0) else {
             println!("no GDI in this environment, skipping");
             return;
         };
@@ -925,12 +996,12 @@ mod tests {
         let c = HudState::Thinking.base_color();
         let color = [c.r as f32, c.g as f32, c.b as f32];
         let lines = [(&mask, 1.0f32, 0.0f32)];
-        GlowRenderer::render_label_pill(&mut buffer, w, h, 300, 20, (mask.width + 60) as f32, 44.0, &lines, &color, 1.0, 1.0);
+        GlowRenderer::render_label_pill(&mut buffer, w, h, 300, 20, (mask.width + 60) as f32, 44.0, &lines, &color, 1.0, 1.0, 1.0);
         let painted = buffer.iter().filter(|px| (*px >> 24) > 0).count();
         assert!(painted > 2000, "the pill should cover a few thousand pixels, got {painted}");
         // Fully faded out it paints nothing, and halfway it is partly transparent.
         let mut empty = vec![0u32; (w * h) as usize];
-        GlowRenderer::render_label_pill(&mut empty, w, h, 300, 20, (mask.width + 60) as f32, 44.0, &lines, &color, 0.0, 1.0);
+        GlowRenderer::render_label_pill(&mut empty, w, h, 300, 20, (mask.width + 60) as f32, 44.0, &lines, &color, 0.0, 1.0, 1.0);
         assert!(empty.iter().all(|px| *px == 0));
         // Premultiplied: no colour channel may exceed alpha.
         assert!(buffer.iter().all(|px| ((px >> 16) & 0xFF) <= (px >> 24) && ((px >> 8) & 0xFF) <= (px >> 24) && (px & 0xFF) <= (px >> 24)));
@@ -990,9 +1061,9 @@ mod tests {
         let base = state.base_color();
         let color = [base.r as f32, base.g as f32, base.b as f32];
         GlowRenderer::render_edge_glow(&mut buffer, w, h, &color, &state.accent_color(), 1.0, 1.3);
-        let mask = GlowRenderer::render_label_mask("Thinking").unwrap();
+        let mask = GlowRenderer::render_label_mask("Thinking", 1.0).unwrap();
         let lines = vec![(&mask, 1.0f32, 0.0f32)];
-        GlowRenderer::render_label_pill(&mut buffer, w, h, w / 2, 22, (mask.width + PILL_CHROME) as f32, 44.0, &lines, &color, 1.0, 1.0);
+        GlowRenderer::render_label_pill(&mut buffer, w, h, w / 2, 22, (mask.width + PILL_CHROME) as f32, 44.0, &lines, &color, 1.0, 1.0, 1.0);
         // Composite over a mid-grey desktop with a white window, plus the pointer at (800, 450).
         let mut image = image::RgbaImage::new(w as u32, h as u32);
         for y in 0..h {

@@ -178,26 +178,45 @@ pub fn token_path() -> std::path::PathBuf {
     crate::settings::path().with_file_name("control.token")
 }
 
-fn load_or_create_token() -> String {
+/// Length of a token made by [`new_token`] (hex). Older, shorter tokens were derived from the clock
+/// and process id and could be guessed, so they are replaced.
+const TOKEN_HEX_LEN: usize = 64;
+
+/// 32 bytes from the system's cryptographic random generator, as hex.
+pub fn new_token() -> Result<String, String> {
+    use windows_sys::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
+    let mut bytes = [0u8; 32];
+    let status = unsafe { BCryptGenRandom(std::ptr::null_mut(), bytes.as_mut_ptr(), bytes.len() as u32, BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
+    if status != 0 {
+        return Err(format!("Windows gave no random bytes (status {status:#x})"));
+    }
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn load_or_create_token() -> Result<String, String> {
     if let Ok(token) = std::fs::read_to_string(token_path()) {
-        if token.trim().len() >= 16 {
-            return token.trim().to_owned();
+        let token = token.trim();
+        if token.len() == TOKEN_HEX_LEN && token.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(token.to_owned());
         }
     }
-    let seed = format!("{:?}{}{}", Instant::now(), std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
-    use sha2::Digest;
-    let token = format!("{:x}", sha2::Sha256::digest(seed.as_bytes()))[..32].to_owned();
+    let token = new_token()?;
     if let Some(parent) = token_path().parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(token_path(), &token);
-    token
+    std::fs::write(token_path(), &token).map_err(|e| format!("could not save the control token: {e}"))?;
+    Ok(token)
+}
+
+/// Compares in time that does not depend on where the first difference is.
+fn same_token(given: &str, token: &str) -> bool {
+    given.len() == token.len() && given.bytes().zip(token.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
 }
 
 /// Answers one control line: `<token> stop|pause|resume|status|steer <text>`.
 pub fn handle_command(line: &str, token: &str) -> String {
     let mut parts = line.trim().splitn(3, ' ');
-    if parts.next() != Some(token) {
+    if !parts.next().is_some_and(|given| same_token(given, token)) {
         return "error: wrong or missing token".into();
     }
     match (parts.next().unwrap_or(""), parts.next().unwrap_or("")) {
@@ -227,7 +246,7 @@ pub fn handle_command(line: &str, token: &str) -> String {
 pub async fn serve_port(port: u16) -> Result<u16, String> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.map_err(|e| format!("control port {port}: {e}"))?;
     let bound = listener.local_addr().map(|a| a.port()).unwrap_or(port);
-    let token = load_or_create_token();
+    let token = load_or_create_token()?;
     tokio::spawn(async move {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         while let Ok((stream, _)) = listener.accept().await {
@@ -280,6 +299,15 @@ mod tests {
         resume();
         assert!(interrupted_since(paused_epoch), "a resume also invalidates what was decided before");
         end_run();
+    }
+
+    #[test]
+    fn tokens_are_random_and_compared_exactly() {
+        let (a, b) = (new_token().unwrap(), new_token().unwrap());
+        assert_eq!(a.len(), TOKEN_HEX_LEN);
+        assert_ne!(a, b, "two tokens never match");
+        assert!(same_token(&a, &a.clone()) && !same_token(&a, &b) && !same_token(&a, &a[..63]));
+        assert_eq!(handle_command("wrong status", &a), "error: wrong or missing token");
     }
 
     #[test]

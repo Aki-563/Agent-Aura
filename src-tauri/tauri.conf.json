@@ -47,6 +47,7 @@
     "publisher": "Agent Aura",
     "shortDescription": "Windows desktop agent",
     "windows": {
+      "signCommand": "..\\tools\\sign.cmd %1",
       "nsis": {
         "installMode": "currentUser"
       },

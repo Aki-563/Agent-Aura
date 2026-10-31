@@ -16,7 +16,7 @@ crate-type = ["rlib"]
 tauri-build = { version = "2.7.4", features = [] }
 
 [dependencies]
-tauri = { version = "2.12.5", default-features = false, features = ["wry", "compression", "dynamic-acl", "custom-protocol"] }
+tauri = { version = "2.12.5", default-features = false, features = ["wry", "compression", "dynamic-acl", "custom-protocol", "tray-icon"] }
 tauri-plugin-log = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
@@ -71,7 +71,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Accessibility",
     "Win32_System_StationsAndDesktops",
     "Win32_Storage_Xps",
-    "Win32_Devices_Display"
+    "Win32_Devices_Display",
+    "Win32_System_Console"
 ] }
 
 

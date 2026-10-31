@@ -54,6 +54,10 @@ pub fn schedule_command(args: &[String]) -> i32 {
                     return 2;
                 }
             };
+            if let Err(error) = schedule::check_repeat(&when) {
+                eprintln!("{error}");
+                return 2;
+            }
             let overlap = match value("--overlap").as_deref() {
                 Some("queue") => Overlap::QueueOne,
                 Some("cancel") => Overlap::CancelPrevious,
@@ -61,7 +65,7 @@ pub fn schedule_command(args: &[String]) -> i32 {
             };
             let missed = if value("--missed").as_deref() == Some("skip") { Missed::Skip } else { Missed::RunOnce };
             let only_if_changed = args.iter().any(|a| a == "--only-if-changed");
-            match store.add(&task, when, overlap, missed, only_if_changed, schedule::now_ms(), schedule::local_offset_minutes()) {
+            match store.add(&task, when, overlap, missed, only_if_changed, schedule::now_ms(), schedule::Tz::Local) {
                 Ok(id) => match store.save(&root) {
                     Ok(()) => {
                         println!("added {id}; a running `aura-cli daemon` picks it up within a minute");

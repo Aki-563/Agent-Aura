@@ -91,6 +91,8 @@ pub struct ShortcutGuard {
 impl ShortcutGuard {
     pub fn engage() -> Self {
         let before = accessibility();
+        // Written down first, so a crash or force-close is undone on the next start.
+        crate::recovery::note_shortcuts(Some((before.sticky_hotkey, before.filter_hotkey, before.toggle_hotkey)));
         set_shortcuts(false, false, false, &before);
         Self { before }
     }
@@ -100,7 +102,13 @@ impl Drop for ShortcutGuard {
     fn drop(&mut self) {
         let before = self.before;
         set_shortcuts(before.sticky_hotkey, before.filter_hotkey, before.toggle_hotkey, &before);
+        crate::recovery::note_shortcuts(None);
     }
+}
+
+/// Puts the three shortcut settings back to these values (recovery after a crash).
+pub fn restore_shortcuts(sticky_hotkey: bool, filter_hotkey: bool, toggle_hotkey: bool) {
+    set_shortcuts(sticky_hotkey, filter_hotkey, toggle_hotkey, &accessibility());
 }
 
 fn set_shortcuts(sticky_hotkey: bool, filter_hotkey: bool, toggle_hotkey: bool, current: &Accessibility) {

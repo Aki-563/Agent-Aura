@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 
 use crate::agent::{execute_run, unattended_host, AgentRuntime};
-use crate::schedule::{self, Missed, Overlap, RunReport, Runner, Schedule, Store, When};
+use crate::schedule::{self, Missed, Overlap, RunReport, Runner, Schedule, Store, Tz, When};
 
 struct Shared {
     store: Arc<Mutex<Store>>,
@@ -36,10 +36,24 @@ pub fn start(app: AppHandle) {
                 return RunReport { summary: "skipped: no window".to_owned(), screen_hash: None };
             };
             let state = app.state::<AgentRuntime>();
-            let host = unattended_host(window);
-            let summary = match execute_run(&state, &host, schedule::task_with_state(&s), 40).await {
-                Ok(r) => r.message,
-                Err(e) => format!("failed: {e}"),
+            // A task the user started is never interrupted: the scheduled run waits for it to end
+            // (up to half an hour) instead of failing with "already running".
+            let waited_since = std::time::Instant::now();
+            let summary = loop {
+                if state.is_busy() {
+                    if waited_since.elapsed() > USER_RUN_WAIT {
+                        break "skipped: another task was still running".to_owned();
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+                let host = unattended_host(window.clone());
+                match execute_run(&state, &host, schedule::task_with_state(&s), 40).await {
+                    Ok(r) => break r.message,
+                    // Someone else started in the moment between the check and the start.
+                    Err(e) if e.contains("already running") => continue,
+                    Err(e) => break format!("failed: {e}"),
+                }
             };
             RunReport { summary, screen_hash: tokio::task::spawn_blocking(crate::schedule_cli::screen_hash).await.ok().flatten() }
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = RunReport> + Send>>
@@ -47,6 +61,9 @@ pub fn start(app: AppHandle) {
     let hash: Arc<dyn Fn() -> Option<u64> + Send + Sync> = Arc::new(crate::schedule_cli::screen_hash);
     tauri::async_runtime::spawn(schedule::run_forever(root, store, changed, runner, hash));
 }
+
+/// How long a due schedule waits for a task the user started to finish.
+const USER_RUN_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 fn describe(s: &Schedule) -> Value {
     let when = crate::schedule_prompt::describe(&s.when, schedule::local_offset_minutes());
@@ -67,6 +84,11 @@ fn with_store<T>(f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, S
     Ok(result)
 }
 
+/// Whether any schedule is switched on (then closing the window keeps Aura in the tray).
+pub fn has_enabled_schedules() -> bool {
+    SHARED.get().and_then(|s| s.store.lock().ok().map(|store| store.schedules.iter().any(|s| s.enabled))).unwrap_or(false)
+}
+
 #[tauri::command]
 pub fn list_schedules() -> Vec<Value> {
     SHARED.get().and_then(|s| s.store.lock().ok().map(|store| store.schedules.iter().map(describe).collect())).unwrap_or_default()
@@ -83,13 +105,14 @@ pub fn add_schedule(task: String, mode: String, value: String, overlap: String, 
         "daily" => When::DailyAt { times: value.split(',').map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()).collect() },
         _ => return Err("Choose \"every\" or \"daily\".".to_owned()),
     };
+    schedule::check_repeat(&when)?;
     let overlap = match overlap.as_str() {
         "queue" => Overlap::QueueOne,
         "cancel" => Overlap::CancelPrevious,
         _ => Overlap::Skip,
     };
     let missed = if missed == "skip" { Missed::Skip } else { Missed::RunOnce };
-    with_store(|store| store.add(task.trim(), when, overlap, missed, only_if_changed, schedule::now_ms(), schedule::local_offset_minutes()))
+    with_store(|store| store.add(task.trim(), when, overlap, missed, only_if_changed, schedule::now_ms(), Tz::Local))
 }
 
 #[tauri::command]
@@ -100,7 +123,7 @@ pub fn remove_schedule(id: String) -> Result<(), String> {
 #[tauri::command]
 pub fn set_schedule_enabled(id: String, enabled: bool) -> Result<(), String> {
     with_store(|store| {
-        let tz = schedule::local_offset_minutes();
+        let tz = Tz::Local;
         let s = store.schedules.iter_mut().find(|s| s.id == id).ok_or("No such schedule.")?;
         s.enabled = enabled;
         if enabled {
@@ -115,10 +138,10 @@ pub fn set_schedule_enabled(id: String, enabled: bool) -> Result<(), String> {
 /// instead of running now. Returns None when the prompt names no schedule (run it now).
 #[tauri::command]
 pub fn schedule_from_prompt(prompt: String) -> Result<Option<Value>, String> {
-    let tz = schedule::local_offset_minutes();
-    let Some(parsed) = crate::schedule_prompt::parse(&prompt, schedule::now_ms(), tz) else {
+    let Some(parsed) = crate::schedule_prompt::parse(&prompt, schedule::now_ms(), Tz::Local) else {
         return Ok(None);
     };
-    let id = with_store(|store| store.add(&parsed.task, parsed.when.clone(), Overlap::Skip, Missed::RunOnce, false, schedule::now_ms(), tz))?;
-    Ok(Some(json!({"id": id, "task": parsed.task, "when": crate::schedule_prompt::describe(&parsed.when, tz)})))
+    schedule::check_repeat(&parsed.when)?;
+    let id = with_store(|store| store.add(&parsed.task, parsed.when.clone(), Overlap::Skip, Missed::RunOnce, false, schedule::now_ms(), Tz::Local))?;
+    Ok(Some(json!({"id": id, "task": parsed.task, "when": crate::schedule_prompt::describe(&parsed.when, schedule::local_offset_minutes())})))
 }

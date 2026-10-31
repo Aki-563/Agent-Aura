@@ -80,6 +80,75 @@ fn yes() -> bool {
 const DAY_MS: i64 = 86_400_000;
 /// A run due less than this long ago is simply late, not missed.
 pub const MISSED_GRACE_MS: u64 = 60_000;
+/// A one-off ("in 10 minutes ...") that is later than this is dropped, whatever its missed-run
+/// rule: "open the timesheet at 9" should not happen at 4 in the afternoon because the PC slept.
+pub const ONE_OFF_LATE_LIMIT_MS: u64 = 15 * 60_000;
+/// Repeating schedules made in the app run at most once a minute; "every 5 seconds" would keep
+/// the agent busy without end.
+pub const MIN_REPEAT_SECONDS: u64 = 60;
+
+/// Rejects a repeat shorter than [`MIN_REPEAT_SECONDS`].
+pub fn check_repeat(when: &When) -> Result<(), String> {
+    match when {
+        When::Every { seconds } if *seconds < MIN_REPEAT_SECONDS => Err("A repeating schedule needs at least a minute between runs.".to_owned()),
+        _ => Ok(()),
+    }
+}
+
+/// Which clock daily times are read on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tz {
+    /// A fixed offset in minutes (local minus UTC); used by tests.
+    Fixed(i32),
+    /// Windows' own time zone, including daylight-saving changes on the day in question.
+    Local,
+}
+
+impl From<i32> for Tz {
+    fn from(minutes: i32) -> Self {
+        Tz::Fixed(minutes)
+    }
+}
+
+impl Tz {
+    /// Local minus UTC, in minutes, at the instant `utc_ms`.
+    pub fn offset_at(self, utc_ms: i64) -> i32 {
+        match self {
+            Tz::Fixed(minutes) => minutes,
+            Tz::Local => local_offset_at(utc_ms).unwrap_or_else(local_offset_minutes),
+        }
+    }
+}
+
+/// Local minus UTC at `utc_ms` by the Windows time-zone rules (so a date after a daylight-saving
+/// change gets that date's offset, not today's).
+pub fn local_offset_at(utc_ms: i64) -> Option<i32> {
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToFileTime, SystemTimeToTzSpecificLocalTime};
+    const EPOCH_DIFF_MS: i64 = 11_644_473_600_000;
+    let ticks = (utc_ms.checked_add(EPOCH_DIFF_MS)?).checked_mul(10_000)? as u64;
+    let utc_ft = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+    unsafe {
+        let mut utc: SYSTEMTIME = std::mem::zeroed();
+        let mut local: SYSTEMTIME = std::mem::zeroed();
+        let mut local_ft: FILETIME = std::mem::zeroed();
+        if FileTimeToSystemTime(&utc_ft, &mut utc) == 0 || SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local) == 0 || SystemTimeToFileTime(&local, &mut local_ft) == 0 {
+            return None;
+        }
+        let local_ticks = ((local_ft.dwHighDateTime as u64) << 32 | local_ft.dwLowDateTime as u64) as i64;
+        Some(((local_ticks - ticks as i64) / 10_000 / 60_000) as i32)
+    }
+}
+
+/// The UTC instant at which the local clock shows `local_ms` (local wall time as if it were UTC).
+pub(crate) fn local_to_utc(local_ms: i64, tz: Tz) -> i64 {
+    local_to_utc_with(local_ms, |ms| tz.offset_at(ms))
+}
+
+fn local_to_utc_with(local_ms: i64, offset_at: impl Fn(i64) -> i32) -> i64 {
+    let guess = local_ms - offset_at(local_ms) as i64 * 60_000;
+    local_ms - offset_at(guess) as i64 * 60_000
+}
 
 /// "HH:MM" -> minutes after midnight.
 pub fn parse_time(text: &str) -> Option<u32> {
@@ -103,7 +172,8 @@ pub fn parse_interval(text: &str) -> Option<u64> {
 }
 
 /// The first run time strictly after `after_ms`. `tz_offset_min` is local time minus UTC.
-pub fn next_run_after(when: &When, anchor_ms: u64, after_ms: u64, tz_offset_min: i32) -> Option<u64> {
+pub fn next_run_after(when: &When, anchor_ms: u64, after_ms: u64, tz: impl Into<Tz>) -> Option<u64> {
+    let tz = tz.into();
     match when {
         When::Every { seconds } => {
             let period = seconds.checked_mul(1000).filter(|p| *p > 0)?;
@@ -116,12 +186,12 @@ pub fn next_run_after(when: &When, anchor_ms: u64, after_ms: u64, tz_offset_min:
                 return None;
             }
             minutes.sort_unstable();
-            let offset_ms = tz_offset_min as i64 * 60_000;
-            let local_now = after_ms as i64 + offset_ms;
+            let local_now = after_ms as i64 + tz.offset_at(after_ms as i64) as i64 * 60_000;
             let day_start = local_now - local_now.rem_euclid(DAY_MS);
             for day in 0..3 {
                 for minute in &minutes {
-                    let utc = day_start + day * DAY_MS + *minute as i64 * 60_000 - offset_ms;
+                    // Each candidate is converted with the offset in force on its own day.
+                    let utc = local_to_utc(day_start + day * DAY_MS + *minute as i64 * 60_000, tz);
                     if utc > after_ms as i64 {
                         return Some(utc as u64);
                     }
@@ -177,7 +247,7 @@ impl Store {
         std::fs::rename(&temp, &target).map_err(|e| e.to_string())
     }
 
-    pub fn add(&mut self, task: &str, when: When, overlap: Overlap, missed: Missed, only_if_changed: bool, now_ms: u64, tz: i32) -> Result<String, String> {
+    pub fn add(&mut self, task: &str, when: When, overlap: Overlap, missed: Missed, only_if_changed: bool, now_ms: u64, tz: impl Into<Tz>) -> Result<String, String> {
         let next = next_run_after(&when, now_ms, now_ms, tz).ok_or("that schedule never runs (check the interval or the HH:MM times)")?;
         let id = format!("s{}", self.schedules.iter().filter_map(|s| s.id.trim_start_matches('s').parse::<u32>().ok()).max().unwrap_or(0) + 1);
         self.schedules.push(Schedule {
@@ -202,15 +272,22 @@ impl Store {
     /// grace period late was missed (the computer slept, Aura was closed). Its time is advanced
     /// for good; it runs once now only when its policy says so. Every returned schedule has its
     /// next time moved forward already, so a run that takes long cannot be started twice.
-    pub fn take_due(&mut self, now_ms: u64, tz: i32) -> Vec<Schedule> {
+    pub fn take_due(&mut self, now_ms: u64, tz: impl Into<Tz>) -> Vec<Schedule> {
+        let tz = tz.into();
         let mut due = Vec::new();
         for s in self.schedules.iter_mut().filter(|s| s.enabled && s.next_run_ms <= now_ms) {
-            let missed = now_ms - s.next_run_ms > MISSED_GRACE_MS;
+            let late = now_ms - s.next_run_ms;
+            let missed = late > MISSED_GRACE_MS;
             let snapshot = s.clone();
             s.next_run_ms = next_run_after(&s.when, s.anchor_ms, now_ms, tz).unwrap_or(u64::MAX);
             if matches!(s.when, When::Once { .. }) {
                 // A one-off schedule has done its job (or missed it for good).
                 s.enabled = false;
+                if late > ONE_OFF_LATE_LIMIT_MS {
+                    s.last_run_ms = Some(now_ms);
+                    s.last_summary = format!("missed: Aura was not running at the time ({} min late), so it did not run", late / 60_000);
+                    continue;
+                }
             }
             if !(missed && s.missed == Missed::Skip) {
                 due.push(snapshot);
@@ -273,6 +350,13 @@ pub fn should_run(schedule: &Schedule, current_hash: Option<u64>) -> bool {
 /// due time (or at most once an hour to re-read the clock), starts runs through `runner`, and
 /// applies the overlap policy. `changed` lets the caller wake it when schedules are edited.
 pub async fn run_forever(data_root: std::path::PathBuf, store: Arc<Mutex<Store>>, changed: Arc<tokio::sync::Notify>, runner: Runner, current_hash: Arc<dyn Fn() -> Option<u64> + Send + Sync>) {
+    // Only one process serves a schedule file: a second app window or an `aura-cli daemon` next
+    // to the app would otherwise start every due run twice.
+    let Some(_only_runner) = crate::single_instance::try_acquire("scheduler", &data_root) else {
+        log::warn!("another Agent Aura process already runs the schedules in {}", data_root.display());
+        eprintln!("[aura] another Agent Aura process already runs these schedules; this one will not");
+        return;
+    };
     let active: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let queued: Arc<Mutex<Option<Schedule>>> = Arc::new(Mutex::new(None));
     let mut last_tick = now_ms();
@@ -292,7 +376,7 @@ pub async fn run_forever(data_root: std::path::PathBuf, store: Arc<Mutex<Store>>
                 Ok(g) => g,
                 Err(_) => continue,
             };
-            let due = guard.take_due(now, local_offset_minutes());
+            let due = guard.take_due(now, Tz::Local);
             let _ = guard.save(&data_root);
             due
         };
@@ -414,6 +498,47 @@ mod tests {
     }
 
     #[test]
+    fn a_one_off_far_past_its_time_is_dropped_not_run_late() {
+        let mut store = Store::default();
+        let soon = store.add("open the timesheet", When::Once { at_ms: T0 + 10 * MIN }, Overlap::Skip, Missed::RunOnce, false, T0, 0).unwrap();
+        let later = store.add("close Teams", When::Once { at_ms: T0 + 20 * MIN }, Overlap::Skip, Missed::RunOnce, false, T0, 0).unwrap();
+        // Five minutes late is still fine; the PC then sleeps for hours past the second one.
+        assert_eq!(store.take_due(T0 + 15 * MIN, 0).iter().map(|s| s.id.clone()).collect::<Vec<_>>(), vec![soon]);
+        assert!(store.take_due(T0 + 6 * 60 * MIN, 0).is_empty(), "hours late: not run");
+        let dropped = store.schedules.iter().find(|s| s.id == later).unwrap();
+        assert!(!dropped.enabled && dropped.last_summary.starts_with("missed"), "{dropped:?}");
+    }
+
+    #[test]
+    fn repeats_shorter_than_a_minute_are_refused() {
+        assert!(check_repeat(&When::Every { seconds: 5 }).is_err());
+        assert!(check_repeat(&When::Every { seconds: 60 }).is_ok());
+        assert!(check_repeat(&When::Once { at_ms: T0 }).is_ok());
+    }
+
+    #[test]
+    fn local_time_uses_the_windows_zone_rules() {
+        let now = now_ms() as i64;
+        assert_eq!(Tz::Local.offset_at(now), local_offset_minutes());
+        // Daily times on the local clock land on that local time, whatever the zone.
+        let next = next_run_after(&When::DailyAt { times: vec!["09:00".into()] }, now as u64, now as u64, Tz::Local).unwrap() as i64;
+        let local = next + Tz::Local.offset_at(next) as i64 * 60_000;
+        assert_eq!(local.rem_euclid(DAY_MS), 9 * 3_600_000);
+    }
+
+    #[test]
+    fn a_daylight_saving_change_moves_the_utc_time_not_the_local_time() {
+        // A made-up zone that is UTC+1 before T0 + 1 day and UTC+2 after (clocks go forward).
+        let switch = T0 as i64 + DAY_MS;
+        let tz = |ms: i64| if ms < switch { 60 } else { 120 };
+        // 09:00 local on the day after the switch: 07:00 UTC, not 08:00.
+        let local = (T0 as i64 + 2 * DAY_MS) - (T0 as i64 + 2 * DAY_MS).rem_euclid(DAY_MS) + 9 * 3_600_000;
+        assert_eq!(local_to_utc_with(local, tz).rem_euclid(DAY_MS), 7 * 3_600_000);
+        // The day before the switch it is 08:00 UTC.
+        assert_eq!(local_to_utc_with(local - 2 * DAY_MS, tz).rem_euclid(DAY_MS), 8 * 3_600_000);
+    }
+
+    #[test]
     fn schedules_survive_a_restart_and_only_if_changed_compares_hashes() {
         let dir = std::env::temp_dir().join(format!("aura-sched-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -472,6 +597,25 @@ mod tests {
         let runs = counter.load(std::sync::atomic::Ordering::SeqCst);
         assert!((3..=4).contains(&runs), "about one run per second for 3.6 s, got {runs}");
         task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn only_one_scheduler_serves_a_schedule_file() {
+        let dir = std::env::temp_dir().join(format!("aura-sched-one-{}", std::process::id()));
+        let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut store = Store::default();
+        store.add("tick", When::Every { seconds: 1 }, Overlap::Skip, Missed::Skip, false, now_ms(), 0).unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let first = tokio::spawn(run_forever(dir.clone(), Arc::clone(&store), Arc::new(tokio::sync::Notify::new()), counting_runner(Arc::clone(&counter), 10), Arc::new(|| None)));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The second one returns at once instead of running the same schedules.
+        let second = run_forever(dir.clone(), Arc::clone(&store), Arc::new(tokio::sync::Notify::new()), counting_runner(Arc::clone(&counter), 10), Arc::new(|| None));
+        tokio::time::timeout(Duration::from_millis(500), second).await.expect("the second scheduler gives way");
+        tokio::time::sleep(Duration::from_millis(2300)).await;
+        let runs = counter.load(std::sync::atomic::Ordering::SeqCst);
+        assert!((2..=3).contains(&runs), "one run per second from one scheduler, got {runs}");
+        first.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

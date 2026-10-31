@@ -404,6 +404,47 @@ pub fn explicit_impact_authorized(task: &str, impact: &ImpactClass) -> bool {
     }
 }
 
+/// Personal or identifying data an action would type or visit that the task text does not
+/// contain: an e-mail address, a run of 9 or more digits (card, account, phone number), or a link
+/// to a site the task does not name that carries a query or a long path (where leaked data
+/// travels). Returns what it is, for the approval question.
+pub fn data_not_from_task(task: &str, action: &ActionPrimitive) -> Option<&'static str> {
+    let text = match action {
+        ActionPrimitive::TypeText { text, .. } => text.as_str(),
+        ActionPrimitive::OpenUrl { url } => url.as_str(),
+        _ => return None,
+    };
+    let task_lower = task.to_lowercase();
+    let task_digits: String = task.chars().filter(|c| c.is_ascii_digit()).collect();
+    // A number written in groups ("4111 1111 1111 1111", "+91 98765 43210") as a whole.
+    let all_digits: String = text.chars().filter(|c| c.is_ascii_digit()).collect();
+    if text.chars().all(|c| c.is_ascii_digit() || " -+().".contains(c)) && all_digits.len() >= 9 && !task_digits.contains(&all_digits) {
+        return Some("a long number");
+    }
+    for word in text.split(|c: char| c.is_whitespace() || ",;<>\"'()".contains(c)).filter(|w| !w.is_empty()) {
+        let lower = word.to_lowercase();
+        let is_email = lower.split_once('@').is_some_and(|(user, host)| !user.is_empty() && host.contains('.') && !host.starts_with('.'));
+        if is_email && !task_lower.contains(lower.trim_end_matches('.')) {
+            return Some("an e-mail address");
+        }
+        let digits: String = word.chars().filter(|c| c.is_ascii_digit()).collect();
+        let only_number = word.chars().all(|c| c.is_ascii_digit() || " -+().".contains(c));
+        if only_number && digits.len() >= 9 && !task_digits.contains(&digits) {
+            return Some("a long number");
+        }
+        if let Some(rest) = lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://")) {
+            let (host, tail) = rest.split_once(['/', '?']).map(|(h, _)| (h, &rest[h.len()..])).unwrap_or((rest, ""));
+            let host = host.trim_start_matches("www.");
+            let name = host.rsplit('.').nth(1).unwrap_or(host);
+            let carries_data = tail.contains('?') || tail.len() > 40;
+            if carries_data && !name.is_empty() && !task_lower.contains(name) {
+                return Some("a link with data to a site");
+            }
+        }
+    }
+    None
+}
+
 pub fn effective_impact(proposal: &ActionProposal) -> ImpactClass {
     // Editing and navigation keys, pointer moves and waiting cannot delete files, pay or send
     // anything, whatever a small model labels them: a "Destructive" backspace would only ask the
@@ -507,6 +548,26 @@ pub fn apply_candidate(action: ActionPrimitive, candidate: &GroundingCandidate) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn typed(text: &str) -> ActionPrimitive {
+        ActionPrimitive::TypeText { text: text.to_owned(), press_enter: false, overwrite: false }
+    }
+
+    #[test]
+    fn data_the_task_never_mentioned_needs_a_yes() {
+        let url = |u: &str| ActionPrimitive::OpenUrl { url: u.to_owned() };
+        // What a page could try to make the model leak.
+        assert_eq!(data_not_from_task("summarise this article", &typed("attacker@evil.example")), Some("an e-mail address"));
+        assert_eq!(data_not_from_task("check my balance", &typed("4111 1111 1111 1111")), Some("a long number"));
+        assert_eq!(data_not_from_task("check my balance", &typed("card 4111111111111111")), Some("a long number"));
+        assert_eq!(data_not_from_task("read the page", &url("https://evil.example/c?d=secret")), Some("a link with data to a site"));
+        // What the task itself gave, and ordinary navigation and typing.
+        assert_eq!(data_not_from_task("email sam@example.com the report", &typed("sam@example.com")), None);
+        assert_eq!(data_not_from_task("call 9876543210 on Teams", &typed("9876543210")), None);
+        assert_eq!(data_not_from_task("open youtube and search cats", &url("https://www.youtube.com/results?search_query=cats")), None);
+        assert_eq!(data_not_from_task("find the weather", &url("https://weather.com")), None);
+        assert_eq!(data_not_from_task("type hello", &typed("hello world 2026")), None);
+    }
 
     #[test]
     fn consequential_actions_require_explicit_task_language() {

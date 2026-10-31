@@ -22,6 +22,12 @@ use crate::input::takeover;
 
 static KILL_SWITCH_TRIGGERED: AtomicBool = AtomicBool::new(false);
 static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+static KEYS_ONLY_DURING_RUNS: AtomicBool = AtomicBool::new(false);
+
+/// The app calls this: the run keys then only act while a task runs.
+pub fn keys_only_during_runs(on: bool) {
+    KEYS_ONLY_DURING_RUNS.store(on, Ordering::SeqCst);
+}
 
 struct KillSwitchManager {
     thread_handle: Option<JoinHandle<()>>,
@@ -53,15 +59,22 @@ unsafe extern "system" fn low_level_keyboard_proc(
     if n_code >= 0 && (w_param == WM_KEYDOWN as usize || w_param == WM_SYSKEYDOWN as usize) {
         let kbd = *(l_param as *const KBDLLHOOKSTRUCT);
         let vk = kbd.vkCode as u16;
-        if takeover::is_hardware_event(kbd.flags, takeover::KEYBOARD_INJECTED_MASK) {
+        // Typing into Aura's own steer box is not the user taking the computer back.
+        if takeover::is_hardware_event(kbd.flags, takeover::KEYBOARD_INJECTED_MASK) && !takeover::own_window_has_keyboard() {
             takeover::note_user_input();
         }
+        // In the app, outside a task Esc, Pause and Ctrl+Alt+Space belong to whatever app is in
+        // front: nothing is tripped, paused or left set for the next run. (The command-line tools
+        // keep them live the whole time, since they act without a run.)
+        let in_run = !KEYS_ONLY_DURING_RUNS.load(Ordering::SeqCst) || crate::control::run_active();
         let ctrl_pressed = vk == VK_PAUSE
             && ((GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0
                 || (GetAsyncKeyState(VK_LCONTROL as i32) as u16 & 0x8000) != 0
                 || (GetAsyncKeyState(VK_RCONTROL as i32) as u16 & 0x8000) != 0);
 
-        if is_emergency_stop(vk, kbd.flags, ctrl_pressed) {
+        if !in_run {
+            // fall through to the next hook
+        } else if is_emergency_stop(vk, kbd.flags, ctrl_pressed) {
             KILL_SWITCH_TRIGGERED.store(true, Ordering::SeqCst);
         } else if takeover::is_hardware_event(kbd.flags, takeover::KEYBOARD_INJECTED_MASK) {
             // Global run controls (work whichever window is in front; injected keys never count).
@@ -88,7 +101,8 @@ unsafe extern "system" fn low_level_mouse_proc(n_code: i32, w_param: WPARAM, l_p
         let mouse = *(l_param as *const MSLLHOOKSTRUCT);
         if takeover::is_hardware_event(mouse.flags, takeover::MOUSE_INJECTED_MASK) {
             match w_param as u32 {
-                WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_MOUSEWHEEL => takeover::note_user_input(),
+                // Clicking the mini player (its speaker switch, dragging it) does not pause the run.
+                WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_MOUSEWHEEL if !takeover::on_own_window(mouse.pt.x, mouse.pt.y) => takeover::note_user_input(),
                 WM_MOUSEMOVE => takeover::note_mouse_position(mouse.pt.x, mouse.pt.y),
                 _ => {}
             }

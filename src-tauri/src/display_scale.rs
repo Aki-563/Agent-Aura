@@ -8,7 +8,7 @@
 
 use windows_sys::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_HEADER,
-    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, QDC_ONLY_ACTIVE_PATHS,
+    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_PATH_INFO, QDC_ONLY_ACTIVE_PATHS,
 };
 use windows_sys::Win32::Foundation::LUID;
 
@@ -63,7 +63,8 @@ pub fn relative_for(percent: u32, recommended: u32) -> Option<i32> {
     Some(target - base)
 }
 
-/// Adapter and source id of the first active display path (the main monitor on one-monitor PCs).
+/// Adapter and source id of the main monitor: the active display whose desktop starts at (0, 0).
+/// (The first display path is not necessarily the main monitor on a multi-monitor PC.)
 fn main_source() -> Result<(LUID, u32), String> {
     unsafe {
         let (mut paths, mut modes) = (0u32, 0u32);
@@ -74,6 +75,15 @@ fn main_source() -> Result<(LUID, u32), String> {
         let mut mode_info: Vec<DISPLAYCONFIG_MODE_INFO> = vec![std::mem::zeroed(); modes as usize];
         if QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &mut paths, path_info.as_mut_ptr(), &mut modes, mode_info.as_mut_ptr(), std::ptr::null_mut()) != 0 {
             return Err("Windows did not report the display paths".into());
+        }
+        let primary = mode_info.iter().take(modes as usize).find(|mode| {
+            mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE && {
+                let position = mode.Anonymous.sourceMode.position;
+                position.x == 0 && position.y == 0
+            }
+        });
+        if let Some(mode) = primary {
+            return Ok((mode.adapterId, mode.id));
         }
         let path = path_info.first().ok_or("no active display")?;
         Ok((path.sourceInfo.adapterId, path.sourceInfo.id))
@@ -121,7 +131,10 @@ pub struct ScaleGuard {
 
 impl ScaleGuard {
     pub fn remember() -> Result<Self, String> {
-        Ok(Self { original: get()?.current })
+        let original = get()?.current;
+        // Written down, so a killed test is put right by the next `aura-cli` or app start.
+        crate::recovery::note_scale(Some(original));
+        Ok(Self { original })
     }
 
     pub fn original(&self) -> u32 {
@@ -131,8 +144,9 @@ impl ScaleGuard {
 
 impl Drop for ScaleGuard {
     fn drop(&mut self) {
-        if let Err(error) = set(self.original) {
-            eprintln!("could not put the display scale back to {}%: {error}", self.original);
+        match set(self.original) {
+            Ok(()) => crate::recovery::note_scale(None),
+            Err(error) => eprintln!("could not put the display scale back to {}%: {error}", self.original),
         }
     }
 }

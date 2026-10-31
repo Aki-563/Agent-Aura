@@ -5,7 +5,7 @@
 //! ignored). The agent loop then pauses until the user has been quiet for a while, so the two
 //! never fight over the mouse.
 
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicIsize, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// `LLKHF_*` / `LLMHF_*` injected flags (identical bit values for keyboard and mouse hooks
@@ -22,6 +22,42 @@ static LAST_Y: AtomicI32 = AtomicI32::new(i32::MIN);
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// Aura's own window (the mini player during a run). Hovering, dragging or clicking it, or typing
+/// into it, is the user talking to Aura, not taking the computer back, so it does not pause the run.
+static OWN_WINDOW: AtomicIsize = AtomicIsize::new(0);
+
+pub fn set_own_window(hwnd: isize) {
+    OWN_WINDOW.store(hwnd, Ordering::SeqCst);
+}
+
+/// Whether the screen point lies on Aura's own (visible) window.
+pub fn on_own_window(x: i32, y: i32) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsWindowVisible};
+    let hwnd = OWN_WINDOW.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return false;
+    }
+    unsafe {
+        let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+        let mut rect = std::mem::zeroed::<windows_sys::Win32::Foundation::RECT>();
+        IsWindowVisible(hwnd) != 0 && GetWindowRect(hwnd, &mut rect) != 0 && x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+    }
+}
+
+/// Whether Aura's own window has the keyboard (the steer box is open).
+pub fn own_window_has_keyboard() -> bool {
+    let hwnd = OWN_WINDOW.load(Ordering::SeqCst);
+    hwnd != 0 && unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() } as isize == hwnd
+}
+
+/// Whether `pid` owns the window in front (pop-ups of the app being worked on).
+pub fn belongs_to_foreground_app(pid: u32) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    let mut owner = 0u32;
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut owner) };
+    owner != 0 && owner == pid
 }
 
 /// Records that the user just used the keyboard or mouse.
@@ -51,7 +87,7 @@ pub fn note_mouse_position(x: i32, y: i32) {
     if last_x == i32::MIN || (x - last_x).abs() + (y - last_y).abs() >= MOVE_THRESHOLD_PX {
         LAST_X.store(x, Ordering::SeqCst);
         LAST_Y.store(y, Ordering::SeqCst);
-        if last_x != i32::MIN {
+        if last_x != i32::MIN && !on_own_window(x, y) {
             note_user_input();
         }
     }

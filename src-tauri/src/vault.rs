@@ -17,9 +17,12 @@ pub struct SavedProvider {
     pub protocol: String,
     pub base_url: String,
     pub model: String,
-    /// DPAPI-encrypted key, base64. Empty when the provider needs no key.
+    /// DPAPI-encrypted key, base64. Empty when the provider needs no key, or when the key lives
+    /// in the saved model preset named by `preset_id` (so it is stored only once).
     #[serde(default)]
     pub api_key_encrypted: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_id: Option<String>,
 }
 
 fn path(data_root: &std::path::Path) -> std::path::PathBuf {
@@ -67,9 +70,53 @@ pub fn decrypt(encoded: &str) -> Result<String, String> {
     String::from_utf8(plain).map_err(|_| "the saved API key is damaged".to_owned())
 }
 
+/// Marks a blob encrypted by [`seal_bytes`]; older plain rows have no marker.
+const SEALED: &[u8] = b"AAS1";
+const SCREEN_ENTROPY: &[u8] = b"AgentAura.screens.v1";
+
+/// Encrypts screenshots and crops kept in the database for this Windows account only. They can
+/// show mail, chats or anything else that was on the screen. Falls back to the plain bytes only
+/// when Windows refuses (never seen in practice), so a run never loses its history over it.
+pub fn seal_bytes(plain: &[u8]) -> Vec<u8> {
+    let input = blob(plain);
+    let entropy = blob(SCREEN_ENTROPY);
+    let mut output = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
+    let ok = unsafe { CryptProtectData(&input, std::ptr::null(), &entropy, std::ptr::null(), std::ptr::null(), 0, &mut output) };
+    if ok == 0 || output.pbData.is_null() {
+        return plain.to_vec();
+    }
+    let mut sealed = SEALED.to_vec();
+    sealed.extend_from_slice(unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) });
+    unsafe { LocalFree(output.pbData as _) };
+    sealed
+}
+
+/// The plain bytes of a [`seal_bytes`] blob (older unsealed rows are returned as they are).
+pub fn open_bytes(stored: Vec<u8>) -> Option<Vec<u8>> {
+    let Some(encrypted) = stored.strip_prefix(SEALED) else { return Some(stored) };
+    let input = blob(encrypted);
+    let entropy = blob(SCREEN_ENTROPY);
+    let mut output = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
+    let ok = unsafe { CryptUnprotectData(&input, std::ptr::null_mut(), &entropy, std::ptr::null(), std::ptr::null(), 0, &mut output) };
+    if ok == 0 || output.pbData.is_null() {
+        return None;
+    }
+    let plain = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec();
+    unsafe { LocalFree(output.pbData as _) };
+    Some(plain)
+}
+
 pub fn save(data_root: &std::path::Path, protocol: &str, base_url: &str, model: &str, api_key: &str) -> Result<(), String> {
-    let saved = SavedProvider { protocol: protocol.to_owned(), base_url: base_url.to_owned(), model: model.to_owned(), api_key_encrypted: encrypt(api_key)? };
-    let text = serde_json::to_string_pretty(&saved).map_err(|e| e.to_string())?;
+    write(data_root, &SavedProvider { protocol: protocol.to_owned(), base_url: base_url.to_owned(), model: model.to_owned(), api_key_encrypted: encrypt(api_key)?, preset_id: None })
+}
+
+/// Saves the active connection as a pointer to a model preset, without a copy of its key.
+pub fn save_reference(data_root: &std::path::Path, protocol: &str, base_url: &str, model: &str, preset_id: &str) -> Result<(), String> {
+    write(data_root, &SavedProvider { protocol: protocol.to_owned(), base_url: base_url.to_owned(), model: model.to_owned(), api_key_encrypted: String::new(), preset_id: Some(preset_id.to_owned()) })
+}
+
+fn write(data_root: &std::path::Path, saved: &SavedProvider) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(saved).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(data_root).map_err(|e| e.to_string())?;
     // Write to a temporary file and rename, so a crash cannot leave half a file behind.
     let target = path(data_root);
@@ -109,6 +156,25 @@ mod tests {
         assert!(decrypt(&BASE64.encode(b"garbage bytes")).is_err());
         clear(&dir);
         assert!(load(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn screenshots_are_sealed_and_old_plain_rows_still_open() {
+        let png = b"\x89PNG fake screenshot bytes with a chat message in it".to_vec();
+        let sealed = seal_bytes(&png);
+        assert!(sealed.starts_with(SEALED) && !sealed.windows(12).any(|w| w == b"chat message"), "not readable on disk");
+        assert_eq!(open_bytes(sealed).unwrap(), png);
+        assert_eq!(open_bytes(png.clone()).unwrap(), png, "rows saved before sealing");
+        assert!(open_bytes([SEALED, b"garbage"].concat()).is_none());
+    }
+
+    #[test]
+    fn a_preset_reference_holds_no_key() {
+        let dir = std::env::temp_dir().join(format!("aura-vault-test3-{}", std::process::id()));
+        save_reference(&dir, "open_ai_responses", "https://api.openai.com/v1", "gpt-test", "p42").unwrap();
+        let (saved, key) = load(&dir).unwrap();
+        assert_eq!((saved.preset_id.as_deref(), key.as_str(), saved.api_key_encrypted.as_str()), (Some("p42"), "", ""));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
