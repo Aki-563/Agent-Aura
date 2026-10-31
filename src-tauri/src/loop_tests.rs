@@ -534,3 +534,23 @@ async fn stop_during_a_backoff_pause_ends_the_run_at_once() {
     assert!(after < std::time::Duration::from_millis(500), "stopped {after:?} after the press, during the 0.5 s backoff");
     assert_eq!(outcome.server.requests_of("aura_proposal").len(), 1, "no further request after the stop");
 }
+
+/// Regression: after a stopped run (or any Esc press) the connection test failed with "Stopped by
+/// the user", and a pause or the mouse moving gave "INTERRUPTED". Stop and pause only apply while
+/// a task runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_connection_test_ignores_a_leftover_stop_or_pause_when_no_task_runs() {
+    let _serial = SERIAL.lock().await;
+    let server = MockServer::start(vec![("aura_done_check", replies::done_check(true, ""))]).await.expect("mock server");
+    let runtime = AgentRuntime::with_data_root(scratch_dir(), false).expect("runtime");
+    runtime
+        .set_provider(ProviderConfigInput { protocol: ApiProtocol::OpenAiCompatibleChat, base_url: server.base_url.clone(), model: "mock-model".to_owned(), api_key: String::new() })
+        .expect("provider");
+    assert!(!crate::control::run_active());
+    crate::input::killswitch::KillSwitch::trigger();
+    crate::control::pause("left over from an earlier run");
+    let outcome = crate::agent::probe_model(&runtime).await;
+    crate::control::resume();
+    crate::input::killswitch::KillSwitch::reset();
+    assert!(outcome.is_ok(), "the probe must reach the model: {outcome:?}");
+}

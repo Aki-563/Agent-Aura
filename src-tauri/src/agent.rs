@@ -2282,6 +2282,10 @@ async fn request_model(
     schema: SchemaSpec,
 ) -> Result<Value, String> {
     let sent_epoch = crate::control::epoch();
+    // Stop and pause belong to a running task. Outside one (the connection test, calibration) an
+    // Esc pressed earlier, a stop left over from the last run, or the mouse moving must not cancel
+    // the request.
+    let in_run = crate::control::run_active();
     let request = async {
         let mut use_schema = true;
         let mut transient_attempts = 0usize;
@@ -2343,9 +2347,9 @@ async fn request_model(
     };
     tokio::select! {
         result = request => result,
-        _ = wait_for_kill() => Err(STOPPED_BY_USER.to_owned()),
+        _ = wait_for_kill(), if in_run => Err(STOPPED_BY_USER.to_owned()),
         // A pause or steer abandons the request at once; the loop looks at the screen again.
-        _ = crate::control::wait_for_interrupt(sent_epoch) => Err(INTERRUPTED_BY_USER.to_owned()),
+        _ = crate::control::wait_for_interrupt(sent_epoch), if in_run => Err(INTERRUPTED_BY_USER.to_owned()),
     }
 }
 
