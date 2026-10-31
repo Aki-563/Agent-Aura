@@ -169,7 +169,9 @@ async fn ping(state: &AgentRuntime) -> Result<(), String> {
         .timeout(Duration::from_secs(6))
         .send()
         .await
-        .map_err(|error| format!("Cannot reach {}: {}", config.base_url, explain_request_error(&error)))?;
+        // Listing the models is instant on any server, so no answer within the limit means the
+        // address cannot be reached from this PC.
+        .map_err(|error| format!("Cannot reach {}: {}", config.base_url, if error.is_timeout() { NOTHING_ANSWERED.to_owned() } else { explain_request_error(&error) }))?;
     if !response.status().is_success() {
         return Err(format!("{} answered HTTP {}", config.base_url, response.status().as_u16()));
     }

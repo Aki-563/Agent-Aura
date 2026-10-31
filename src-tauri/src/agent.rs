@@ -2046,6 +2046,12 @@ fn normalize_base_url(input: &str, protocol: ApiProtocol) -> Result<String, Stri
     if !(base.starts_with("https://") || base.starts_with("http://")) {
         return Err("Base URL must start with http:// or https://.".to_owned());
     }
+    // LM Studio, Ollama, vLLM and llama.cpp serve the OpenAI-style API under /v1. A bare
+    // "http://host:port" (how LM Studio shows its address) gets it added.
+    let has_path = base.split("://").nth(1).is_some_and(|rest| rest.contains('/'));
+    if protocol == ApiProtocol::OpenAiCompatibleChat && !has_path {
+        base.push_str("/v1");
+    }
     Ok(base.trim_end_matches('/').to_owned())
 }
 
@@ -2121,6 +2127,9 @@ const STOPPED_BY_USER: &str = "Stopped by the user.";
 /// Whether a failed structured-output request should be retried without `response_format`.
 /// Turns a reqwest error into something actionable: `error sending request` alone says nothing, the
 /// cause underneath (refused, timed out, DNS, TLS) does.
+/// Nothing answered at all: almost always the network, not the model.
+pub(crate) const NOTHING_ANSWERED: &str = "nothing answered at that address. Check that this PC and the model PC are on the same network (try opening the address in a browser here), that LM Studio's server has \"Serve on Local Network\" on, and that the model PC's firewall lets the port in";
+
 fn explain_request_error(error: &reqwest::Error) -> String {
     let mut causes = Vec::new();
     let mut source = std::error::Error::source(error);
@@ -2128,7 +2137,9 @@ fn explain_request_error(error: &reqwest::Error) -> String {
         causes.push(cause.to_string());
         source = cause.source();
     }
-    let hint = if error.is_timeout() {
+    let hint = if error.is_timeout() && error.is_connect() {
+        NOTHING_ANSWERED
+    } else if error.is_timeout() {
         "the server did not answer in time"
     } else if error.is_connect() {
         "could not connect: is the model server running and reachable from this PC?"
@@ -4147,6 +4158,17 @@ mod tests {
             .unwrap(),
             "http://localhost:11434/v1"
         );
+    }
+
+    #[test]
+    fn a_bare_local_server_address_gets_v1() {
+        let chat = ApiProtocol::OpenAiCompatibleChat;
+        assert_eq!(normalize_base_url("http://192.168.6.70:1234", chat).unwrap(), "http://192.168.6.70:1234/v1");
+        assert_eq!(normalize_base_url("http://192.168.6.70:1234/", chat).unwrap(), "http://192.168.6.70:1234/v1");
+        assert_eq!(normalize_base_url("http://192.168.6.70:1234/v1", chat).unwrap(), "http://192.168.6.70:1234/v1");
+        // A server with its own path is left alone, and so is the OpenAI API address.
+        assert_eq!(normalize_base_url("https://example.com/openai/v1", chat).unwrap(), "https://example.com/openai/v1");
+        assert_eq!(normalize_base_url("https://api.openai.com/v1", ApiProtocol::OpenAiResponses).unwrap(), "https://api.openai.com/v1");
     }
 
     #[test]
