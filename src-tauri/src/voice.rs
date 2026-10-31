@@ -117,6 +117,25 @@ fn run(mut backend: Box<dyn TtsBackend>, commands: Receiver<Command>) {
     }
 }
 
+/// Until when (Unix ms) the step reader is probably still talking: an estimate from the length of
+/// the last sentence. Voice input treats sound during that time as Aura's own voice, not the user.
+static SPEAKING_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// Whether Aura is (probably) speaking a step right now.
+pub fn is_speaking() -> bool {
+    now_ms() < SPEAKING_UNTIL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// About 75 ms per character at the default rate, plus the room's echo.
+fn note_speaking(text: &str) {
+    let estimate = 400 + 75 * text.chars().count() as u64;
+    SPEAKING_UNTIL.store(now_ms() + estimate, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Speaks `text` before an action. Returns at once unless `speak_then_act` is set, in which case
 /// it waits for the sentence (at most 8 s, and never past a stop).
 pub fn announce(text: &str) {
@@ -126,6 +145,7 @@ pub fn announce(text: &str) {
         return;
     }
     let Some(tx) = sender() else { return };
+    note_speaking(text);
     if settings.speak_then_act {
         let (done_tx, done_rx) = mpsc::channel();
         if tx.send(Command::Speak { text: text.to_owned(), done: Some(done_tx) }).is_ok() {
@@ -143,6 +163,7 @@ pub fn announce(text: &str) {
 
 /// Silences speech immediately (stop, pause and steer call this).
 pub fn stop_speaking() {
+    SPEAKING_UNTIL.store(0, std::sync::atomic::Ordering::Relaxed);
     if DISABLED.load(std::sync::atomic::Ordering::SeqCst) {
         return;
     }

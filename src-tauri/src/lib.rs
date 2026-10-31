@@ -38,6 +38,7 @@ pub mod testlog;
 pub mod trace;
 pub mod vault;
 pub mod voice;
+pub mod voice_input;
 pub mod workers;
 
 /// Per-monitor DPI awareness must be set before any window is created or any screen metric is
@@ -127,6 +128,11 @@ pub fn run() {
             agent::app::list_task_runs,
             agent::app::get_task_run_detail,
             agent::app::get_step_screenshot,
+            voice_input::voice_input_status,
+            voice_input::set_sarvam_key,
+            voice_input::clear_sarvam_key,
+            voice_input::listen_and_translate,
+            voice_input::stop_listening,
         ])
         // Closing the window while schedules are on keeps Aura running in the tray, so they
         // still happen; with no schedules, closing quits as usual.

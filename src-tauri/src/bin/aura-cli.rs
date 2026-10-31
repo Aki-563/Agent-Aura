@@ -161,6 +161,20 @@ async fn main() {
     if raw.first().map(String::as_str) == Some("schedule") {
         std::process::exit(agent_aura_lib::schedule_cli::schedule_command(&raw[1..]));
     }
+    if raw.first().map(String::as_str) == Some("mic-check") {
+        // Records one spoken turn from the default microphone and reports it; sends nothing.
+        println!("speak now (the recording ends after a pause, or after 9 s of silence)...");
+        match agent_aura_lib::voice_input::mic_check() {
+            Ok((speech, seconds, peak)) => {
+                println!("speech heard: {speech}; kept {seconds:.1} s of audio; loudest level {peak}/1000");
+                std::process::exit(if speech { 0 } else { 1 });
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
+    }
     if raw.first().map(String::as_str) == Some("intruder") {
         // A test helper: shows one window for the obstruction tests (see conformance.rs).
         std::process::exit(agent_aura_lib::conformance::run_intruder(&raw[1..]));

@@ -385,3 +385,34 @@ body.running .run-view { display: block; padding: 6px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01s !important; animation-iteration-count: 1 !important; transition-duration: 0.01s !important; }
 }
+
+/* ---- Voice input -------------------------------------------------------------------------- */
+/* The mic between the step limit and send: a quiet icon; red while listening, with a ring that
+   grows with the voice (--level 0..1, set by the page); a soft pulse while Sarvam translates. */
+.mic-btn {
+  position: relative; display: grid; place-items: center; width: 40px; height: 40px; flex: none; border: 0; border-radius: 50%;
+  background: transparent; color: var(--text-2);
+  transition: transform 0.45s var(--spring), background-color 0.25s var(--ease), color 0.25s var(--ease);
+}
+.mic-btn svg { position: relative; z-index: 1; width: 19px; height: 19px; }
+.mic-btn:hover { background: var(--surface-2); color: var(--text); }
+.mic-btn:active { transform: scale(0.9); }
+.mic-ring {
+  position: absolute; inset: 0; border-radius: 50%; background: rgba(255, 69, 58, 0.28); opacity: 0;
+  transform: scale(calc(1 + var(--level, 0) * 0.55)); transition: transform 0.09s linear, opacity 0.25s var(--ease);
+}
+.mic-btn[data-state="listening"] { background: var(--red); color: #fff; }
+.mic-btn[data-state="listening"] .mic-ring { opacity: 1; }
+.mic-btn[data-state="working"] { background: var(--surface-3); color: var(--text); animation: mic-think 1s var(--ease) infinite; }
+@keyframes mic-think { 50% { transform: scale(0.9); opacity: 0.7; } }
+.composer.listening { border-color: rgba(255, 69, 58, 0.55); }
+/* The translated task is shown for a moment before it runs: a thin line fills along the box. */
+.composer.voice-sending::after {
+  content: ""; position: absolute; left: 22px; right: 22px; bottom: 4px; height: 2px; border-radius: 1px;
+  background: var(--blue); transform-origin: left; animation: voice-send 1.4s linear both;
+}
+@keyframes voice-send { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+
+/* The player's mic: off by default; on, it glows red and breathes with the voice. */
+.mini-icon.mic.live { color: #fff; background: rgba(255, 69, 58, 0.85); box-shadow: 0 0 calc(4px + var(--level, 0) * 14px) rgba(255, 69, 58, 0.7); }
+.mini-icon.mic.live:hover { background: var(--red); }

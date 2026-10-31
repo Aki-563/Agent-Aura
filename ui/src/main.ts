@@ -121,13 +121,13 @@ app.innerHTML = `
           <div id="mini-main" class="swap"><span class="swap-line current">Getting ready</span></div>
           <div class="mini-sub"><span id="mini-phase">Starting</span><span id="mini-step"></span></div>
         </div>
+        <button id="mini-mic" class="mini-icon mic" type="button" aria-pressed="false" title="Talk to Aura (off)">${ICON.micOn}${ICON.micOff}</button>
         <button id="mini-voice" class="mini-icon" type="button" aria-pressed="true" title="Step reader">${ICON.speakerOn}${ICON.speakerOff}</button>
       </div>
       <div class="mini-more">
         <div id="mini-more-inner" class="mini-more-inner">
           <div class="mini-actions">
             <button id="run-pause" class="mini-btn" type="button"><span id="run-pause-icon">${ICON.pause}</span><span id="run-pause-label">Pause</span></button>
-            <button id="run-mic" class="mini-btn icon-only" type="button" aria-pressed="false" title="Voice input (coming soon)">${ICON.micOn}${ICON.micOff}</button>
             <button id="run-stop" class="mini-btn danger" type="button">${ICON.end}<span>End</span></button>
           </div>
           <form id="steer-form" class="steer" autocomplete="off">
@@ -161,6 +161,7 @@ app.innerHTML = `
         <textarea id="task" rows="1" placeholder="What should Aura do?" spellcheck="true"></textarea>
         <div class="composer-tools">
           <button id="steps-btn" class="steps-btn" type="button" aria-expanded="false" title="Maximum steps">${ICON.steps}<span id="steps-value">20</span></button>
+          <button id="mic-btn" class="mic-btn" type="button" data-state="idle" title="Speak the task (Tamil, Tanglish or English)" aria-label="Speak the task">${ICON.micOn}<span class="mic-ring"></span></button>
           <button id="send" class="send-btn" type="submit" aria-label="Run" disabled>${ICON.arrow}${ICON.stop}</button>
         </div>
       </form>
@@ -191,6 +192,15 @@ app.innerHTML = `
         <div class="group-label">Voice</div>
         <div class="group">
           <div class="row"><div class="row-main"><div class="row-title">Read each step aloud</div></div><button id="voice-switch" class="switch" type="button" role="switch" aria-checked="true" aria-label="Read each step aloud"></button></div>
+        </div>
+        <div class="group-label">Speak tasks · Sarvam AI</div>
+        <div class="group">
+          <div id="sarvam-saved" class="row hidden"><div class="row-main"><div class="row-title">Sarvam AI key saved</div><div class="row-meta">Tamil, Tanglish and English are turned into English for the model</div></div><button id="sarvam-remove" class="row-btn" type="button" title="Remove key" aria-label="Remove key">${ICON.trash}</button></div>
+          <form id="sarvam-form" class="form" autocomplete="off">
+            <label class="field"><span>Sarvam AI API key</span><input id="sarvam-key" type="password" spellcheck="false" placeholder="From dashboard.sarvam.ai, saved encrypted" /></label>
+            <div id="sarvam-error" class="form-error"></div>
+            <button id="sarvam-save" class="primary-btn" type="submit">Save key</button>
+          </form>
         </div>
         <div id="schedules-block" class="hidden">
           <div class="group-label">Scheduled</div>
@@ -304,6 +314,7 @@ function openSheet(id: "settings" | "activity"): void {
     void loadPresets();
     void refreshSchedules();
     void loadVoice();
+    void loadSarvam();
   } else {
     void loadRuns();
   }
@@ -681,6 +692,7 @@ async function startRun(text: string): Promise<void> {
   } catch (error) {
     toast(toMessage(error), { error: true, ms: 7000 });
   } finally {
+    setRunMic(false);
     document.body.classList.remove("running");
     setRunningUi(false);
     task.focus();
@@ -762,6 +774,7 @@ function setMiniPhase(label: string, cls: string): void {
 }
 
 function resetMini(): void {
+  setRunMic(false);
   hasVoiceLine = false;
   miniOpen = false;
   $("mini").classList.remove("open");
@@ -831,13 +844,6 @@ $("run-pause").addEventListener("click", async () => {
   }
 });
 $("run-stop").addEventListener("click", () => void stopRun());
-$("run-mic").addEventListener("click", () => {
-  const button = $("run-mic");
-  const next = button.getAttribute("aria-pressed") !== "true";
-  button.setAttribute("aria-pressed", String(next));
-  localStorage.setItem("aura.mic", next ? "on" : "off");
-});
-$("run-mic").setAttribute("aria-pressed", String(localStorage.getItem("aura.mic") === "on"));
 
 /** The window is sized to the player: the page tells the app how tall it needs to be. */
 async function syncHeight(): Promise<void> {
@@ -960,6 +966,7 @@ window.setInterval(async () => {
       setRunningUi(true);
     } else if (!status.running && externalRun) {
       externalRun = false;
+      setRunMic(false);
       document.body.classList.remove("running");
       setRunningUi(false);
       toast("Scheduled task finished", { action: "View", ms: 8000, onAction: () => openSheet("activity") });
@@ -1171,6 +1178,183 @@ async function review(input: Record<string, unknown>): Promise<void> {
     toast(toMessage(error), { error: true });
   }
 }
+
+// ---- Voice input (Sarvam AI) --------------------------------------------------------------------
+
+let hasSarvamKey = false;
+const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+async function loadSarvam(): Promise<void> {
+  try {
+    hasSarvamKey = (await invoke<{ hasKey: boolean }>("voice_input_status")).hasKey;
+  } catch {
+    // Keep the last known value.
+  }
+  $("sarvam-saved").classList.toggle("hidden", !hasSarvamKey);
+  $("sarvam-form").classList.toggle("hidden", hasSarvamKey);
+}
+
+$("sarvam-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = $<HTMLInputElement>("sarvam-key");
+  const button = $<HTMLButtonElement>("sarvam-save");
+  $("sarvam-error").textContent = "";
+  button.disabled = true;
+  button.textContent = "Checking…";
+  try {
+    await invoke("set_sarvam_key", { key: input.value });
+    input.value = "";
+    toast("Sarvam AI key saved · tap the mic to speak a task");
+  } catch (error) {
+    $("sarvam-error").textContent = toMessage(error);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Save key";
+    void loadSarvam();
+  }
+});
+$("sarvam-remove").addEventListener("click", async () => {
+  await invoke("clear_sarvam_key").catch(() => undefined);
+  void loadSarvam();
+});
+
+/** Shows the microphone's level while listening (the ring grows with the voice). */
+function followLevel(host: HTMLElement, active: () => boolean): void {
+  const tick = async () => {
+    if (!active()) {
+      host.style.setProperty("--level", "0");
+      return;
+    }
+    try {
+      const status = await invoke<{ level: number }>("voice_input_status");
+      host.style.setProperty("--level", String(Math.min(1, status.level / 350)));
+    } catch {
+      // Cosmetic only.
+    }
+    window.setTimeout(() => void tick(), 70);
+  };
+  void tick();
+}
+
+// The home screen: tap, speak (Tamil, Tanglish, English…), and the English text appears in the
+// box, then the task starts by itself. Tap again to finish early; Esc cancels.
+const micBtn = $<HTMLButtonElement>("mic-btn");
+let micState: "idle" | "listening" | "working" = "idle";
+let autoSendTimer: number | undefined;
+
+function setMicState(state: typeof micState): void {
+  micState = state;
+  micBtn.dataset.state = state;
+  micBtn.title = state === "listening" ? "Listening… tap to finish" : state === "working" ? "Translating…" : "Speak the task (Tamil, Tanglish or English)";
+  $("composer").classList.toggle("listening", state === "listening");
+}
+
+function cancelAutoSend(): void {
+  if (autoSendTimer === undefined) return;
+  window.clearTimeout(autoSendTimer);
+  autoSendTimer = undefined;
+  $("composer").classList.remove("voice-sending");
+}
+for (const kind of ["input", "keydown", "mousedown"]) task.addEventListener(kind, cancelAutoSend);
+
+async function speakTask(): Promise<void> {
+  if (micState === "listening") {
+    await invoke("stop_listening", { cancel: false }).catch(() => undefined);
+    return;
+  }
+  if (micState !== "idle" || running) return;
+  cancelAutoSend();
+  await loadSarvam();
+  if (!hasSarvamKey) {
+    toast("Add a Sarvam AI key to speak tasks", { action: "Settings", onAction: () => openSheet("settings") });
+    return;
+  }
+  setMicState("listening");
+  followLevel(micBtn, () => micState === "listening");
+  const listening = invoke<{ text: string; language: string | null }>("listen_and_translate", { purpose: "task" });
+  // Once the speech has ended the app is translating it.
+  const watch = window.setInterval(async () => {
+    const status = await invoke<{ phase: string }>("voice_input_status").catch(() => null);
+    if (status && micState === "listening" && status.phase === "translating") setMicState("working");
+  }, 150);
+  try {
+    const result = await listening;
+    if (!result.text) {
+      toast("Didn't catch that. Tap the mic and speak again.");
+      return;
+    }
+    // The English text goes into the box, so it can be read before it runs.
+    task.value = task.value.trim() ? `${task.value.trim()} ${result.text}` : result.text;
+    autosize();
+    task.focus();
+    $("composer").classList.add("voice-sending");
+    autoSendTimer = window.setTimeout(() => {
+      autoSendTimer = undefined;
+      $("composer").classList.remove("voice-sending");
+      void submitTask();
+    }, 1400);
+  } catch (error) {
+    toast(toMessage(error), { error: true, ms: 7000 });
+  } finally {
+    window.clearInterval(watch);
+    setMicState("idle");
+  }
+}
+micBtn.addEventListener("click", (event) => {
+  event.stopPropagation();
+  void speakTask();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && micState === "listening") void invoke("stop_listening", { cancel: true }).catch(() => undefined);
+  if (event.key === "Escape") cancelAutoSend();
+});
+
+// During a run: the mic in the player is off at the start. Switched on, it keeps listening; when
+// the user speaks the agent pauses, and the English text reaches it as a correction.
+let runMicOn = false;
+function setRunMic(on: boolean): void {
+  const wasOn = runMicOn;
+  runMicOn = on;
+  const button = $("mini-mic");
+  button.setAttribute("aria-pressed", String(on));
+  button.title = on ? "Talk to Aura (listening)" : "Talk to Aura (off)";
+  button.classList.toggle("live", on);
+  if (wasOn && !on) void invoke("stop_listening", { cancel: true }).catch(() => undefined);
+  if (on && !wasOn) void runMicLoop();
+}
+async function runMicLoop(): Promise<void> {
+  followLevel($("mini-mic"), () => runMicOn);
+  while (runMicOn && document.body.classList.contains("running")) {
+    try {
+      const result = await invoke<{ text: string }>("listen_and_translate", { purpose: "steer" });
+      if (!runMicOn) break;
+      if (result.text) {
+        hasVoiceLine = true;
+        setMiniText(`You: ${result.text}`);
+      }
+    } catch (error) {
+      if (!runMicOn) break;
+      const message = toMessage(error);
+      setMiniText(message);
+      if (/key|microphone|credits/i.test(message)) {
+        setRunMic(false);
+        break;
+      }
+      await sleep(1500);
+    }
+  }
+}
+$("mini-mic").addEventListener("click", async (event) => {
+  event.stopPropagation();
+  if (!runMicOn) {
+    await loadSarvam();
+    if (!hasSarvamKey) {
+      setMiniText("Add a Sarvam AI key in Settings to talk to Aura");
+      return;
+    }
+  }
+  setRunMic(!runMicOn);
+});
 
 // ---- Start -------------------------------------------------------------------------------------
 
