@@ -43,16 +43,32 @@ pub fn model_calls_so_far() -> u64 {
     MODEL_CALLS.load(Ordering::SeqCst)
 }
 
-/// Whether the run used up its wall-clock time or model-call budget (harness settings).
-fn budget_exceeded(started: Instant, model_calls_at_start: u64) -> Option<String> {
-    let settings = crate::settings::get();
+/// `max_steps` value meaning "no step limit" (the user chose unlimited; the run goes on until the
+/// task is done, the user stops it, or the stuck detectors end it).
+pub const UNLIMITED_STEPS: u32 = u32::MAX;
+
+/// The time and model-call budgets for a run of `max_steps`: the harness settings, raised so they
+/// never cut off a step count the user chose (about 2 minutes and 4 model calls per step, which a
+/// slow local model needs). None = no budget (unlimited steps, or switched off in the settings).
+pub fn run_budgets(max_steps: u32, settings: &crate::settings::HarnessSettings) -> (Option<u32>, Option<u32>) {
+    if max_steps == UNLIMITED_STEPS {
+        return (None, None);
+    }
+    let minutes = (settings.max_minutes > 0).then(|| settings.max_minutes.max(max_steps.saturating_mul(2)));
+    let calls = (settings.max_model_calls > 0).then(|| settings.max_model_calls.max(max_steps.saturating_mul(4)));
+    (minutes, calls)
+}
+
+/// Whether the run used up its wall-clock time or model-call budget.
+fn budget_exceeded(started: Instant, model_calls_at_start: u64, max_steps: u32) -> Option<String> {
+    let (max_minutes, max_calls) = run_budgets(max_steps, &crate::settings::get());
     let minutes = started.elapsed().as_secs() / 60;
-    if settings.max_minutes > 0 && minutes >= settings.max_minutes as u64 {
-        return Some(format!("Stopped: the run reached its time limit of {} minutes.", settings.max_minutes));
+    if let Some(limit) = max_minutes.filter(|limit| minutes >= *limit as u64) {
+        return Some(format!("Stopped: the run reached its time limit of {limit} minutes."));
     }
     let calls = model_calls_so_far().saturating_sub(model_calls_at_start);
-    if settings.max_model_calls > 0 && calls >= settings.max_model_calls as u64 {
-        return Some(format!("Stopped: the run reached its limit of {} model calls.", settings.max_model_calls));
+    if let Some(limit) = max_calls.filter(|limit| calls >= *limit as u64) {
+        return Some(format!("Stopped: the run reached its limit of {limit} model calls."));
     }
     None
 }
@@ -847,7 +863,8 @@ pub async fn execute_run(
     if task.is_empty() {
         return Err("Describe the task before starting autonomous execution.".to_owned());
     }
-    let max_steps = max_steps.clamp(1, 100);
+    // 0 (or anything past 1000) means no step limit.
+    let max_steps = if max_steps == 0 || max_steps > 1000 { UNLIMITED_STEPS } else { max_steps };
     if state
         .running
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -898,7 +915,7 @@ pub async fn execute_run(
         AutonomousProgress {
             phase: "starting".to_owned(),
             step: 0,
-            message: format!("Starting autonomous task with a {max_steps}-step limit."),
+            message: if max_steps == UNLIMITED_STEPS { "Starting autonomous task with no step limit.".to_owned() } else { format!("Starting autonomous task with a {max_steps}-step limit.") },
             thought: None,
             actions: None,
             screenshot_data_url: None,
@@ -916,7 +933,7 @@ pub async fn execute_run(
         &state.data_root,
         &run_id,
         &task,
-        json!({"protocol": config.protocol, "baseUrl": config.base_url, "model": config.model, "maxSteps": max_steps}),
+        json!({"protocol": config.protocol, "baseUrl": config.base_url, "model": config.model, "maxSteps": if max_steps == UNLIMITED_STEPS { json!("unlimited") } else { json!(max_steps) }}),
     );
     let result = autonomous_loop(
         host,
@@ -1088,7 +1105,7 @@ async fn autonomous_loop(
             return Ok(stopped_response(executed_steps));
         }
         // Run budgets beyond the step limit: wall-clock time and model calls (settings).
-        if let Some(reason) = budget_exceeded(run_started, model_calls_at_start) {
+        if let Some(reason) = budget_exceeded(run_started, model_calls_at_start, max_steps) {
             trace.event(step_number, "budget_exceeded", json!({"reason": &reason}));
             return Ok(AutonomousResponse { completed: false, stopped: false, steps_executed: executed_steps, message: reason });
         }
@@ -4112,6 +4129,17 @@ fn truncate(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn budgets_never_cut_off_the_chosen_step_count_and_unlimited_has_none() {
+        use super::{run_budgets, UNLIMITED_STEPS};
+        let settings = crate::settings::HarnessSettings::default(); // 15 min, 120 calls
+        assert_eq!(run_budgets(5, &settings), (Some(15), Some(120)), "small runs keep the safety budgets");
+        assert_eq!(run_budgets(80, &settings), (Some(160), Some(320)), "80 slow steps get room for 80 steps");
+        assert_eq!(run_budgets(UNLIMITED_STEPS, &settings), (None, None));
+        let off = crate::settings::HarnessSettings { max_minutes: 0, max_model_calls: 0, ..settings };
+        assert_eq!(run_budgets(80, &off), (None, None), "switched off in the settings stays off");
+    }
+
     #[test]
     fn model_coordinates_on_a_thousand_grid_become_screenshot_pixels() {
         let click = |x, y| ActionPrimitive::Click { x, y, button: Default::default(), clicks: 1, hold_keys: Vec::new() };

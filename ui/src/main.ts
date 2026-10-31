@@ -547,7 +547,12 @@ async function refreshSchedules(): Promise<void> {
 
 const task = $<HTMLTextAreaElement>("task");
 const send = $<HTMLButtonElement>("send");
-let maxSteps = Number(localStorage.getItem("aura.maxSteps")) || 20;
+/** The step limit; 0 means unlimited (the run goes on until it is done or you stop it). */
+let maxSteps = (() => {
+  const saved = Number(localStorage.getItem("aura.maxSteps") ?? "20");
+  return Number.isInteger(saved) && saved >= 0 && saved <= 100 ? saved : 20;
+})();
+const stepsLabel = (value: number) => (value === 0 ? "∞" : String(value));
 let running = false;
 
 function autosize(): void {
@@ -578,13 +583,14 @@ function setRunningUi(on: boolean): void {
 
 // Maximum steps: an icon in the composer opens a small stepper.
 function renderSteps(): void {
-  $("steps-value").textContent = String(maxSteps);
+  $("steps-value").textContent = stepsLabel(maxSteps);
+  $("steps-btn").title = maxSteps === 0 ? "Maximum steps: unlimited" : `Maximum steps: ${maxSteps}`;
   const out = document.getElementById("steps-out");
-  if (out) out.textContent = String(maxSteps);
+  if (out) out.textContent = stepsLabel(maxSteps);
   for (const chip of document.querySelectorAll<HTMLButtonElement>("#steps-pop .chips button")) chip.classList.toggle("on", Number(chip.dataset.v) === maxSteps);
 }
 function setSteps(value: number): void {
-  maxSteps = Math.max(1, Math.min(100, Math.round(value)));
+  maxSteps = value === 0 ? 0 : Math.max(1, Math.min(100, Math.round(value)));
   localStorage.setItem("aura.maxSteps", String(maxSteps));
   renderSteps();
 }
@@ -607,9 +613,15 @@ $("steps-btn").addEventListener("click", (event) => {
   pop.innerHTML = `
     <div class="steps-pop-title">Maximum steps</div>
     <div class="stepper"><button type="button" data-d="-1" aria-label="Fewer">−</button><output id="steps-out"></output><button type="button" data-d="1" aria-label="More">+</button></div>
-    <div class="chips">${[10, 20, 40, 80].map((v) => `<button type="button" data-v="${v}">${v}</button>`).join("")}</div>`;
+    <div class="chips">${[10, 20, 40, 80, 0].map((v) => `<button type="button" data-v="${v}" title="${v === 0 ? "Unlimited" : `${v} steps`}">${stepsLabel(v)}</button>`).join("")}</div>`;
   pop.addEventListener("click", (e) => e.stopPropagation());
-  for (const b of pop.querySelectorAll<HTMLButtonElement>(".stepper button")) b.addEventListener("click", () => setSteps(maxSteps + Number(b.dataset.d)));
+  // Past 100 comes unlimited (∞); one step down from unlimited is 100.
+  const step = (d: number) => {
+    if (maxSteps === 0) setSteps(d < 0 ? 100 : 0);
+    else if (d > 0 && maxSteps >= 100) setSteps(0);
+    else setSteps(maxSteps + d);
+  };
+  for (const b of pop.querySelectorAll<HTMLButtonElement>(".stepper button")) b.addEventListener("click", () => step(Number(b.dataset.d)));
   for (const b of pop.querySelectorAll<HTMLButtonElement>(".chips button")) b.addEventListener("click", () => setSteps(Number(b.dataset.v)));
   $("composer").append(pop);
   $("steps-btn").setAttribute("aria-expanded", "true");
