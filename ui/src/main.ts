@@ -139,7 +139,6 @@ app.innerHTML = `
 
   <main id="home" class="home">
     <header class="topbar">
-      <div class="brand"><span class="brand-orb"></span>Aura</div>
       <div class="top-actions">
         <button id="open-activity" class="icon-btn" type="button" title="Activity" aria-label="Activity">${ICON.activity}</button>
         <button id="status" class="status-pill" type="button" title="Model connection"><span class="status-dot"></span><span id="status-text">No model</span></button>
