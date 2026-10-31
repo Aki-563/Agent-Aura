@@ -18,3 +18,14 @@ node_modules/
 *.log
 agent-aura-crash.log
 __pycache__/
+
+# Not part of the app: the unwired Python prototype and old GNU-toolchain leftovers
+/engine/
+/checked_features
+/sqlite3.def
+/src-tauri/.cargo/
+
+# Local data and editor folders
+*.db
+.vscode/
+.idea/
