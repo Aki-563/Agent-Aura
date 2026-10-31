@@ -121,7 +121,7 @@ app.innerHTML = `
           <div id="mini-main" class="swap"><span class="swap-line current">Getting ready</span></div>
           <div class="mini-sub"><span id="mini-phase">Starting</span><span id="mini-step"></span></div>
         </div>
-        <button id="mini-mic" class="mini-icon mic" type="button" aria-pressed="false" title="Talk to Aura (off)">${ICON.micOn}${ICON.micOff}</button>
+        <button id="mini-mic" class="mini-icon mic" type="button" aria-pressed="false" aria-label="Microphone">${ICON.micOn}${ICON.micOff}</button>
         <button id="mini-voice" class="mini-icon" type="button" aria-pressed="true" title="Step reader">${ICON.speakerOn}${ICON.speakerOff}</button>
       </div>
       <div class="mini-more">
@@ -161,7 +161,7 @@ app.innerHTML = `
         <textarea id="task" rows="1" placeholder="What should Aura do?" spellcheck="true"></textarea>
         <div class="composer-tools">
           <button id="steps-btn" class="steps-btn" type="button" aria-expanded="false" title="Maximum steps">${ICON.steps}<span id="steps-value">20</span></button>
-          <button id="mic-btn" class="mic-btn" type="button" data-state="idle" title="Speak the task (Tamil, Tanglish or English)" aria-label="Speak the task">${ICON.micOn}<span class="mic-ring"></span></button>
+          <button id="mic-btn" class="mic-btn" type="button" data-state="idle" aria-label="Microphone">${ICON.micOn}<span class="mic-ring"></span></button>
           <button id="send" class="send-btn" type="submit" aria-label="Run" disabled>${ICON.arrow}${ICON.stop}</button>
         </div>
       </form>
@@ -195,7 +195,7 @@ app.innerHTML = `
         </div>
         <div class="group-label">Speak tasks · Sarvam AI</div>
         <div class="group">
-          <div id="sarvam-saved" class="row hidden"><div class="row-main"><div class="row-title">Sarvam AI key saved</div><div class="row-meta">Tamil, Tanglish and English are turned into English for the model</div></div><button id="sarvam-remove" class="row-btn" type="button" title="Remove key" aria-label="Remove key">${ICON.trash}</button></div>
+          <div id="sarvam-saved" class="row hidden"><div class="row-main"><div class="row-title">Sarvam AI key saved</div></div><button id="sarvam-remove" class="row-btn" type="button" title="Remove key" aria-label="Remove key">${ICON.trash}</button></div>
           <form id="sarvam-form" class="form" autocomplete="off">
             <label class="field"><span>Sarvam AI API key</span><input id="sarvam-key" type="password" spellcheck="false" placeholder="From dashboard.sarvam.ai, saved encrypted" /></label>
             <div id="sarvam-error" class="form-error"></div>
@@ -1245,7 +1245,6 @@ let autoSendTimer: number | undefined;
 function setMicState(state: typeof micState): void {
   micState = state;
   micBtn.dataset.state = state;
-  micBtn.title = state === "listening" ? "Listening… tap to finish" : state === "working" ? "Translating…" : "Speak the task (Tamil, Tanglish or English)";
   $("composer").classList.toggle("listening", state === "listening");
 }
 
@@ -1317,7 +1316,6 @@ function setRunMic(on: boolean): void {
   runMicOn = on;
   const button = $("mini-mic");
   button.setAttribute("aria-pressed", String(on));
-  button.title = on ? "Talk to Aura (listening)" : "Talk to Aura (off)";
   button.classList.toggle("live", on);
   if (wasOn && !on) void invoke("stop_listening", { cancel: true }).catch(() => undefined);
   if (on && !wasOn) void runMicLoop();
