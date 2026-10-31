@@ -25,6 +25,9 @@ const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?
 </assembly>"#;
 
 fn main() {
+    // A new icon must be embedded again; cargo does not watch these files by itself.
+    println!("cargo:rerun-if-changed=icons");
+    println!("cargo:rerun-if-changed=tauri.conf.json");
     let windows = tauri_build::WindowsAttributes::new().app_manifest(MANIFEST);
     tauri_build::try_build(tauri_build::Attributes::new().windows_attributes(windows)).expect("tauri build step failed");
 }
