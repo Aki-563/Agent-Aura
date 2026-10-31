@@ -52,6 +52,22 @@ pub fn clamp_to_monitor(point: (i32, i32), monitor_pos: (i32, i32), monitor_size
     (point.0.clamp(monitor_pos.0, max_x.max(monitor_pos.0)), point.1.clamp(monitor_pos.1, max_y.max(monitor_pos.1)))
 }
 
+/// Brings a minimized window back with Windows itself. (The window library's own "is it
+/// minimized" flag misses a minimize done from outside, by Win+D or "minimize all", and its
+/// restore then does nothing.) Returns whether it was minimized.
+pub fn restore_if_minimized(window: &WebviewWindow) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, ShowWindow, SW_RESTORE};
+    let Ok(hwnd) = window.hwnd() else { return false };
+    let hwnd = hwnd.0 as windows_sys::Win32::Foundation::HWND;
+    unsafe {
+        if IsIconic(hwnd) == 0 {
+            return false;
+        }
+        ShowWindow(hwnd, SW_RESTORE);
+    }
+    true
+}
+
 /// Window geometry to restore after the run.
 pub struct SavedLayout {
     position: PhysicalPosition<i32>,
@@ -167,13 +183,13 @@ pub fn set_height(window: &WebviewWindow, height_dip: f64) {
 pub fn enter_run_mode(window: &WebviewWindow) -> Option<SavedLayout> {
     // A minimized window reports the tiny iconic size; restoring that afterwards left the app as a
     // small rectangle. Take the real size first.
-    if window.is_minimized().unwrap_or(false) {
-        let _ = window.unminimize();
-    }
+    restore_if_minimized(window);
     let was_hidden = !window.is_visible().unwrap_or(true);
     let saved = SavedLayout {
         position: window.outer_position().ok()?,
-        size: window.outer_size().ok()?,
+        // `set_size` sets the inner size, so the inner size is what is kept: keeping the outer one
+        // made the window grow by its frame after every run.
+        size: window.inner_size().ok()?,
         was_maximized: window.is_maximized().unwrap_or(false),
         was_hidden,
     };
@@ -212,8 +228,12 @@ pub fn enter_run_mode(window: &WebviewWindow) -> Option<SavedLayout> {
     Some(saved)
 }
 
-/// Restores the normal window after a run and gives it focus again.
+/// Restores the normal window after a run, exactly as it was when the run started (size,
+/// place, maximized or not), un-minimized and in front of the app the agent worked in.
 pub fn leave_run_mode(window: &WebviewWindow, saved: Option<SavedLayout>) {
+    // Something during the run (Win+D, "minimize all") may have minimized the player: a minimized
+    // window ignores size and place changes, so it comes back first.
+    restore_if_minimized(window);
     let _ = window.set_focusable(true);
     let _ = window.set_always_on_top(false);
     let _ = window.set_decorations(true);
@@ -222,6 +242,7 @@ pub fn leave_run_mode(window: &WebviewWindow, saved: Option<SavedLayout>) {
     let _ = window.set_skip_taskbar(false);
     let _ = window.set_min_size(Some(tauri::Size::Logical(tauri::LogicalSize::new(640.0, 480.0))));
     let was_hidden = saved.as_ref().is_some_and(|s| s.was_hidden);
+    let restored = saved.as_ref().map(|s| SavedLayout { position: s.position, size: s.size, was_maximized: s.was_maximized, was_hidden: s.was_hidden });
     if let Some(saved) = saved.filter(|s| s.size.width >= 400 && s.size.height >= 300) {
         let _ = window.set_size(saved.size);
         let _ = window.set_position(saved.position);
@@ -237,7 +258,44 @@ pub fn leave_run_mode(window: &WebviewWindow, saved: Option<SavedLayout>) {
         let _ = window.hide();
         return;
     }
+    bring_forward(window);
+    // A minimize that lands while the window is being put back (Win+D at the last moment) can
+    // leave it parked off screen: check once more and put it back again.
+    if let Some(saved) = restored.filter(|s| s.size.width >= 400 && s.size.height >= 300) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let parked = window.outer_position().map(|p| p.x <= -20000 || p.y <= -20000).unwrap_or(false);
+        if restore_if_minimized(window) || parked {
+            let _ = window.set_size(saved.size);
+            let _ = window.set_position(saved.position);
+            if saved.was_maximized {
+                let _ = window.maximize();
+            }
+            bring_forward(window);
+        }
+    }
+}
+
+/// Shows the window in front of every other one. Windows refuses a plain "set focus" from an app
+/// that is not in front (the agent's app is), which used to leave Aura behind it after a run, as if
+/// minimized; this uses the same forced hand-over the agent uses for its own target windows.
+fn bring_forward(window: &WebviewWindow) {
+    let _ = window.show();
+    restore_if_minimized(window);
     let _ = window.set_focus();
+    let Ok(hwnd) = window.hwnd() else { return };
+    let hwnd = hwnd.0 as windows_sys::Win32::Foundation::HWND;
+    for _ in 0..4 {
+        if super::target::bring_to_front(hwnd) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(120));
+    }
+}
+
+/// During a run the player is never left minimized (Win+D, "minimize all", a stray minimize).
+/// A window hidden in the tray is not shown here: entering run mode does that, and remembers it.
+pub fn keep_player_shown(window: &WebviewWindow) {
+    restore_if_minimized(window);
 }
 
 /// Called every few seconds during a run: when a menu or pop-up of the app being worked on opens

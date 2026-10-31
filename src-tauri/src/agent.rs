@@ -663,6 +663,11 @@ struct TauriBackend {
 
 impl HostBackend for TauriBackend {
     fn emit_value(&self, event: &str, payload: Value) {
+        // The page's own timers slow down while the window is minimized, so the run itself keeps
+        // the player on screen: progress is reported several times a step.
+        if event == "agent-progress" {
+            panel::keep_player_shown(&self.window);
+        }
         let _ = self.window.emit(event, payload);
     }
 
@@ -980,7 +985,9 @@ pub fn set_mini_height(window: tauri::WebviewWindow, height: f64) -> Result<(), 
 /// Called every few seconds while the player is shown: keeps it above other always-on-top windows.
 #[tauri::command]
 pub fn keep_run_panel_on_top(window: tauri::WebviewWindow) -> Result<(), String> {
-    // Never sit on top of the worked-on app's own menu or pop-up: move off it first.
+    // Never left minimized during a run, and never on top of the worked-on app's own menu or
+    // pop-up: move off it first.
+    panel::keep_player_shown(&window);
     panel::keep_clear_of_popups(&window);
     window.set_always_on_top(true).map_err(|e| e.to_string())
 }

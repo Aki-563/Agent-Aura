@@ -204,6 +204,12 @@
 - [x] `aura-cli mic-check` records one turn from the default microphone and reports it (sends nothing).
 - Verified 2026-10-31: 264 unit tests (7 new for voice: speech kept with a lead-in, a click or silence or a steady fan is not speech, Aura's own voice ignored, WAV header, the request to a stand-in Sarvam server is multipart with `mode=translate` and `saaras:v4` and the English transcript comes back, a wrong key is reported); in the app over CDP: the mic sits between the step limit and send, no key gives "Add a Sarvam AI key", the real Sarvam service rejects a made-up key with "did not accept the API key", the player's mic is off at the start; the microphone on this PC opens and streams (room level 46/1000). Not yet tried with a real Sarvam key and a person speaking Tamil (no key here).
 
+### Phase 13: The window comes back exactly as it was after a task (2026-10-31)
+- [x] After a run Aura returns to the size, place and maximized state it had when the task started, un-minimized and in front of the app the agent worked in (a forced hand-over, as for the agent's own target windows; a plain focus request is refused by Windows when another app is in front).
+- [x] A minimize during the run (Win+D, "minimize all") is undone by the run itself within a step (the page's timers slow down while minimized, so the agent loop does it), and once more at the very end if it lands while the window is being put back.
+- [x] Fixed: the window grew by its frame (about 15 x 37 px) after every run, because the outer size was saved and the inner size restored.
+- Verified 2026-10-31 with a stand-in model on a real run in the app: three runs in a row keep 1054 x 758 at the same place; minimized mid-run it is back about 1.5 s later and ends in front at its size; minimized at 5.0, 5.5 and 6.0 s (around the end of the run) it still ends restored and in front; started maximized it ends maximized. 264 unit tests.
+
 ---
 
 ## 3. Handover Protocol for Coding Agents
